@@ -15,7 +15,9 @@ class ErrorResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    detail: str = Field(description="Message d'erreur destiné au consommateur de l'API.")
+    detail: str = Field(
+        description="Message d'erreur destiné au consommateur de l'API."
+    )
 
 
 class HealthOut(BaseModel):
@@ -46,7 +48,9 @@ class PredictionPoint(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    timestamp: datetime = Field(description="Horodatage du point prédit, ISO 8601 UTC.")
+    timestamp: datetime = Field(
+        description="Horodatage du point prédit, ISO 8601 UTC."
+    )
     predicted_consumption_kw: float = Field(
         description="Puissance prédite en kilowatts.",
     )
