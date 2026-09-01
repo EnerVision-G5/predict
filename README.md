@@ -1,5 +1,7 @@
 # predict
 
+[![ci](https://github.com/EnerVision-G5/predict/actions/workflows/ci.yml/badge.svg)](https://github.com/EnerVision-G5/predict/actions/workflows/ci.yml)
+
 Service d'inférence EnerVision, déployé sur Azure. Sert uniquement les
 prédictions de consommation produites par le modèle XGBoost.
 
