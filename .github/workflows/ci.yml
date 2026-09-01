@@ -29,7 +29,7 @@ jobs:
         run: ruff check .
 
       - name: Tests (pytest)
-        run: pytest -q
+        run: python -m pytest -q
 
       - name: Build (génération de la spécification OpenAPI)
         run: python scripts/export_openapi.py > /dev/null
