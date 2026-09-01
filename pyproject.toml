@@ -1,0 +1,35 @@
+# Configuration de l'outillage du repo predict.
+#
+# Le projet n'est pas packagé : il n'y a ni [project] ni build-backend. Les
+# modules vivent sous src/ et sont rendus importables par PYTHONPATH, aussi
+# bien en test (pythonpath ci-dessous) que dans l'image Docker. Publier un
+# paquet installable serait un contrat de plus à maintenir pour aucun
+# consommateur : personne n'importe ce code depuis l'extérieur du repo.
+
+[tool.ruff]
+src = ["src", "tests", "scripts"]
+target-version = "py311"
+# 88 et non 80 : les docstrings de src/inference/schemas.py alimentent les
+# descriptions du contrat OpenAPI gelé. Les replier pour tenir en 80 colonnes
+# insérerait un retour à la ligne dans les descriptions et ferait échouer le
+# job contract-drift sans aucune évolution métier.
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["etl", "inference", "training"]
+
+[tool.pytest.ini_options]
+# src/ n'est pas installé : pytest doit l'ajouter au chemin d'import lui-même.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

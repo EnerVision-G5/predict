@@ -14,8 +14,9 @@ import json
 import sys
 from pathlib import Path
 
-# Permet l'exécution directe du script depuis la racine du repo.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Permet l'exécution directe du script depuis la racine du repo : les
+# modules vivent sous src/, qui n'est pas installé comme paquet.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from inference.app import CONTRACT_VERSION, app  # noqa: E402
 

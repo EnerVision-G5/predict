@@ -1,0 +1,30 @@
+# Dépendances ETL et ML, épinglées à la version exacte.
+#
+# Un entraînement doit être reproductible : un modèle enregistré dans MLflow
+# n'a de sens que si on peut réinstaller l'environnement qui l'a produit. Une
+# montée de version se fait donc explicitement, dans une PR dédiée, avec un
+# ré-entraînement de contrôle.
+#
+# Le jeu de versions ci-dessous tient sur Python 3.11 (version de la CI) comme
+# sur Python 3.13 (postes de développement). numpy 2.5 et xgboost 3.3 exigent
+# Python 3.12 minimum : ne pas les monter sans faire passer la CI à 3.12.
+
+# Ingestion
+requests==2.34.2
+
+# Transformation
+numpy==2.4.6
+# pandas reste en 2.3 : mlflow 3.15 exige pandas<3.
+pandas==2.3.3
+
+# Chargement en base
+SQLAlchemy==2.0.52
+psycopg[binary]==3.3.5
+
+# Modélisation
+scikit-learn==1.9.0
+xgboost==3.2.0
+prophet==1.4.0
+
+# Suivi des expériences et registre de modèles
+mlflow==3.15.2
