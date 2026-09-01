@@ -6,8 +6,7 @@ on:
 
 env:
   # Branche du repo enervision qui porte le contrat gelé de référence.
-  # temporaire, rebasculer sur develop après merge du gel initial (voir PR enervision EV-06)
-  CONTRACTS_REF: EADL_2026_NANTES_G5/EV-06-contrats-openapi
+  CONTRACTS_REF: develop
 
 jobs:
   contract-drift:
