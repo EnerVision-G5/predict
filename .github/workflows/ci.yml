@@ -29,8 +29,11 @@ jobs:
           ref: ${{ env.CONTRACTS_REF }}
           path: enervision
           # Le GITHUB_TOKEN par défaut ne lit pas les autres repos privés de
-          # l'organisation : un token dédié en lecture seule reste nécessaire.
-          token: ${{ secrets.CONTRACTS_READ_TOKEN }}
+          # l'organisation. On passe par une clé de déploiement en lecture seule
+          # posée sur enervision, dont la partie privée est le secret ci-dessous.
+          # Une clé de déploiement n'est liée à aucun compte, contrairement à un
+          # PAT qui expire ou disparaît avec le départ de son porteur.
+          ssh-key: ${{ secrets.CONTRACTS_SSH_KEY }}
 
       - name: Comparer le code au contrat gelé
         run: |
