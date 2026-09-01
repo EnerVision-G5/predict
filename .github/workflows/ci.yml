@@ -9,11 +9,37 @@ env:
   CONTRACTS_REF: develop
 
 jobs:
+  lint-test-build:
+    name: Lint, tests et build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt ruff pytest
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Tests (pytest)
+        run: python -m pytest -q
+
+      - name: Build (génération de la spécification OpenAPI)
+        run: python scripts/export_openapi.py > /dev/null
+
   contract-drift:
     name: Dérive du contrat OpenAPI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - uses: actions/setup-python@v5
         with:
