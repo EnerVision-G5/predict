@@ -10,7 +10,9 @@ venv/
 # modèles enregistrés. Ils sont versionnés par MLflow, jamais par Git.
 mlruns/
 
-# Extractions locales de l'API Mock et exports intermédiaires.
+# Couches d'artefacts : partitions brutes et variables. Elles sont
+# reproductibles à partir de la source et d'une commande datée, ce qui est
+# exactement ce qu'un dépôt de code n'a pas à porter.
 data/
 
 # Sorties de notebooks.

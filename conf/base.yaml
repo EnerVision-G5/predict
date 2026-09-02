@@ -1,0 +1,117 @@
+# Configuration commune aux quatre services.
+#
+# Elle ne porte aucun secret : les valeurs sensibles et celles qui changent
+# d'une machine à l'autre sont écrites `${VARIABLE}` et résolues dans
+# l'environnement au chargement. Un `${VARIABLE:-defaut}` accepte une valeur
+# de repli, un `${VARIABLE}` sans repli est obligatoire et fait échouer le
+# démarrage s'il manque.
+#
+# Ce fichier est la couche de base. `conf/{PREDICT_ENV}.yaml` se superpose à
+# lui clé par clé, sans jamais le remplacer en bloc : une surcharge locale
+# n'a à écrire que ce qu'elle change.
+
+storage:
+  # Racine des partitions de variables. Un chemin local en développement, une
+  # URI s3:// vers Garage en déploiement. Les deux traversent le même code :
+  # voir predict_common/io.py.
+  #
+  # La couche brute n'est pas ici : c'est la table `mesure`, plus bas.
+  root: ${PREDICT_STORAGE_ROOT:-data}
+
+database:
+  # Couche brute de la chaîne. Le collecteur y écrit les mesures de la source,
+  # l'ETL les y relit et y repose ce qu'il en déduit. La base est fournie par
+  # api/enervision-db, qui détient le schéma figé v1.0.
+  #
+  # Le repli est vide et non une URL de développement : une valeur par défaut
+  # ferait démarrer le collecteur contre une base qui n'existe pas, et l'échec
+  # arriverait à la première écriture au lieu du démarrage.
+  url: ${DATABASE_URL:-}
+  # Taille des lots d'insertion. Une journée de sept sites à la minute fait une
+  # dizaine de milliers de lignes : les soumettre d'un bloc ferait un paquet
+  # que le driver doit entièrement matérialiser.
+  batch_size: 1000
+
+source:
+  # API Mock IoT. Le port fait partie de la valeur : aucune adresse n'est en
+  # dur dans le code, le collecteur concatène cette URL et le chemin.
+  base_url: ${MOCK_API_URL:-http://localhost:8000}
+  sites_path: /api/v1/sites
+  # Le site est un paramètre de requête, pas un segment de chemin : c'est le
+  # contrat de la source, qui expose une seule route d'historique.
+  readings_path: /api/v1/readings
+  current_path: /api/v1/sites/{site_id}/current
+  # Taille de page du rattrapage, plafonnée à 1000 par la source. La
+  # pagination avance par le temps et non par un rang : une page pleine fait
+  # repartir la requête du dernier horodatage reçu.
+  page_size: 1000
+  timeout_s: 30
+  # Reprises immédiates d'un appel avant abandon, et attente entre deux
+  # tentatives. L'attente croît avec le rang de la tentative.
+  retries: 3
+  backoff_s: 2
+  # Débit maximal sortant, en requêtes par seconde. 0 lève la limite. La
+  # borne protège la source, pas le collecteur : un rattrapage sur 7 sites
+  # et 90 jours envoie des milliers de pages.
+  rate_limit_rps: 10
+
+collector:
+  # Cadence d'interrogation de /current en mode continu. La source produit
+  # une mesure par minute et par site : descendre plus bas relit la même
+  # valeur, monter plus haut en perd.
+  poll_interval_s: 60
+  # Timeout d'un appel à /current. Plus court que source.timeout_s : un site
+  # muet ne doit pas retarder les six autres au-delà de leur cadence.
+  poll_timeout_s: 10
+  # Seuil de retard d'ingestion au-delà duquel le journal passe en WARNING.
+  # Trois cadences manquées : en deçà, un à-coup de la source alerterait sans
+  # qu'aucune donnée ne soit perdue.
+  lag_warning_s: 180
+
+etl:
+  # Version du jeu de variables. Elle est dans le chemin des partitions, donc
+  # deux versions coexistent sans se recouvrir et un modèle entraîné sur v1
+  # reste reproductible après la sortie de v2. La changer est un acte
+  # délibéré : voir services/etl/src/etl/features.py.
+  feature_version: v1
+  # Pas de rééchantillonnage de la série. La source produit à la minute, le
+  # modèle prédit à l'heure.
+  resample_rule: 1h
+  # Décalages retenus comme variables explicatives : l'heure précédente porte
+  # l'inertie thermique, 24 h et 168 h les saisonnalités journalière et
+  # hebdomadaire des sites tertiaires.
+  lag_hours: [1, 24, 168]
+  # Fenêtre de la moyenne glissante, en heures.
+  rolling_window_h: 24
+
+training:
+  experiment: ${MLFLOW_EXPERIMENT:-enervision-consumption}
+  registered_model: enervision_xgboost
+  # Découpe temporelle, jamais aléatoire : une coupe au hasard laisserait le
+  # modèle voir le futur d'une même journée pendant l'apprentissage.
+  valid_ratio: 0.15
+  test_ratio: 0.15
+  # Part maximale d'imputation tolérée dans la cible d'une heure. Au-delà,
+  # l'heure décrit surtout ce que l'ETL a reconstruit : l'apprendre
+  # reviendrait à apprendre l'interpolation.
+  max_imputed_ratio: 0.5
+  params:
+    n_estimators: 600
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.9
+    random_state: 42
+  # Arrêt anticipé sur le jeu de validation, en nombre de tours sans gain.
+  early_stopping_rounds: 50
+
+serving:
+  # Alias et non version figée : promouvoir un modèle se fait en déplaçant
+  # l'alias dans MLflow, sans redéployer le service, et le retour arrière est
+  # le même geste en sens inverse.
+  model_uri: ${SERVING_MODEL_URI:-models:/enervision_xgboost@champion}
+  # Le service reconstruit les décalages depuis la dernière partition de
+  # variables produite par l'ETL. Nombre de jours remontés pour la trouver.
+  feature_lookback_days: 10
+
+mlflow:
+  tracking_uri: ${MLFLOW_TRACKING_URI:-http://localhost:5000}
