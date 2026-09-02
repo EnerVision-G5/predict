@@ -10,6 +10,32 @@ import pytest
 from etl.config import EtlConfig
 
 
+class FakeConnection:
+    """Connexion factice qui mémorise les instructions exécutées."""
+
+    def __init__(self, executed):
+        self._executed = executed
+
+    def execute(self, statement):
+        self._executed.append(statement)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class FakeEngine:
+    """Moteur factice : begin() rend une transaction sans base derrière."""
+
+    def __init__(self):
+        self.executed = []
+
+    def begin(self):
+        return FakeConnection(self.executed)
+
+
 @pytest.fixture
 def config() -> EtlConfig:
     """Configuration inoffensive : aucun test ne joint réellement ces hôtes."""

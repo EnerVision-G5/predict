@@ -10,14 +10,16 @@ from __future__ import annotations
 import argparse
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import requests
 from sqlalchemy import create_engine
 
 from etl.config import EtlConfig, load_config
+from etl.exclude import load_exclusions
 from etl.extract import build_session, fetch_readings, fetch_sites
+from etl.impute import impute_frame
 from etl.load import load_frame
 from etl.transform import deduplicate, to_frame
 
@@ -28,13 +30,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RunReport:
-    """Résultat d'un run, par site puis consolidé."""
+    """Résultat d'un run, par site puis consolidé.
+
+    Les mesures écartées sont comptées à part et non retranchées : elles ont
+    bien été chargées, c'est leur usage dans les agrégats qui est refusé.
+    """
 
     rows_per_site: dict[str, int]
+    excluded_per_site: dict[str, int] = field(default_factory=dict)
 
     @property
     def total_rows(self) -> int:
         return sum(self.rows_per_site.values())
+
+    @property
+    def total_excluded(self) -> int:
+        return sum(self.excluded_per_site.values())
 
 
 def window_from_hours(
@@ -75,14 +86,26 @@ def run(
     try:
         targets = resolve_sites(config, sites, session=session)
         rows_per_site: dict[str, int] = {}
+        excluded_per_site: dict[str, int] = {}
         for site_id in targets:
             readings = fetch_readings(
                 config, site_id, start_time, end_time, session=session
             )
-            frame = deduplicate(to_frame(readings))
+            frame = impute_frame(deduplicate(to_frame(readings)))
             rows_per_site[site_id] = load_frame(engine, frame, config.batch_size)
-            logger.info("site %s : %d mesures", site_id, rows_per_site[site_id])
-        return RunReport(rows_per_site=rows_per_site)
+            excluded_per_site[site_id] = load_exclusions(
+                engine, frame, config.batch_size
+            )
+            logger.info(
+                "site %s : %d mesures, %d écartée(s)",
+                site_id,
+                rows_per_site[site_id],
+                excluded_per_site[site_id],
+            )
+        return RunReport(
+            rows_per_site=rows_per_site,
+            excluded_per_site=excluded_per_site,
+        )
     finally:
         session.close()
         engine.dispose()
@@ -116,7 +139,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = load_config()
     start_time, end_time = window_from_hours(args.hours)
     report = run(config, start_time, end_time, sites=args.sites)
-    logger.info("run terminé : %d mesures soumises", report.total_rows)
+    logger.info(
+        "run terminé : %d mesures soumises, %d écartée(s)",
+        report.total_rows,
+        report.total_excluded,
+    )
     return 0
 
 

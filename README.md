@@ -33,6 +33,9 @@ pytest
 | `src/etl/config.py` | Configuration lue dans l'environnement |
 | `src/etl/extract.py` | Lecture paginée de l'API Mock IoT |
 | `src/etl/transform.py` | Normalisation vers les colonnes de `mesure` |
+| `src/etl/quality.py` | Cause de chaque valeur nulle et qualification de la mesure |
+| `src/etl/impute.py` | Valeur reconstruite, dans une colonne séparée de la brute |
+| `src/etl/exclude.py` | Rangement des mesures inexploitables dans `mesure_exclu` |
 | `src/etl/load.py` | Chargement idempotent (`ON CONFLICT DO NOTHING`) |
 | `src/etl/pipeline.py` | Orchestration d'un run, point d'entrée du conteneur |
 | `src/etl/poller.py` | Ingestion continue de `/current`, point d'entrée du conteneur `poller` |
@@ -41,11 +44,57 @@ pytest
 | `src/inference/schemas.py` | `PredictionRequest`, `PredictionPoint`, `PredictionOut` |
 | `src/inference/app.py` | Application FastAPI et `CONTRACT_VERSION` |
 | `scripts/export_openapi.py` | Export de la spécification OpenAPI |
+| `migrations/` | Migrations de base à reporter dans `enervision-db` |
 | `tests/` | Tests unitaires, sans base ni réseau |
 | `notebooks/` | Exploration, jamais de production |
 
 `src/` n'est pas un paquet installé. Il est rendu importable par `PYTHONPATH`
 dans l'image Docker et par `pythonpath` de `pyproject.toml` sous pytest.
+
+## Valeurs manquantes
+
+Une valeur nulle n'est pas une valeur qui manque : c'est un capteur qui dit
+qu'il est tombé. Aucune n'est filtrée, aucune n'est écrasée. La chaîne les
+range en trois temps, et chaque temps a son module.
+
+| Étage | Ce qu'il garantit |
+|---|---|
+| `etl.quality` | Aucune valeur nulle sans motif dans `null_reasons`, et un `data_quality` que les données ne contredisent pas |
+| `etl.impute` | Une valeur reconstruite dans `consumption_kw_imputed`, jamais dans `consumption_kw` |
+| `etl.exclude` | Une mesure ni brute ni reconstruite rangée dans `mesure_exclu` avec sa cause |
+
+`data_quality` retient la plus sévère des deux qualifications, celle de la
+source et celle que les données laissent déduire. La source peut alerter
+au-delà de ce que l'ETL voit, jamais en deçà : un `good` posé sur une
+puissance absente sortirait la panne de `idx_mesure_quality`, l'index d'audit
+des capteurs, qui n'indexe justement que les mesures non `good`.
+
+L'imputation ne travaille que sur le lot d'un site, sans relire la base.
+Une valeur encadrée par deux voisines connues est interpolée sur le temps
+(`interpolation`), une valeur qui n'a qu'un passé est reportée (`locf`), et
+une valeur sans passé ni futur dans le lot n'est pas inventée : elle reste
+nulle, `imputation_method` vaut `none`, et la mesure part dans `mesure_exclu`.
+C'est le cas ordinaire du poller, dont chaque tick ne porte qu'une mesure.
+
+Une exclusion écrite par l'ETL est automatique, donc `exclu_par` reste NULL :
+la colonne est réservée aux exclusions décidées par un analyste. Elle est
+écrite après la mesure et jamais avant, `mesure_exclu` portant une clé
+étrangère vers `mesure`.
+
+### Migration de base requise
+
+Le schéma figé v1.0 n'a ni `consumption_kw_imputed` ni `imputation_method`,
+alors que le contrat gelé `EnergyReadingOut` les déclare déjà. **Tant que la
+migration n'est pas appliquée, tout chargement échoue** : l'ETL écrit ces deux
+colonnes à chaque lot.
+
+```bash
+psql -U enervision -d enervision -f migrations/03_mesure_imputation.sql
+```
+
+Le fichier appartient au repo `enervision-db` : le reporter dans
+`initdb/03_mesure_imputation.sql` pour que toute base créée ensuite le porte
+d'origine. Il est idempotent, donc rejouable sans risque.
 
 ## Dépendances
 
@@ -137,7 +186,8 @@ n'est donc pas déployable.
 fil de l'eau. Il interroge `/current` sur chaque site à cadence fixe, une
 minute par défaut, et écrit chaque lecture avec son horodatage, son
 `data_quality` et ses `null_reasons`, par les mêmes étages de transformation
-et de chargement que le rattrapage.
+et de chargement que le rattrapage — qualification, imputation et exclusion
+comprises.
 
 ```bash
 docker compose up -d poller
@@ -174,7 +224,7 @@ apparaît par site, et consolidé par tick :
 
 ```text
 INFO etl.poller site SITE001 : 1 mesure(s), retard 12.4 s, qualité good=1
-INFO etl.poller tick : 7/7 site(s), 7 mesure(s), retard données max 12.4 s, durée 0.83 s
+INFO etl.poller tick : 7/7 site(s), 7 mesure(s) dont 0 écartée(s), retard données max 12.4 s, durée 0.83 s
 ```
 
 Au-delà de `ETL_LAG_WARNING_S`, la ligne du site passe en `WARNING` :
