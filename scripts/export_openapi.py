@@ -18,7 +18,7 @@ from pathlib import Path
 # modules vivent sous src/, qui n'est pas installé comme paquet.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from inference.app import CONTRACT_VERSION, app  # noqa: E402
+from inference.app import CONTRACT_VERSION, app
 
 
 def build_spec() -> dict:
