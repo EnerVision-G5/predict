@@ -3,7 +3,13 @@
 Règle structurante héritée de la doc API : les valeurs manquantes ne sont
 jamais filtrées. Une mesure nulle porte une information de panne capteur, elle
 est chargée telle quelle avec son `data_quality` et ses `null_reasons`.
-L'imputation est un traitement aval, elle n'a pas sa place ici.
+L'imputation est un traitement aval, elle n'a pas sa place ici : elle relève
+de `etl.impute`, qui écrit dans une colonne séparée sans jamais toucher à la
+valeur brute normalisée ici.
+
+La qualification, elle, appartient bien à cette étape : un lot qui sortirait
+d'ici avec un null sans motif aurait déjà perdu la panne, et aucune étape aval
+ne saurait la retrouver.
 """
 
 from __future__ import annotations
@@ -12,6 +18,8 @@ from collections.abc import Iterable
 from typing import Any
 
 import pandas as pd
+
+from etl.quality import qualify
 
 # Colonnes de la table `mesure`, dans l'ordre du schéma figé v1.0.
 MEASURE_COLUMNS = (
@@ -37,8 +45,6 @@ NUMERIC_COLUMNS = (
     "temperature_celsius",
     "humidity_percent",
 )
-
-DEFAULT_DATA_QUALITY = "good"
 
 
 class TransformError(ValueError):
@@ -85,15 +91,18 @@ def deduplicate(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _coerce_types(frame: pd.DataFrame) -> pd.DataFrame:
-    """Aligne les types du tableau sur ceux des colonnes de la table."""
+    """Aligne les types du tableau sur ceux des colonnes de la table.
+
+    La qualification vient après la conversion numérique, et pas avant : une
+    valeur illisible devient un NaN à cette étape, et c'est bien un capteur de
+    moins à déclarer dans `null_reasons`.
+    """
     for column in NUMERIC_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame["site_id"] = frame["site_id"].astype("object")
-    frame["data_quality"] = (
-        frame["data_quality"].fillna(DEFAULT_DATA_QUALITY).astype("object")
-    )
+    frame["data_quality"] = frame["data_quality"].astype("object")
     frame["null_reasons"] = frame["null_reasons"].map(_normalize_null_reasons)
-    return frame
+    return qualify(frame, NUMERIC_COLUMNS)
 
 
 def _normalize_null_reasons(value: Any) -> list[str]:

@@ -44,7 +44,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from etl.config import EtlConfig, load_config
+from etl.exclude import load_exclusions
 from etl.extract import ExtractionError, build_session, fetch_current
+from etl.impute import impute_frame
 from etl.load import load_frame
 from etl.pipeline import resolve_sites
 from etl.transform import TransformError, deduplicate, to_frame
@@ -95,6 +97,7 @@ class SiteTick:
     site_id: str
     rows: int
     lag_s: float | None
+    excluded: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,7 @@ class TickReport:
     rows: int
     lags_s: tuple[float, ...]
     failed_sites: tuple[str, ...]
+    excluded: int = 0
 
     @property
     def max_lag_s(self) -> float | None:
@@ -204,7 +208,7 @@ def poll_site(context: PollContext, site_id: str, now: datetime) -> SiteTick:
         sleep=context.stop.wait,
         label=f"site {site_id}",
     )
-    frame = deduplicate(to_frame(records))
+    frame = impute_frame(deduplicate(to_frame(records)))
     dropped = len(records) - len(frame)
     if dropped > 0:
         logger.warning(
@@ -213,9 +217,21 @@ def poll_site(context: PollContext, site_id: str, now: datetime) -> SiteTick:
             dropped,
         )
     rows = load_frame(context.engine, frame, config.batch_size)
+    excluded = load_exclusions(context.engine, frame, config.batch_size)
     lag_s = ingestion_lag_s(frame, now)
     _log_site(site_id, rows, lag_s, quality_summary(frame), config.lag_warning_s)
-    return SiteTick(site_id=site_id, rows=rows, lag_s=lag_s)
+    if excluded:
+        logger.warning(
+            "site %s : %d mesure(s) écartée(s), nulles et non imputables",
+            site_id,
+            excluded,
+        )
+    return SiteTick(
+        site_id=site_id,
+        rows=rows,
+        lag_s=lag_s,
+        excluded=excluded,
+    )
 
 
 def run_tick(
@@ -225,6 +241,7 @@ def run_tick(
 ) -> TickReport:
     """Interroge tous les sites une fois et retourne le bilan du tick."""
     rows = 0
+    excluded = 0
     lags: list[float] = []
     failed: list[str] = []
     for site_id in sites:
@@ -235,12 +252,14 @@ def run_tick(
             logger.error("site %s : tick abandonné (%s)", site_id, exc)
             continue
         rows += tick.rows
+        excluded += tick.excluded
         if tick.lag_s is not None:
             lags.append(tick.lag_s)
     return TickReport(
         rows=rows,
         lags_s=tuple(lags),
         failed_sites=tuple(failed),
+        excluded=excluded,
     )
 
 
@@ -409,10 +428,12 @@ def _log_tick(report: TickReport, requested: int, duration_s: float) -> None:
     """Journalise le bilan d'un tick, retard de données compris."""
     lag = "n/a" if report.max_lag_s is None else f"{report.max_lag_s:.1f} s"
     logger.info(
-        "tick : %d/%d site(s), %d mesure(s), retard données max %s, durée %.2f s",
+        "tick : %d/%d site(s), %d mesure(s) dont %d écartée(s),"
+        " retard données max %s, durée %.2f s",
         requested - len(report.failed_sites),
         requested,
         report.rows,
+        report.excluded,
         lag,
         duration_s,
     )
