@@ -12,6 +12,13 @@ sept sites à la minute dépasse le million de lignes : les matérialiser toutes
 avant d'en écrire une seule ferait sortir le processus sur un défaut de
 mémoire, très loin de la ligne qui l'a causé.
 
+Elle avance par le temps, et non par un rang. La source ne connaît pas
+d'`offset` : elle rend au plus `limit` mesures à partir de `start_time`.
+Réclamer la page suivante consiste donc à redemander la même fenêtre à partir
+du dernier horodatage reçu. Une pagination par rang, ici, redemanderait
+indéfiniment la même page — la boucle ne s'arrêterait jamais, et rien dans le
+journal ne dirait pourquoi.
+
 Les reprises absorbent la micro-coupure, et elle seule. L'attente croît avec le
 rang de la tentative : une coupure qui dure ne se règle pas en insistant à la
 même cadence. Au-delà, l'échec remonte — c'est à l'appelant, qui sait s'il
@@ -28,12 +35,16 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
 
 from predict_common.config import Config
+
+# Nom de l'horodatage tel que la source le sert. Le collecteur le traduit à
+# l'écriture ; ici, il ne sert qu'à savoir où reprendre la pagination.
+SOURCE_TIMESTAMP_FIELD = "timestamp"
 
 logger = logging.getLogger(__name__)
 
@@ -159,27 +170,50 @@ class SourceClient:
         start_time: datetime,
         end_time: datetime,
     ) -> Iterator[dict[str, Any]]:
-        """Itère les mesures d'un site sur une fenêtre, page par page."""
-        path = self.settings.readings_path.format(site_id=site_id)
-        offset = 0
-        while True:
+        """Itère les mesures d'un site sur une fenêtre, page par page.
+
+        Une page pleine signifie que la source a tronqué : la suivante repart
+        du dernier horodatage reçu. Une page incomplète signifie qu'il n'y a
+        plus rien, et la boucle s'arrête là.
+        """
+        path = self.settings.readings_path
+        limit = self.settings.page_size
+        cursor = start_time
+        previous: datetime | None = None
+        while cursor <= end_time:
             payload = self._get_json(
                 path,
                 params={
-                    "start_time": start_time.isoformat(),
+                    "site_id": site_id,
+                    "start_time": cursor.isoformat(),
                     "end_time": end_time.isoformat(),
-                    "limit": self.settings.page_size,
-                    "offset": offset,
+                    "limit": limit,
                 },
-                label=f"site {site_id} offset {offset}",
+                label=f"site {site_id} depuis {cursor.isoformat()}",
             )
-            items = payload.get("items", []) if isinstance(payload, dict) else []
+            items = _as_readings(payload, path)
             if not items:
                 return
             yield from items
-            # L'API pagine par offset : sans avance stricte, une page pleine
-            # relancerait indéfiniment la même requête.
-            offset += len(items)
+            if len(items) < limit:
+                return
+            latest = _latest_timestamp(items)
+            if latest is None or (previous is not None and latest <= previous):
+                # Sans avance stricte, la même fenêtre serait redemandée sans
+                # fin. Mieux vaut une journée incomplète, et le dire, qu'un
+                # processus qui tourne indéfiniment sans rien produire.
+                logger.warning(
+                    "site %s : la source ne progresse plus à %s, page"
+                    " abandonnée",
+                    site_id,
+                    cursor.isoformat(),
+                )
+                return
+            previous = latest
+            # Une microseconde après la dernière mesure reçue : la source
+            # borne inclusivement, et repartir d'elle la renverrait en double.
+            # Le doublon serait absorbé plus loin, mais autant ne pas le créer.
+            cursor = latest + timedelta(microseconds=1)
 
     def fetch_current(self, site_id: str) -> list[dict[str, Any]]:
         """Retourne la mesure courante d'un site, toujours sous forme de liste.
@@ -245,6 +279,24 @@ class SourceClient:
                 f"GET {response.url} a répondu {response.status_code}."
             )
         return response.json()
+
+
+def _latest_timestamp(items: list[dict[str, Any]]) -> datetime | None:
+    """Retourne l'horodatage le plus récent d'une page, pour la reprendre.
+
+    Une mesure sans horodatage lisible n'est pas un point de reprise : elle
+    est ignorée ici, et c'est l'écriture qui la comptera comme écartée.
+    """
+    stamps: list[datetime] = []
+    for item in items:
+        raw = item.get(SOURCE_TIMESTAMP_FIELD)
+        if not raw:
+            continue
+        try:
+            stamps.append(datetime.fromisoformat(str(raw).replace("Z", "+00:00")))
+        except ValueError:
+            continue
+    return max(stamps) if stamps else None
 
 
 def _as_readings(payload: Any, path: str) -> list[dict[str, Any]]:

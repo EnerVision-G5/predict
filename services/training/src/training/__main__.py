@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 
@@ -155,12 +156,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Point d'entrée du conteneur d'entraînement."""
+def _configure_logging() -> None:
+    """Arme le journal, et met la sortie standard à l'abri de l'encodage local.
+
+    MLflow imprime des emoji quand il rend la main ; une console Windows en
+    cp1252 lève alors une UnicodeEncodeError au beau milieu d'un run qui, lui,
+    s'est bien passé. On ne peut pas demander à MLflow de se taire, mais on
+    peut faire en sorte qu'un caractère non représentable dégrade l'affichage
+    au lieu d'interrompre le traitement.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Point d'entrée du conteneur d'entraînement."""
+    _configure_logging()
     args = parse_args(argv)
     try:
         config = load_config()
@@ -171,8 +188,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.history_days < 1:
             raise ValueError("--history-days doit valoir au moins 1.")
         train(config, version, end, args.history_days, args.sites)
-    except (ConfigError, PathError, DatasetError, ValueError) as exc:
+    except (ConfigError, PathError, DatasetError) as exc:
         logger.error("entraînement interrompu : %s", exc)
+        return EXIT_FAILED
+    except ValueError as exc:
+        # Les erreurs de la chaîne ont leur type ; celles-ci viennent
+        # d'ailleurs — un hyperparamètre refusé par XGBoost, un encodage de
+        # console. Les ranger sous le même message enverrait chercher la panne
+        # du mauvais côté, alors on dit d'où elle sort.
+        logger.error("erreur inattendue (%s) : %s", type(exc).__name__, exc)
         return EXIT_FAILED
     return EXIT_OK
 

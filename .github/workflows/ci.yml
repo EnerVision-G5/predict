@@ -57,6 +57,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Libérer de la place sur le runner
+        # Un runner GitHub n'a qu'une quinzaine de gigaoctets libres, dont une
+        # bonne part occupée par des outils dont aucun build ici ne se sert :
+        # .NET, Android, GHC, les images Docker préchargées. `load: true`
+        # exporte l'image en archive avant de l'importer, donc la pile
+        # scientifique tient deux fois sur le disque au moment le plus tendu.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc             /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          df -h /
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Construire l'image ${{ matrix.service }}
@@ -68,7 +79,11 @@ jobs:
           load: true
           tags: enervision-${{ matrix.service }}:ci
           cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          # mode=min et non max : le cache d'actions est plafonné à 10 Go pour
+          # tout le dépôt, et quatre images exportant chacune leurs couches
+          # intermédiaires s'évinceraient mutuellement — on paierait le stockage
+          # pour un cache qui ne resservirait jamais.
+          cache-to: type=gha,mode=min,scope=${{ matrix.service }}
 
       - name: Vérifier que le point d'entrée démarre
         # Un service qui ne sait pas afficher son aide ne démarrera pas non
