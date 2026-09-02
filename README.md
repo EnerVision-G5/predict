@@ -35,6 +35,7 @@ pytest
 | `src/etl/transform.py` | Normalisation vers les colonnes de `mesure` |
 | `src/etl/load.py` | Chargement idempotent (`ON CONFLICT DO NOTHING`) |
 | `src/etl/pipeline.py` | Orchestration d'un run, point d'entrée du conteneur |
+| `src/etl/poller.py` | Ingestion continue de `/current`, point d'entrée du conteneur `poller` |
 | `src/training/dataset.py` | Jeu d'apprentissage et variables explicatives |
 | `src/training/train.py` | Entraînement XGBoost et enregistrement MLflow |
 | `src/inference/schemas.py` | `PredictionRequest`, `PredictionPoint`, `PredictionOut` |
@@ -129,6 +130,71 @@ métriques (`mae`, `rmse`, `r2`) et le modèle, enregistré sous
 référence dans `mlflow_run_id`, et le tag du modèle enregistré que
 `PredictionOut.model_version` renverra. Un modèle entraîné hors de ce chemin
 n'est donc pas déployable.
+
+## Ingestion continue
+
+`etl.pipeline` rattrape une fenêtre passée ; `etl.poller` alimente la base au
+fil de l'eau. Il interroge `/current` sur chaque site à cadence fixe, une
+minute par défaut, et écrit chaque lecture avec son horodatage, son
+`data_quality` et ses `null_reasons`, par les mêmes étages de transformation
+et de chargement que le rattrapage.
+
+```bash
+docker compose up -d poller
+docker compose logs -f poller
+```
+
+Le service porte `restart: unless-stopped` : si le processus sort, Docker le
+relance. Une coupure réseau ne le fait pas sortir pour autant, elle est
+absorbée à trois niveaux, du plus fin au plus grossier.
+
+| Niveau | Mécanisme | Ce qu'il couvre |
+|---|---|---|
+| Appel | `ETL_POLL_RETRIES` reprises, attente croissante | Micro-coupure |
+| Tick | Le site en échec est journalisé, les autres sont ingérés | Site indisponible |
+| Conteneur | `restart: unless-stopped` | Sortie du processus |
+
+Un site injoignable ne fait donc perdre qu'un tick, et le tick suivant repart
+une minute plus tard. Seul un démarrage sans référentiel des sites fait sortir
+le processus, avec le code 1, et c'est alors Docker qui reprend la main.
+
+En ligne de commande, hors conteneur :
+
+```bash
+PYTHONPATH=src python -m etl.poller
+PYTHONPATH=src python -m etl.poller --interval 30 --site SITE001
+```
+
+### Lire le retard dans les journaux
+
+Deux retards sont journalisés, parce qu'ils ne désignent pas la même panne.
+
+Le **retard de données** est l'âge de la mesure servie par la source. Il
+apparaît par site, et consolidé par tick :
+
+```text
+INFO etl.poller site SITE001 : 1 mesure(s), retard 12.4 s, qualité good=1
+INFO etl.poller tick : 7/7 site(s), 7 mesure(s), retard données max 12.4 s, durée 0.83 s
+```
+
+Au-delà de `ETL_LAG_WARNING_S`, la ligne du site passe en `WARNING` :
+
+```text
+WARNING etl.poller site SITE003 : retard 240.0 s au-delà du seuil 180.0 s, qualité partial=1
+```
+
+Le **retard d'ordonnancement** est celui que le poller a pris lui-même. Il
+n'apparaît que s'il dépasse cinq secondes, et signale un tick qui déborde de
+la cadence :
+
+```text
+WARNING etl.poller retard d'ordonnancement : tick démarré 7.2 s trop tard
+WARNING etl.poller 1 tick(s) sauté(s) : le tick précédent a dépassé la cadence
+```
+
+Un tick sauté n'est pas rejoué : `/current` ne sert que la mesure du moment,
+un rattrapage relirait la même valeur. La cadence reste ancrée sur des
+instants absolus, donc un tick lent ne décale pas les suivants.
 
 ## Contrat OpenAPI
 
