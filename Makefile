@@ -16,6 +16,11 @@ FV   ?= v1
 DAYS ?= 1
 HISTORY_DAYS ?= 90
 
+# Bornes du rattrapage. Un mois par défaut : de quoi renseigner le décalage de
+# 168 heures et laisser à l'entraînement une fenêtre exploitable.
+START ?= $(shell date -u -d "30 days ago" +%F)
+END   ?= $(DATE)
+
 # Chaque cible est un processus indépendant, lançable seul. Les enchaîner ici
 # ne crée aucun couplage : le seul état partagé, ce sont les partitions et le
 # registre MLflow.
@@ -56,10 +61,10 @@ serve:  ## Démarre le service d'inférence en local
 run-day: collect etl train  ## Chaîne complète sur une journée
 	@echo "journée $(DATE) traitée en $(FV)"
 
-backfill:  ## Rattrape N journées : make backfill DATE=2026-09-02 DAYS=30
-	uv run python -m collector --date $(DATE) --days $(DAYS)
+backfill:  ## Rattrape une période : make backfill START=2026-08-01 END=2026-09-01
+	uv run python -m collector --start $(START) --end $(END)
 	@for day in $$(seq $$(($(DAYS) - 1)) -1 0); do \
-		target=$$(date -u -d "$(DATE) -$$day day" +%F); \
+		target=$$(date -u -d "$(END) -$$day day" +%F); \
 		echo "--- etl $$target"; \
 		uv run python -m etl --date $$target --feature-version $(FV) || exit 1; \
 	done

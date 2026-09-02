@@ -1,7 +1,14 @@
-"""Point d'entrée du collecteur : rattrapage d'une ou plusieurs journées.
+"""Point d'entrée du collecteur : rattrapage de l'historique par lot.
 
-    python -m collector --date 2026-09-02
-    python -m collector --date 2026-09-02 --days 7 --site SITE001
+    python -m collector --start 2026-08-01 --end 2026-09-01
+    python -m collector --start 2026-08-01 --end 2026-09-01 --site SITE001
+    python -m collector --date 2026-09-02 --days 7
+
+Deux façons de dire la même chose, parce qu'elles ne servent pas au même
+usage. `--start/--end` nomme une période, ce que fait un analyste qui rattrape
+un historique. `--date/--days` nomme une journée et sa profondeur, ce que fait
+un ordonnanceur qui rejoue la veille : la date y est un paramètre, et la
+profondeur une constante.
 
 Le collecteur remplit la couche brute, qui est la table `mesure` de
 TimescaleDB. Il ne connaît ni l'ETL, ni l'entraînement, ni le service : sa
@@ -29,7 +36,12 @@ from datetime import UTC, date, datetime, time, timedelta
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from collector.client import SourceClient, SourceError, SourceSettings
+from collector.client import (
+    MAX_PAGE_SIZE,
+    SourceClient,
+    SourceError,
+    SourceSettings,
+)
 from collector.sink import sync_sites, to_measures, write
 from predict_common.config import ConfigError, load_config
 from predict_common.db import DatabaseError, open_engine
@@ -120,15 +132,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Collecte des mesures EnerVision vers TimescaleDB.",
     )
     parser.add_argument(
+        "--start",
+        default=None,
+        help="Première journée collectée, incluse, au format YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--end",
+        default=None,
+        help="Dernière journée collectée, incluse. Défaut : --start.",
+    )
+    parser.add_argument(
         "--date",
-        required=True,
-        help="Dernier jour collecté, au format YYYY-MM-DD.",
+        default=None,
+        help="Dernière journée collectée. Forme courte, avec --days.",
     )
     parser.add_argument(
         "--days",
         type=int,
         default=DEFAULT_DAYS,
-        help="Nombre de journées collectées en remontant depuis --date.",
+        help="Nombre de journées remontées depuis --date. Défaut : 1.",
     )
     parser.add_argument(
         "--site",
@@ -136,7 +158,47 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="sites",
         help="Site à collecter. Répétable. Par défaut : tout le référentiel.",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            f"Mesures demandées par requête, au plus {MAX_PAGE_SIZE}."
+            " Défaut : source.page_size."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def requested_days(args: argparse.Namespace) -> list[date]:
+    """Retourne les journées à collecter, dans l'ordre chronologique.
+
+    Les deux formes s'excluent : les mélanger laisserait deux périodes
+    possibles pour un même appel, et le run partirait sur l'une des deux sans
+    que rien ne dise laquelle.
+    """
+    borne = args.start is not None or args.end is not None
+    if borne and args.date is not None:
+        raise ValueError(
+            "--date et --start/--end désignent tous deux la période :"
+            " en choisir une seule."
+        )
+    if borne:
+        if args.start is None:
+            raise ValueError("--end demande --start.")
+        # Une borne haute absente vaut la borne basse : `--start` seul collecte
+        # cette journée, ce qui est la lecture naturelle.
+        first = parse_date(args.start)
+        last = parse_date(args.end) if args.end else first
+        return date_range(first, last)
+    if args.date is None:
+        raise ValueError(
+            "Période absente : donner --start/--end, ou --date avec --days."
+        )
+    if args.days < 1:
+        raise ValueError("--days doit valoir au moins 1.")
+    last = parse_date(args.date)
+    return date_range(last - timedelta(days=args.days - 1), last)
 
 
 def _configure_logging() -> None:
@@ -164,9 +226,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         config = load_config()
-        last_day = parse_date(args.date)
-        days = _requested_days(last_day, args.days)
+        days = requested_days(args)
         settings = SourceSettings.from_config(config)
+        if args.limit is not None:
+            settings = settings.with_page_size(args.limit)
         engine = open_engine(config.get_optional_str("database.url"))
         batch_size = config.get_int("database.batch_size")
     except (ConfigError, DatabaseError, PathError, ValueError) as exc:
@@ -178,7 +241,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         with SourceClient(settings) as client:
             sites = resolve_sites(client, engine, batch_size, args.sites)
             logger.info(
-                "collecte de %d site(s) sur %d journée(s)", len(sites), len(days)
+                "collecte de %d site(s) du %s au %s, %d mesure(s) par requête",
+                len(sites),
+                days[0],
+                days[-1],
+                settings.page_size,
             )
             for day in days:
                 total += collect_day(client, engine, batch_size, day, sites)
@@ -190,12 +257,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info("collecte terminée : %d mesure(s) soumise(s)", total)
     return EXIT_OK
 
-
-def _requested_days(last_day: date, days: int) -> list[date]:
-    """Retourne les journées à collecter, de la plus ancienne à --date."""
-    if days < 1:
-        raise ValueError("--days doit valoir au moins 1.")
-    return date_range(last_day - timedelta(days=days - 1), last_day)
 
 
 if __name__ == "__main__":
