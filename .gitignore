@@ -5,5 +5,16 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Backend store et artefacts MLflow : c'est là que vivent les runs et les
+# modèles enregistrés. Ils sont versionnés par MLflow, jamais par Git.
 mlruns/
+
+# Extractions locales de l'API Mock et exports intermédiaires.
+data/
+
+# Sorties de notebooks.
+.ipynb_checkpoints/
+
+# Secrets d'exécution. Seul .env.example est versionné.
 .env

@@ -85,7 +85,10 @@ def get_health() -> HealthOut:
 def predict(payload: PredictionRequest) -> PredictionOut:
     raise HTTPException(
         status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Contrat EV-06 uniquement. Inférence implémentée par EV-20 et suivants.",
+        detail=(
+            "Contrat EV-06 uniquement. Inférence implémentée par EV-20"
+            " et suivants."
+        ),
     )
 
 
