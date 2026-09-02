@@ -55,6 +55,14 @@ services:
       - --port=5000
       - --backend-store-uri=sqlite:////mlruns/mlflow.db
       - --artifacts-destination=/mlruns/artifacts
+      # MLflow 3 refuse tout en-tête Host qu'il ne reconnaît pas, par
+      # protection contre le DNS rebinding, et répond alors 403 « Invalid Host
+      # header » — y compris à ses propres clients. Sans cette liste, un
+      # conteneur qui appelle `http://mlflow:5000` est rejeté : l'entraînement
+      # ne peut pas ouvrir de run, et le service d'inférence ne peut pas
+      # résoudre son alias. `localhost` et `127.0.0.1` couvrent la navigation
+      # depuis le poste, `mlflow` le réseau interne du compose.
+      - --allowed-hosts=${MLFLOW_ALLOWED_HOSTS:-mlflow:5000,localhost:5000,127.0.0.1:5000}
     ports:
       - "${MLFLOW_PORT:-5000}:5000"
     volumes:

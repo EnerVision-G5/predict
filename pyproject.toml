@@ -39,6 +39,17 @@ dev = [
 # code à elle.
 package = false
 
+# xgboost déclare `nvidia-nccl-cu12` sur Linux : 450 Mo de bibliothèques CUDA
+# pour la seule communication entre plusieurs GPU d'un entraînement distribué.
+# Rien de tout cela ne sert ici — l'entraînement tient sur un CPU et
+# l'inférence est un `predict` — et ce poids ne se voyait pas depuis Windows,
+# où le marqueur ne s'applique pas. Le marqueur ci-dessous est faux partout,
+# ce qui écarte le paquet sans toucher à la déclaration de xgboost.
+#
+# À revoir le jour où un entraînement passe sur GPU : ce serait alors la
+# première chose à réactiver.
+override-dependencies = ["nvidia-nccl-cu12 ; sys_platform == 'never'"]
+
 [tool.uv.workspace]
 members = ["libs/*", "services/*"]
 

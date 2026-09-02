@@ -37,9 +37,13 @@ source:
   # dur dans le code, le collecteur concatène cette URL et le chemin.
   base_url: ${MOCK_API_URL:-http://localhost:8000}
   sites_path: /api/v1/sites
-  readings_path: /api/v1/sites/{site_id}/readings
+  # Le site est un paramètre de requête, pas un segment de chemin : c'est le
+  # contrat de la source, qui expose une seule route d'historique.
+  readings_path: /api/v1/readings
   current_path: /api/v1/sites/{site_id}/current
-  # Taille de page du rattrapage. L'API pagine par offset.
+  # Taille de page du rattrapage, plafonnée à 1000 par la source. La
+  # pagination avance par le temps et non par un rang : une page pleine fait
+  # repartir la requête du dernier horodatage reçu.
   page_size: 1000
   timeout_s: 30
   # Reprises immédiates d'un appel avant abandon, et attente entre deux

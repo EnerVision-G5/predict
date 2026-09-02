@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from collections.abc import Sequence
 from datetime import date
 
@@ -150,12 +151,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Point d'entrée du conteneur ETL."""
+def _configure_logging() -> None:
+    """Arme le journal, et met la sortie standard à l'abri de l'encodage local.
+
+    MLflow imprime des emoji quand il rend la main ; une console Windows en
+    cp1252 lève alors une UnicodeEncodeError au beau milieu d'un run qui, lui,
+    s'est bien passé. On ne peut pas demander à MLflow de se taire, mais on
+    peut faire en sorte qu'un caractère non représentable dégrade l'affichage
+    au lieu d'interrompre le traitement.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Point d'entrée du conteneur ETL."""
+    _configure_logging()
     args = parse_args(argv)
     engine: Engine | None = None
     try:

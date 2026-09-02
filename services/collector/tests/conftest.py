@@ -59,7 +59,7 @@ def settings() -> SourceSettings:
     return SourceSettings(
         base_url="http://mock.invalid",
         sites_path="/api/v1/sites",
-        readings_path="/api/v1/sites/{site_id}/readings",
+        readings_path="/api/v1/readings",
         current_path="/api/v1/sites/{site_id}/current",
         page_size=2,
         timeout_s=1.0,

@@ -13,10 +13,18 @@
 # de version ici et le contrat régénéré, et la faire relire par les trois
 # consommateurs comme n'importe quelle évolution de contrat.
 #
-# mlflow et xgboost sont là pour charger le modèle, pas pour l'entraîner :
-# le format pyfunc restitue le modèle par sa saveur d'origine, qui a besoin de
-# la bibliothèque qui l'a produit. scikit-learn, lui, ne sert qu'aux métriques
-# de l'entraînement et n'est donc pas déclaré.
+# mlflow complet, et non mlflow-skinny, bien que le service ne soit qu'un
+# client du registre. La variante skinny a été essayée : elle résout l'alias
+# sans peine, puis échoue à télécharger l'artefact du modèle
+# (`No such artifact: ''`). Elle n'embarque pas de quoi rapatrier un
+# `models:/…`, ce qui est précisément ce que le service fait au démarrage.
+#
+# Le coût est d'environ 200 Mo — Flask, gunicorn, scikit-learn, matplotlib —
+# dont rien ici ne se sert. C'est un poids assumé : une image plus petite qui
+# ne sait pas charger son modèle ne sert à rien.
+#
+# xgboost reste : le format pyfunc restitue le modèle par sa saveur d'origine,
+# qui a besoin de la bibliothèque qui l'a produit.
 #
 # Ni driver base ni httpx : le service ne parle ni à la source ni à
 # PostgreSQL. Il calcule une prévision et la rend ; l'archiver est le métier

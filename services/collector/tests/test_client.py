@@ -48,23 +48,71 @@ def test_fetch_sites_refuses_a_payload_that_is_not_a_list(make_client) -> None:
 
 
 def test_iter_readings_walks_every_page(make_client, make_reading) -> None:
+    # `page_size` vaut 2 : une page pleine annonce que la source a tronqué.
     pages = [
-        {"items": [make_reading("2026-09-02T00:00:00Z")] * 2},
-        {"items": [make_reading("2026-09-02T02:00:00Z")]},
-        {"items": []},
+        [make_reading("2026-09-02T00:00:00Z"), make_reading("2026-09-02T01:00:00Z")],
+        [make_reading("2026-09-02T02:00:00Z")],
     ]
-    seen: list[int] = []
+    seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        offset = int(request.url.params["offset"])
-        seen.append(offset)
+        seen.append(request.url.params["start_time"])
         return json_response(pages[len(seen) - 1])
 
     client = make_client(handler)
     assert len(list(client.iter_readings("SITE001", *WINDOW))) == 3
-    # L'API pagine par offset : sans avance stricte, une page pleine
-    # relancerait indéfiniment la même requête.
-    assert seen == [0, 2, 3]
+    # La page suivante repart du dernier horodatage reçu, à une microseconde
+    # près : la source borne inclusivement.
+    assert seen[0].startswith("2026-09-02T00:00:00")
+    assert seen[1].startswith("2026-09-02T01:00:00.000001")
+
+
+def test_iter_readings_stops_on_an_incomplete_page(make_client, make_reading) -> None:
+    # Moins que `limit`, c'est qu'il n'y a plus rien : une requête de plus ne
+    # ferait que confirmer le vide.
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return json_response([make_reading("2026-09-02T00:00:00Z")])
+
+    client = make_client(handler)
+    assert len(list(client.iter_readings("SITE001", *WINDOW))) == 1
+    assert len(calls) == 1
+
+
+def test_iter_readings_gives_up_when_the_source_stops_progressing(
+    make_client, make_reading
+) -> None:
+    # Une source qui rendrait toujours la même page pleine ferait tourner la
+    # boucle sans fin. Mieux vaut une journée incomplète, et le dire.
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        stamp = "2026-09-02T00:00:00Z"
+        return json_response([make_reading(stamp), make_reading(stamp)])
+
+    client = make_client(handler)
+    assert len(list(client.iter_readings("SITE001", *WINDOW))) == 4
+    # Deux appels : le second constate l'absence de progrès et s'arrête.
+    assert len(calls) == 2
+
+
+def test_iter_readings_passes_the_site_as_a_query_parameter(
+    make_client, make_reading
+) -> None:
+    # Le site n'est pas un segment de chemin : la source expose une seule
+    # route d'historique pour tous les sites.
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(dict(request.url.params))
+        return json_response([])
+
+    client = make_client(handler)
+    list(client.iter_readings("SITE009", *WINDOW))
+    assert seen["site_id"] == "SITE009"
 
 
 def test_iter_readings_stops_on_the_first_empty_page(make_client) -> None:
@@ -72,7 +120,7 @@ def test_iter_readings_stops_on_the_first_empty_page(make_client) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(1)
-        return json_response({"items": []})
+        return json_response([])
 
     client = make_client(handler)
     assert list(client.iter_readings("SITE001", *WINDOW)) == []
@@ -84,7 +132,7 @@ def test_iter_readings_passes_the_window_to_the_source(make_client) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.update(dict(request.url.params))
-        return json_response({"items": []})
+        return json_response([])
 
     client = make_client(handler)
     list(client.iter_readings("SITE001", *WINDOW))
@@ -169,7 +217,7 @@ def test_settings_read_the_configuration_blocks() -> None:
             "source": {
                 "base_url": "http://mock:8000/",
                 "sites_path": "/sites",
-                "readings_path": "/sites/{site_id}/readings",
+                "readings_path": "/readings",
                 "current_path": "/sites/{site_id}/current",
                 "page_size": 500,
                 "timeout_s": 30,
