@@ -82,14 +82,56 @@ def read_features(
     Une journée absente est ignorée : la source a pu être arrêtée, ou la
     chaîne démarrée en cours de fenêtre. C'est le volume total qui décide si
     l'apprentissage est possible, pas la présence de chaque jour.
+
+    Ignorée, mais pas passée sous silence. `--history-days 90` sur une chaîne
+    qui n'a qu'un mois de partitions produit un modèle appris sur un mois, et
+    rien n'en avertissait : les journées manquantes sont journalisées en
+    `debug` par la couche de stockage, sous le niveau que les services
+    configurent. La proportion manquante est écrite ici, au niveau où elle
+    sera lue, parce qu'elle change ce que le modèle a pu apprendre — une
+    saisonnalité absente de la fenêtre ne s'apprend pas.
     """
-    partitions = [
-        features_partition(root, version, day) for day in date_range(start, end)
-    ]
+    requested = date_range(start, end)
+    partitions = [features_partition(root, version, day) for day in requested]
     frame = io.read_frames(partitions, missing_ok=True)
     if frame.empty:
+        logger.warning(
+            "aucune des %d journée(s) demandées entre %s et %s n'est publiée"
+            " en %s",
+            len(requested),
+            start,
+            end,
+            version,
+        )
         return frame
+    _warn_on_gaps(frame, requested, version)
     return frame.sort_values([SITE_COLUMN, TIMESTAMP_COLUMN]).reset_index(drop=True)
+
+
+def _warn_on_gaps(
+    frame: pd.DataFrame,
+    requested: Sequence[date],
+    version: str,
+) -> None:
+    """Signale l'écart entre la fenêtre demandée et celle réellement lue.
+
+    Les journées présentes sont comptées dans le tableau lu plutôt que sur le
+    stockage : l'information est déjà là, et une seconde interrogation du
+    stockage objet coûterait un appel réseau par journée pour redire ce que
+    les données disent.
+    """
+    present = frame[TIMESTAMP_COLUMN].dt.date.nunique()
+    if present >= len(requested):
+        return
+    logger.warning(
+        "fenêtre demandée : %d journée(s) du %s au %s, %d seulement"
+        " publiée(s) en %s. Le modèle n'apprendra que sur celles-là.",
+        len(requested),
+        requested[0],
+        requested[-1],
+        present,
+        version,
+    )
 
 
 def select(

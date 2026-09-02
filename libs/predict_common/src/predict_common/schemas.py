@@ -174,11 +174,33 @@ MEASURE_SCHEMA = pa.DataFrameSchema(
 # ligne d'apprentissage dégradée, c'est une ligne qui n'a pas sa place. Elle a
 # été écartée par `etl.exclude`, en amont, avec sa cause.
 
-FIXED_FEATURE_COLUMNS = (
+# Deux jeux de colonnes, et non un seul, parce que « ce que l'ETL publie » et
+# « ce que le modèle consomme » ne sont pas la même chose.
+#
+# La température est une mesure réelle, et la partition la garde : elle sert à
+# l'analyse, et elle servira au modèle le jour où une prévision météo
+# alimentera l'inférence. Mais le service d'inférence, lui, ne connaît pas la
+# température des heures à venir — il la présenterait vide à chaque prédiction.
+# Un modèle entraîné dessus apprendrait des séparations qu'il ne pourrait plus
+# emprunter en production : chaque arbre qui teste la température enverrait
+# toutes les lignes servies dans sa branche par défaut. Ce n'est pas une
+# information perdue proprement, c'est un biais fixe que rien ne signale.
+#
+# Les deux listes se recouvrent donc partiellement, et c'est voulu : les sortir
+# d'ici plutôt que de les écrire deux fois est ce qui empêche l'ETL et
+# l'entraînement de diverger sans que rien ne le dise.
+
+PUBLISHED_FIXED_COLUMNS = (
     "hour",
     "day_of_week",
     "is_weekend",
     "temperature_celsius",
+)
+
+MODEL_FIXED_COLUMNS = (
+    "hour",
+    "day_of_week",
+    "is_weekend",
 )
 
 # Bornes calendaires, écrites une fois pour que la contrainte du schéma et le
@@ -204,9 +226,31 @@ def feature_columns(lag_hours: Sequence[int], rolling_window_h: int) -> tuple[st
     le service d'inférence doit présenter ses colonnes. Le déduire d'un même
     appel des deux côtés est ce qui empêche l'entraînement et le service de
     diverger sans que rien ne le dise.
+
+    La température n'en fait pas partie : voir `MODEL_FIXED_COLUMNS`. La
+    surveillance de dérive lit cette même liste, si bien qu'elle mesure la
+    tâche que le service rend vraiment, et non une tâche plus facile.
     """
     return (
-        *FIXED_FEATURE_COLUMNS,
+        *MODEL_FIXED_COLUMNS,
+        *(lag_column(hours) for hours in lag_hours),
+        rolling_column(rolling_window_h),
+    )
+
+
+def published_columns(
+    lag_hours: Sequence[int],
+    rolling_window_h: int,
+) -> tuple[str, ...]:
+    """Retourne les colonnes calculées que l'ETL écrit dans la partition.
+
+    Sur-ensemble de `feature_columns` : la partition porte en plus ce que le
+    modèle ne consomme pas encore. Retirer une colonne d'ici change le contrat
+    de la couche, donc impose une nouvelle `feature_version` ; en retirer une
+    de `feature_columns` ne change que le modèle, que MLflow versionne déjà.
+    """
+    return (
+        *PUBLISHED_FIXED_COLUMNS,
         *(lag_column(hours) for hours in lag_hours),
         rolling_column(rolling_window_h),
     )

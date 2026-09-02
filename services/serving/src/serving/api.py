@@ -176,7 +176,12 @@ def predict(payload: PredictionRequest) -> PredictionOut:
     except NoHistory as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     points = predict_series(
-        model.predict, history, payload.horizon_hours, spec, columns
+        model.predict,
+        history,
+        payload.horizon_hours,
+        spec,
+        columns,
+        residual_std=model.residual_std,
     )
     if not points:
         raise HTTPException(
@@ -192,16 +197,16 @@ def predict(payload: PredictionRequest) -> PredictionOut:
         generated_at=datetime.now(UTC),
         points=[
             PredictionPoint(
-                timestamp=stamp.to_pydatetime(),
-                predicted_consumption_kw=value,
-                # Bornes non calculées : un intervalle de confiance sur une
-                # prévision récurrente demande une estimation de l'erreur qui
-                # s'accumule à chaque pas. Le contrat prévoit leur nullité
-                # depuis l'origine, précisément pour ce cas.
-                lower_bound_kw=None,
-                upper_bound_kw=None,
+                timestamp=point.stamp.to_pydatetime(),
+                predicted_consumption_kw=point.value,
+                # Bornes calculées par `forecast.confidence_band` à partir de
+                # la dispersion que la version servie déclare. Nulles quand la
+                # version ne la déclare pas : le contrat les prévoit
+                # optionnelles depuis l'origine, précisément pour ce cas.
+                lower_bound_kw=point.lower,
+                upper_bound_kw=point.upper,
             )
-            for stamp, value in points
+            for point in points
         ],
     )
 

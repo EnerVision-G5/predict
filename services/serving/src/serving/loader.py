@@ -37,6 +37,11 @@ import pandas as pd
 # d'artefact, un run — n'a pas de version de registre à résoudre.
 ALIAS_PREFIX = "models:/"
 
+# Nom du tag posé par `training.tracking` sur chaque version enregistrée. Écrit
+# des deux côtés, il est la frontière entre l'entraînement et le service : le
+# changer d'un seul côté ferait servir des prévisions sans bornes, en silence.
+RESIDUAL_STD_TAG = "residual_std"
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +61,12 @@ class LoadedModel:
     du contrat lisent pour rattacher une prévision au modèle qui l'a produite.
     Sans elle, une prévision aberrante ne serait imputable à rien.
 
+    `residual_std` est la dispersion de l'erreur mesurée sur le jeu de test au
+    moment de l'entraînement. Elle est portée par un tag de la version, donc
+    elle suit le modèle : promouvoir une autre version change la largeur des
+    intervalles du même geste. Nulle quand la version ne la déclare pas — un
+    modèle enregistré avant cette mesure reste servable, il rend simplement
+    une prévision sans bornes plutôt qu'une bande inventée.
     """
 
     model: Any
@@ -63,6 +74,7 @@ class LoadedModel:
     version: str
     columns: tuple[str, ...]
     dtypes: dict[str, Any]
+    residual_std: float | None = None
 
     def predict(self, features: pd.DataFrame) -> Any:
         """Applique le modèle à un lot, présenté comme sa signature l'exige."""
@@ -163,16 +175,73 @@ def _describe(model: Any, model_uri: str) -> LoadedModel:
             " quelles variables lui présenter, ni dans quel ordre."
         )
     inputs = signature.inputs
+    # Une seule interrogation du registre pour la version et les tags : deux
+    # appels pourraient tomber de part et d'autre d'une promotion et décrire
+    # deux versions différentes dans un même modèle chargé.
+    entry = _registry_entry(model_uri)
     return LoadedModel(
         model=model,
         uri=model_uri,
-        version=_version_of(model, model_uri),
+        version=_version_of(entry, model, model_uri),
         columns=tuple(inputs.input_names()),
         dtypes=dict(zip(inputs.input_names(), inputs.numpy_types(), strict=True)),
+        residual_std=_residual_std_of(entry, model_uri),
     )
 
 
-def _version_of(model: Any, model_uri: str) -> str:
+def _registry_entry(model_uri: str) -> Any:
+    """Retourne la version de registre que l'alias désigne, ou None.
+
+    None n'est pas une panne : un modèle chargé par chemin d'artefact plutôt
+    que par alias n'a pas d'entrée de registre, et reste servable.
+    """
+    name, alias = _parse_alias(model_uri)
+    if not name:
+        return None
+    try:
+        return mlflow.MlflowClient().get_model_version_by_alias(name, alias)
+    except Exception as exc:  # noqa: BLE001 - le registre lève large
+        logger.warning("alias %s non résolu dans le registre : %s", model_uri, exc)
+        return None
+
+
+def _residual_std_of(entry: Any, model_uri: str) -> float | None:
+    """Lit la dispersion de l'erreur dans les tags de la version.
+
+    Une valeur nulle ou négative est refusée plutôt que servie : elle
+    produirait une bande de largeur nulle, c'est-à-dire une prévision annoncée
+    comme certaine. Mieux vaut pas d'intervalle qu'un intervalle faux.
+    """
+    tags = dict(getattr(entry, "tags", None) or {})
+    raw = tags.get(RESIDUAL_STD_TAG)
+    if raw is None:
+        logger.warning(
+            "version servie par %s sans tag %s : les prévisions partiront"
+            " sans intervalle. Réentraîner pose ce tag.",
+            model_uri,
+            RESIDUAL_STD_TAG,
+        )
+        return None
+    try:
+        spread = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "tag %s illisible (%r), prévisions sans intervalle",
+            RESIDUAL_STD_TAG,
+            raw,
+        )
+        return None
+    if spread <= 0:
+        logger.warning(
+            "tag %s non strictement positif (%s), prévisions sans intervalle",
+            RESIDUAL_STD_TAG,
+            spread,
+        )
+        return None
+    return spread
+
+
+def _version_of(entry: Any, model: Any, model_uri: str) -> str:
     """Retourne la version du registre que l'alias désigne aujourd'hui.
 
     C'est cette valeur, et non l'identifiant interne du modèle, que
@@ -185,14 +254,9 @@ def _version_of(model: Any, model_uri: str) -> str:
     version : l'identifiant interne prend alors le relais. Moins précis, mais
     c'est une trace, là où une chaîne vide n'en serait pas une.
     """
-    name, alias = _parse_alias(model_uri)
-    if name:
-        try:
-            return str(
-                mlflow.MlflowClient().get_model_version_by_alias(name, alias).version
-            )
-        except Exception as exc:  # noqa: BLE001 - le registre lève large
-            logger.warning("alias %s non résolu en version : %s", model_uri, exc)
+    version = getattr(entry, "version", None)
+    if version is not None:
+        return str(version)
     metadata = getattr(model, "metadata", None)
     return str(getattr(metadata, "model_uuid", None) or model_uri)
 

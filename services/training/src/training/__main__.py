@@ -37,7 +37,13 @@ from training.dataset import (
     select,
     split_by_time,
 )
-from training.model import ModelParams, best_iteration, evaluate, fit
+from training.model import (
+    ModelParams,
+    best_iteration,
+    evaluate,
+    fit,
+    residual_std,
+)
 
 DEFAULT_HISTORY_DAYS = 90
 
@@ -102,7 +108,14 @@ def train(
 
     with tracking.run(settings, run_name=f"{version}-xgboost"):
         model = fit(train_x, train_y, valid_x, valid_y, params, early_stopping)
-        metrics = evaluate(test_y, model.predict(test_x))
+        # Une seule prédiction sur le test, relue deux fois : la refaire pour
+        # l'écart-type ferait dépendre l'intervalle servi d'un second calcul
+        # que rien ne garantirait identique au premier.
+        predicted = model.predict(test_x)
+        metrics = {
+            **evaluate(test_y, predicted),
+            "residual_std": residual_std(test_y, predicted),
+        }
         tracking.log_params(
             {
                 **params.as_dict(),
@@ -128,6 +141,10 @@ def train(
                 "mae": round(metrics["mae"], 4),
                 "rmse": round(metrics["rmse"], 4),
                 "r2": round(metrics["r2"], 4),
+                # Le service d'inférence lit ce tag pour borner sa prévision.
+                # Un tag et non une métrique de run : le service résout un
+                # alias, il n'a pas à remonter jusqu'au run qui l'a produit.
+                "residual_std": round(metrics["residual_std"], 4),
             },
         )
     if promote and registered:

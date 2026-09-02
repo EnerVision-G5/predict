@@ -19,9 +19,11 @@ from predict_common import io
 from predict_common.paths import features_partition
 from predict_common.schemas import feature_columns, features_arrow_schema
 from serving.forecast import (
+    CONFIDENCE_Z,
     ForecastSpec,
     NoHistory,
     build_row,
+    confidence_band,
     horizon_stamps,
     predict_series,
     read_history,
@@ -158,10 +160,12 @@ class TestBuildRow:
         assert row["lag_1h"] == history.loc[stamp - pd.Timedelta(hours=1)]
         assert row["lag_24h"] == history.loc[stamp - pd.Timedelta(hours=24)]
 
-    def test_the_future_temperature_is_not_invented(self, tmp_path: Path) -> None:
-        # Elle relèverait d'une prévision météo, qui est une source de plus.
+    def test_the_future_temperature_is_not_presented(self, tmp_path: Path) -> None:
+        # Le modèle ne l'attend plus : elle a quitté les variables
+        # explicatives. La présenter vide reviendrait à faire emprunter à
+        # chaque prédiction la branche par défaut des arbres qui la testent.
         row = build_row(series(), horizon_stamps(series(), 1)[0], spec_for(tmp_path))
-        assert pd.isna(row["temperature_celsius"])
+        assert "temperature_celsius" not in row
 
     def test_a_missing_lag_gives_no_row(self, tmp_path: Path) -> None:
         # Inventer sa valeur donnerait une prévision dont rien ne dirait
@@ -223,3 +227,34 @@ class TestPredictSeries:
             lambda frame: [42.0], series(hours=2), 6, spec_for(tmp_path), COLUMNS
         )
         assert points == []
+
+
+class TestConfidenceBand:
+    """La bande dit ce que vaut la prévision, ou ne dit rien."""
+
+    def test_no_spread_gives_no_bounds(self) -> None:
+        # Le contrat les prévoit optionnelles : mieux vaut pas d'intervalle
+        # qu'un intervalle qui ne repose sur rien.
+        assert confidence_band(50.0, 1, None) == (None, None)
+
+    def test_the_band_is_centred_on_the_prediction(self) -> None:
+        lower, upper = confidence_band(50.0, 1, 2.0)
+        assert (lower + upper) / 2 == pytest.approx(50.0)
+
+    def test_the_first_step_is_the_plain_quantile(self) -> None:
+        lower, upper = confidence_band(50.0, 1, 2.0)
+        assert upper - 50.0 == pytest.approx(CONFIDENCE_Z * 2.0)
+
+    def test_the_band_grows_as_the_square_root_of_the_step(self) -> None:
+        # Les erreurs de deux pas successifs s'additionnent en variance, pas
+        # en écart-type : une croissance linéaire donnerait à l'horizon 48 une
+        # bande quatre fois trop large, que personne ne lirait.
+        first = confidence_band(50.0, 1, 2.0)
+        fourth = confidence_band(50.0, 4, 2.0)
+        assert (fourth[1] - fourth[0]) == pytest.approx(2 * (first[1] - first[0]))
+
+    def test_the_lower_bound_is_not_clipped_at_zero(self) -> None:
+        # Le schéma de la couche brute n'interdit pas un soutirage négatif, et
+        # rogner la borne masquerait un modèle qui prédit une aberration.
+        lower, _ = confidence_band(1.0, 1, 10.0)
+        assert lower < 0.0
