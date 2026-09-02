@@ -4,6 +4,8 @@ Usage :
     python scripts/export_openapi.py                 # écrit sur stdout
     python scripts/export_openapi.py chemin.json     # écrit dans le fichier
 
+Le paquet `serving` doit être installé (uv sync à la racine du workspace).
+
 Le JSON est produit avec les clés triées : c'est ce qui rend la comparaison
 avec le contrat gelé déterministe, donc utilisable par le job CI de dérive.
 """
@@ -14,11 +16,7 @@ import json
 import sys
 from pathlib import Path
 
-# Permet l'exécution directe du script depuis la racine du repo : les
-# modules vivent sous src/, qui n'est pas installé comme paquet.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from inference.app import CONTRACT_VERSION, app
+from serving.api import CONTRACT_VERSION, app
 
 
 def build_spec() -> dict:

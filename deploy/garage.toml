@@ -1,0 +1,31 @@
+# Configuration du nœud Garage local.
+#
+# Garage lit toute sa configuration ici : contrairement à d'autres stockages
+# objet, il n'accepte pas d'être réglé par l'environnement seul. Ce fichier
+# décrit un nœud unique, suffisant pour éprouver le déploiement sur un poste ;
+# une installation réelle en aligne plusieurs et change `replication_factor`.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+
+# Un seul nœud : rien à répliquer. Toute autre valeur empêcherait le cluster de
+# se déclarer sain, et les écritures resteraient en attente d'un pair absent.
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+# Secret de l'anneau RPC. Sans valeur réelle en jeu ici — un nœud unique ne
+# parle à personne — mais Garage refuse de démarrer sans.
+rpc_secret = "0000000000000000000000000000000000000000000000000000000000000001"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+# Chemin et non sous-domaine : `s3://enervision/features/...` doit donner
+# `http://garage:3900/enervision/...`, et non `http://enervision.garage:3900`,
+# qui ne résoudrait pas dans le réseau Docker.
+root_domain = ".s3.garage.localhost"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "0000000000000000000000000000000000000000000=" 

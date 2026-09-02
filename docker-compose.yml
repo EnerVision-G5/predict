@@ -1,21 +1,53 @@
-# Pile locale ETL + MLflow.
-# Usage : cp .env.example .env  →  docker compose up -d mlflow
+# Pile locale : MLflow, stockage des artefacts, et les quatre services.
 #
-# La base TimescaleDB n'est volontairement pas déclarée ici : elle est déjà
-# fournie par api/enervision-db/docker-compose.yml, qui porte le schéma figé
-# v1.0. La dupliquer donnerait deux schémas à maintenir et deux vérités sur la
-# table `mesure`. DATABASE_URL pointe donc vers cette base, joignable depuis le
-# conteneur via host.docker.internal.
+# Usage : cp .env.example .env  →  docker compose up -d mlflow serving
+#
+# Deux dépendances ne sont volontairement pas déclarées ici, pour la même
+# raison : elles ont déjà une vérité ailleurs, et la dupliquer en donnerait
+# deux à maintenir.
+#
+# L'API Mock IoT est fournie par le formateur, sur une machine ou une IP qui
+# change. `MOCK_API_URL_CONTAINER` la désigne, et `host.docker.internal`
+# convient quand elle tourne sur la machine hôte.
+#
+# La base TimescaleDB est portée par api/enervision-db/docker-compose.yml, qui
+# détient le schéma figé v1.0. C'est la couche brute de la chaîne : le
+# collecteur y écrit, l'ETL y lit et y repose. La dupliquer ici donnerait deux
+# vérités sur la table `mesure`. `DATABASE_URL_CONTAINER` la désigne.
+#
+# Les trois traitements datés — collector, etl, training — sont derrière le
+# profil `jobs`. Sans lui, un `docker compose up` déclencherait une collecte,
+# une transformation et un entraînement à chaque démarrage de la pile.
+
+x-artifacts: &artifacts
+  # Racine des partitions de variables, montée depuis le poste pour qu'on
+  # puisse ouvrir les parquet produits sans entrer dans un conteneur. En
+  # déploiement, cette valeur devient une URI s3:// vers Garage et le montage
+  # disparaît.
+  PREDICT_STORAGE_ROOT: ${PREDICT_STORAGE_ROOT:-/app/data}
+  PREDICT_ENV: ${PREDICT_ENV:-local}
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+
+x-database: &database
+  # Couche brute. Le `:?` fait échouer le démarrage en nommant la variable :
+  # un conteneur qui partirait sans base écrirait dans le vide et ne le dirait
+  # qu'à la première insertion.
+  DATABASE_URL: ${DATABASE_URL_CONTAINER:?definir DATABASE_URL_CONTAINER dans .env}
+
 services:
   mlflow:
     build:
       context: .
-      dockerfile: docker/etl.Dockerfile
+      dockerfile: services/training/Dockerfile
     container_name: enervision-mlflow
     restart: unless-stopped
     # Le backend store est un SQLite dans le volume mlruns, hors Git : c'est
     # lui qui versionne les runs et les modèles enregistrés. Un file store
-    # simple ne suffirait pas, le Model Registry exige une base.
+    # simple ne suffirait pas, le Model Registry exige une base — et sans
+    # registre, le service d'inférence n'aurait pas d'alias à résoudre.
     entrypoint: ["mlflow"]
     command:
       - server
@@ -23,68 +55,58 @@ services:
       - --port=5000
       - --backend-store-uri=sqlite:////mlruns/mlflow.db
       - --artifacts-destination=/mlruns/artifacts
+      # MLflow 3 refuse tout en-tête Host qu'il ne reconnaît pas, par
+      # protection contre le DNS rebinding, et répond alors 403 « Invalid Host
+      # header » — y compris à ses propres clients. Sans cette liste, un
+      # conteneur qui appelle `http://mlflow:5000` est rejeté : l'entraînement
+      # ne peut pas ouvrir de run, et le service d'inférence ne peut pas
+      # résoudre son alias. `localhost` et `127.0.0.1` couvrent la navigation
+      # depuis le poste, `mlflow` le réseau interne du compose.
+      - --allowed-hosts=${MLFLOW_ALLOWED_HOSTS:-mlflow:5000,localhost:5000,127.0.0.1:5000}
     ports:
       - "${MLFLOW_PORT:-5000}:5000"
     volumes:
       - mlruns:/mlruns
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"
       interval: 15s
       timeout: 5s
       retries: 5
 
-  etl:
+  collector:
     build:
       context: .
-      dockerfile: docker/etl.Dockerfile
-    container_name: enervision-etl
-    # Traitement par lot : il s'exécute, il se termine. Le relancer en boucle
-    # rejouerait la même fenêtre sans fin.
+      dockerfile: services/collector/Dockerfile
+    container_name: enervision-collector
+    # Traitement daté : il s'exécute, il se termine. Le relancer en boucle
+    # rejouerait la même journée sans fin.
     restart: "no"
-    # Sans ce profil, docker compose up déclencherait une ingestion à chaque
-    # démarrage de la pile. Lancement explicite : docker compose run --rm etl
-    profiles: ["etl"]
-    depends_on:
-      mlflow:
-        condition: service_healthy
+    profiles: ["jobs"]
     environment:
-      # Les variables *_CONTAINER et non leurs homonymes du poste : depuis le
-      # conteneur, le localhost du .env désignerait le conteneur lui-même.
-      DATABASE_URL: ${DATABASE_URL_CONTAINER:?definir DATABASE_URL_CONTAINER dans .env}
-      MOCK_API_URL: ${MOCK_API_URL_CONTAINER:-http://host.docker.internal:8000}
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      MLFLOW_EXPERIMENT: ${MLFLOW_EXPERIMENT:-enervision-consumption}
-      ETL_BATCH_SIZE: ${ETL_BATCH_SIZE:-1000}
+      <<: [*artifacts, *database]
+      MOCK_API_URL: ${MOCK_API_URL_CONTAINER:?definir MOCK_API_URL_CONTAINER dans .env}
     extra_hosts:
       # Linux ne résout pas host.docker.internal par défaut, contrairement à
-      # Docker Desktop. Sans cette ligne, l'ETL ne verrait ni la base ni l'API
-      # Mock lancées sur la machine hôte.
+      # Docker Desktop. La ligne ne sert que si la base ou l'API Mock tournent
+      # sur la machine hôte ; avec une IP de réseau, elle est sans effet.
       - "host.docker.internal:host-gateway"
 
   poller:
     build:
       context: .
-      dockerfile: docker/etl.Dockerfile
+      dockerfile: services/collector/Dockerfile
     container_name: enervision-poller
-    # Contrairement au service etl, qui est un traitement par lot, le poller
-    # est un processus long : s'il sort, c'est un incident, et il doit
-    # repartir. unless-stopped et non always, pour qu'un arrêt volontaire de
-    # l'exploitant ne soit pas défait au redémarrage du démon Docker.
+    # Contrairement au collecteur, qui est un traitement daté, le poller est un
+    # processus long : s'il sort, c'est un incident, et il doit repartir.
+    # unless-stopped et non always, pour qu'un arrêt volontaire de l'exploitant
+    # ne soit pas défait au redémarrage du démon Docker.
     restart: unless-stopped
-    entrypoint: ["python", "-m", "etl.poller"]
-    depends_on:
-      mlflow:
-        condition: service_healthy
+    entrypoint: ["python", "-m", "collector.poller"]
     environment:
-      DATABASE_URL: ${DATABASE_URL_CONTAINER:?definir DATABASE_URL_CONTAINER dans .env}
-      MOCK_API_URL: ${MOCK_API_URL_CONTAINER:-http://host.docker.internal:8000}
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      ETL_BATCH_SIZE: ${ETL_BATCH_SIZE:-1000}
-      ETL_POLL_INTERVAL_S: ${ETL_POLL_INTERVAL_S:-60}
-      ETL_POLL_RETRIES: ${ETL_POLL_RETRIES:-1}
-      ETL_POLL_BACKOFF_S: ${ETL_POLL_BACKOFF_S:-2}
-      ETL_POLL_TIMEOUT_S: ${ETL_POLL_TIMEOUT_S:-10}
-      ETL_LAG_WARNING_S: ${ETL_LAG_WARNING_S:-180}
+      <<: [*artifacts, *database]
+      MOCK_API_URL: ${MOCK_API_URL_CONTAINER:?definir MOCK_API_URL_CONTAINER dans .env}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Le poller n'expose pas de port : sa santé se lit dans son journal. On
@@ -96,8 +118,114 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  etl:
+    build:
+      context: .
+      dockerfile: services/etl/Dockerfile
+    container_name: enervision-etl
+    restart: "no"
+    profiles: ["jobs"]
+    environment:
+      <<: [*artifacts, *database]
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  training:
+    build:
+      context: .
+      dockerfile: services/training/Dockerfile
+    container_name: enervision-training
+    restart: "no"
+    profiles: ["jobs"]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      <<: *artifacts
+      MLFLOW_EXPERIMENT: ${MLFLOW_EXPERIMENT:-enervision-consumption}
+    volumes:
+      - ./data:/app/data
+
+  serving:
+    build:
+      context: .
+      dockerfile: services/serving/Dockerfile
+    container_name: enervision-serving
+    restart: unless-stopped
+    # depends_on et non condition: service_healthy : le service démarre même
+    # sans registre joignable, refuse les prévisions en 503 et le dit dans son
+    # journal. Lier son démarrage à MLflow le ferait redémarrer en boucle
+    # pendant une panne du registre, sans qu'aucune sonde ne réponde.
+    depends_on:
+      - mlflow
+    environment:
+      <<: *artifacts
+      SERVING_MODEL_URI: ${SERVING_MODEL_URI:-models:/enervision_xgboost@champion}
+    ports:
+      - "${SERVING_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  garage:
+    # Stockage objet des partitions de variables. Les quatre services
+    # traversent exactement le même code que sur le disque : seule la valeur de
+    # storage.root change, de `data` à `s3://enervision`. Derrière un profil,
+    # parce que le disque suffit au développement courant.
+    image: dxflrs/garage:v1.0.1
+    container_name: enervision-garage
+    profiles: ["garage"]
+    restart: unless-stopped
+    ports:
+      - "${GARAGE_S3_PORT:-3900}:3900"
+      - "${GARAGE_ADMIN_PORT:-3903}:3903"
+    volumes:
+      # Garage lit toute sa configuration dans ce fichier : contrairement à
+      # d'autres stockages objet, il n'accepte pas d'être réglé par
+      # l'environnement seul.
+      - ./deploy/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  garage-init:
+    # Un nœud Garage neuf n'a ni disposition, ni seau, ni clé : il faut les
+    # poser une fois. Le script est idempotent, donc relançable après un
+    # `docker compose down` qui aurait gardé les volumes.
+    image: dxflrs/garage:v1.0.1
+    container_name: enervision-garage-init
+    profiles: ["garage"]
+    depends_on:
+      garage:
+        condition: service_healthy
+    volumes:
+      - ./deploy/garage.toml:/etc/garage.toml:ro
+      - ./deploy/garage-init.sh:/garage-init.sh:ro
+    entrypoint: ["/bin/sh", "/garage-init.sh"]
+    environment:
+      GARAGE_BUCKET: ${GARAGE_BUCKET:-enervision}
+      GARAGE_KEY_NAME: ${GARAGE_KEY_NAME:-predict}
+
 volumes:
-  # Volume nommé : le backend store MLflow survit à docker compose down et
-  # n'entre jamais dans Git.
+  # Volumes nommés : le backend store MLflow et le stockage objet survivent à
+  # docker compose down et n'entrent jamais dans Git. Garage sépare ses
+  # métadonnées de ses données, et les deux doivent survivre ensemble : perdre
+  # les métadonnées rendrait les blocs illisibles.
   mlruns:
+    driver: local
+  garage-meta:
+    driver: local
+  garage-data:
     driver: local
