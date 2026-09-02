@@ -104,6 +104,32 @@ training:
   # Arrêt anticipé sur le jeu de validation, en nombre de tours sans gain.
   early_stopping_rounds: 50
 
+monitoring:
+  # Expérience où atterrissent les mesures d'écart. Séparée de celle des
+  # entraînements : mélanger les deux rendrait illisible la comparaison entre
+  # modèles, chaque run de surveillance venant s'y intercaler.
+  experiment: ${MLFLOW_DRIFT_EXPERIMENT:-enervision-drift}
+
+  # Profondeur évaluée par défaut, en journées. Une semaine : assez pour que
+  # l'erreur moyenne ne dépende pas d'une seule journée atypique, assez court
+  # pour qu'une dérive installée depuis trois jours se voie encore.
+  window_days: 7
+
+  # Seuil d'alerte, exprimé en RAPPORT à l'erreur du modèle sur son jeu de
+  # test au moment de l'entraînement — et non en kilowatts. Un seuil absolu
+  # vaudrait pour un site de 200 kW et serait absurde pour un autre de 1000,
+  # et il faudrait le réviser à chaque réentraînement. Le rapport, lui, suit
+  # le modèle : promouvoir une autre version change la référence du même geste.
+  #
+  # 1.5 tolère 50 % de dégradation. En dessous de 1.2, le bruit d'une semaine
+  # calme suffit à déclencher ; au-delà de 2, on ne détecte plus qu'une panne.
+  mae_alert_ratio: ${DRIFT_ALERT_RATIO:-1.5}
+
+  # En deçà, l'écart mesuré ne veut rien dire : une poignée d'heures suffit à
+  # faire dire n'importe quoi à une moyenne. Le run est alors journalisé sans
+  # verdict plutôt que de produire une alerte que personne ne saura lire.
+  min_rows: 24
+
 serving:
   # Alias et non version figée : promouvoir un modèle se fait en déplaçant
   # l'alias dans MLflow, sans redéployer le service, et le retour arrière est

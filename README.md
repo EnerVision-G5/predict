@@ -166,7 +166,8 @@ make run-day DATE=2026-09-02 FV=v1
 | `services/etl/load.py` | Repose les colonnes déduites dans `mesure` |
 | `services/training/dataset.py` | Lecture des partitions, découpe temporelle |
 | `services/training/model.py` | XGBoost, arrêt anticipé, métriques |
-| `services/training/tracking.py` | MLflow : paramètres, métriques, signature, alias |
+| `services/training/tracking.py` | MLflow : paramètres, métriques, signature, tags, alias |
+| `services/training/drift.py` | Écart prédiction/réel, seuil et verdict |
 | `services/serving/loader.py` | Résolution du modèle par alias |
 | `services/serving/forecast.py` | Historique lu, prévision par récurrence |
 | `services/serving/api.py` | FastAPI, `CONTRACT_VERSION` |
@@ -278,12 +279,24 @@ mlflow.log_param("feature_version", "v1")
 mlflow.log_param("train_window", "2026-06-01/2026-08-31")
 ```
 
+Chaque version enregistrée porte en plus des **tags** qui la décrivent :
+`feature_version`, `train_window`, `sites`, et les trois métriques de son jeu
+de test. Un tag et un alias ne disent pas la même chose — l'alias désigne un
+rôle et se déplace, le tag décrit la version et ne bouge plus. Quelqu'un qui
+ouvre le registre six mois plus tard voit sur quelles variables et sur quelle
+période une version a été entraînée sans avoir à retrouver son run. C'est
+aussi ce qui rend la surveillance possible : la dérive se mesure par rapport à
+ce que la version affichait à l'entraînement.
+
 Le service résout un **alias** au démarrage. Un entraînement produit un
 `challenger`, jamais un `champion` : promouvoir est une décision
 d'exploitation, pas une conséquence automatique de la fin d'un run.
 
 ```bash
-# promouvoir la version 7
+# promouvoir depuis l'entraînement, quand on sait déjà qu'on veut la servir
+python -m training --feature-version v1 --promote
+
+# ou promouvoir après coup une version déjà enregistrée
 mlflow models set-alias -m enervision_xgboost -a champion -v 7
 docker compose restart serving
 ```
@@ -297,6 +310,62 @@ ne peut pas garantir sans perte — un `hour` en `int64` présenté à un modèl
 entraîné sur de l'`int32` est rejeté. Le service présente donc les variables
 exactement comme la signature les déclare, plutôt que d'en tenir une seconde
 copie qui divergerait.
+
+## Surveiller la dérive
+
+Un modèle ne se dégrade pas d'un coup : il se dégrade parce que le monde change
+sous lui — un site qui déplace sa production, un capteur remplacé, une saison
+absente de l'historique. Les métriques du jour de l'entraînement ne disent rien
+de cela : elles ont été mesurées sur des données du passé.
+
+```bash
+python -m training.drift                              # les 7 derniers jours
+python -m training.drift --since 2026-08-26 --until 2026-09-01
+```
+
+Chaque exécution rejoue le modèle **en service** — celui que l'alias `champion`
+désigne, pas le dernier entraîné — sur les mesures arrivées depuis, et publie
+un run dans l'expérience `enervision-drift`.
+
+### Ce qui est mesuré, et ce qui ne l'est pas
+
+L'écart est calculé **à un pas** : chaque heure est prédite à partir de ses
+décalages réels. C'est la même tâche que celle mesurée à l'entraînement, donc
+la seule comparable. Le service d'inférence, lui, prédit par récurrence sur
+48 heures et son erreur s'accumule mécaniquement à chaque pas ; mêler les deux
+rendrait la dégradation du modèle indiscernable de l'effet d'horizon.
+
+### Le seuil
+
+| Réglage | Défaut | Ce qu'il décide |
+|---|---|---|
+| `monitoring.mae_alert_ratio` | **1.5** | Rapport toléré entre l'erreur mesurée et celle du modèle sur son jeu de test |
+| `monitoring.window_days` | 7 | Profondeur évaluée quand aucune borne n'est donnée |
+| `monitoring.min_rows` | 24 | En deçà, le run est publié sans verdict |
+
+Le seuil est un **rapport**, pas des kilowatts. Un écart de 20 kW n'a pas le
+même sens sur un bureau de 200 kW et sur une usine de 1000, et un seuil absolu
+serait à réviser à chaque réentraînement. La référence est l'erreur du modèle
+sur son jeu de test, lue dans le run qui l'a produit : elle suit le modèle, et
+promouvoir une autre version change la référence du même geste.
+
+`1.5` tolère 50 % de dégradation. En dessous de `1.2`, le bruit d'une semaine
+calme suffit à déclencher ; au-delà de `2`, on ne détecte plus qu'une panne.
+`DRIFT_ALERT_RATIO` permet de l'abaisser le temps d'une démonstration, pour
+montrer le chemin d'alerte sans fabriquer de fausses données.
+
+### Le verdict est un code de sortie
+
+Un ordonnanceur n'a pas à lire un journal pour savoir s'il doit alerter.
+
+| Code | Sens |
+|---|---|
+| `0` | Stable, ou trop peu d'heures pour conclure |
+| `1` | La surveillance elle-même a échoué — partitions absentes, registre injoignable |
+| `2` | **Dérive** : l'écart dépasse le seuil |
+
+Le `2` est distinct du `1` à dessein : les confondre ferait chercher un
+problème d'infrastructure là où le modèle a simplement vieilli.
 
 ## Orchestration
 

@@ -85,6 +85,7 @@ def train(
     end: date,
     history_days: int,
     sites: Sequence[str] | None,
+    promote: bool = False,
 ) -> dict[str, float]:
     """Entraîne un modèle sur la fenêtre demandée et enregistre son run."""
     split = load_split(config, version, end, history_days, sites)
@@ -115,7 +116,27 @@ def train(
             }
         )
         tracking.log_metrics(metrics)
-        tracking.log_model(model, settings, valid_x, model.predict(valid_x))
+        registered = tracking.log_model(
+            model,
+            settings,
+            valid_x,
+            model.predict(valid_x),
+            tags={
+                "feature_version": version,
+                "train_window": split.window,
+                "sites": ",".join(sites) if sites else "toutes",
+                "mae": round(metrics["mae"], 4),
+                "rmse": round(metrics["rmse"], 4),
+                "r2": round(metrics["r2"], 4),
+            },
+        )
+    if promote and registered:
+        # Hors du contexte du run : promouvoir n'appartient pas à
+        # l'entraînement, c'est une décision d'exploitation que la ligne de
+        # commande exprime. Le run, lui, est clos dès que le modèle est écrit.
+        tracking.set_alias(
+            settings.registered_model, registered, tracking.PRODUCTION_ALIAS
+        )
     logger.info("entraînement terminé sur %s : %s", split.window, metrics)
     return metrics
 
@@ -153,6 +174,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Expérience MLflow. Défaut : training.experiment.",
     )
+    parser.add_argument(
+        "--promote",
+        action="store_true",
+        help=(
+            "Pose aussi l'alias champion, donc met le modèle en service."
+            " Sans cette option, la version reste challenger."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -187,7 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         end = parse_date(args.until) if args.until else datetime.now(UTC).date()
         if args.history_days < 1:
             raise ValueError("--history-days doit valoir au moins 1.")
-        train(config, version, end, args.history_days, args.sites)
+        train(config, version, end, args.history_days, args.sites, args.promote)
     except (ConfigError, PathError, DatasetError) as exc:
         logger.error("entraînement interrompu : %s", exc)
         return EXIT_FAILED
