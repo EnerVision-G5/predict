@@ -89,6 +89,29 @@ def fetch_readings(
         offset += len(items)
 
 
+def fetch_current(
+    config: EtlConfig,
+    site_id: str,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """Retourne la mesure courante d'un site, telle que servie par la source.
+
+    Le résultat est une liste, jamais un objet seul : le reste de la chaîne
+    travaille par lots, et une source qui répondrait plusieurs mesures d'un
+    coup ne doit pas obliger l'appelant à distinguer les deux cas. Le timeout
+    est celui du mode continu, plus court que celui du rattrapage, pour qu'un
+    site muet ne mange pas la cadence des six autres.
+    """
+    http = session or build_session()
+    path = config.current_path.format(site_id=site_id)
+    response = http.get(
+        f"{config.mock_api_url}{path}",
+        timeout=config.poll_timeout_s,
+    )
+    _raise_for_status(response)
+    return _as_readings(response.json(), path)
+
+
 def _raise_for_status(response: requests.Response) -> None:
     """Transforme une réponse HTTP en échec explicite du run."""
     if response.status_code >= 400:
@@ -96,3 +119,19 @@ def _raise_for_status(response: requests.Response) -> None:
             f"{response.request.method} {response.url} a répondu"
             f" {response.status_code}."
         )
+
+
+def _as_readings(payload: Any, path: str) -> list[dict[str, Any]]:
+    """Ramène les formes acceptables de réponse à une liste de mesures."""
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        if isinstance(items, list):
+            return _as_readings(items, path)
+        return [payload]
+    if isinstance(payload, list):
+        if not all(isinstance(item, dict) for item in payload):
+            raise ExtractionError(f"{path} a renvoyé une liste non exploitable.")
+        return payload
+    raise ExtractionError(
+        f"{path} devait renvoyer une mesure ou une liste de mesures."
+    )
