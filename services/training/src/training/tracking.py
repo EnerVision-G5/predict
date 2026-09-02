@@ -41,6 +41,10 @@ ARTIFACT_NAME = "model"
 # la fin d'un entraînement. Le service, lui, résout `champion`.
 STAGING_ALIAS = "challenger"
 
+# Alias de la version réellement servie. C'est lui que le service d'inférence
+# résout, et lui que la surveillance prend pour référence.
+PRODUCTION_ALIAS = "champion"
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +86,7 @@ def log_model(
     settings: TrackingSettings,
     features: pd.DataFrame,
     predictions: Any,
+    tags: Mapping[str, Any] | None = None,
 ) -> str:
     """Enregistre le modèle avec sa signature et retourne sa version.
 
@@ -98,8 +103,47 @@ def log_model(
     )
     version = _registered_version(info)
     if version:
-        _set_alias(settings.registered_model, version)
+        set_version_tags(settings.registered_model, version, tags or {})
+        set_alias(settings.registered_model, version, STAGING_ALIAS)
     return version
+
+
+def set_version_tags(
+    name: str,
+    version: str,
+    tags: Mapping[str, Any],
+) -> None:
+    """Décrit la version dans le registre, à côté de son alias.
+
+    Un tag et un alias ne disent pas la même chose. L'alias désigne un rôle —
+    qui est servi aujourd'hui — et se déplace ; le tag décrit la version et ne
+    bouge plus. Quelqu'un qui ouvre le registre six mois plus tard voit sur
+    quelles variables et sur quelle période cette version a été entraînée sans
+    avoir à retrouver son run.
+
+    C'est aussi ce qui rend la surveillance possible : la dérive se mesure par
+    rapport à ce que la version affichait à l'entraînement, et il faut savoir
+    ce qu'elle était.
+    """
+    client = mlflow.MlflowClient()
+    for key, value in tags.items():
+        client.set_model_version_tag(name, version, key, str(value))
+    if tags:
+        logger.info(
+            "modèle %s version %s décrit par %d tag(s)", name, version, len(tags)
+        )
+
+
+def set_alias(name: str, version: str, alias: str) -> None:
+    """Pose un alias sur une version du registre.
+
+    Promouvoir, c'est déplacer un alias — pas reconstruire une image ni
+    redéployer un service. Le retour arrière est le même geste en sens
+    inverse, ce qui en fait une opération qu'on ose faire.
+    """
+    client = mlflow.MlflowClient()
+    client.set_registered_model_alias(name, alias, version)
+    logger.info("modèle %s version %s marqué %s", name, version, alias)
 
 
 def _registered_version(info: Any) -> str:
@@ -119,8 +163,19 @@ def _registered_version(info: Any) -> str:
     return str(version)
 
 
-def _set_alias(name: str, version: str) -> None:
-    """Pose l'alias de promotion sur la version qui vient d'être créée."""
+def baseline_metrics(name: str, alias: str) -> dict[str, float]:
+    """Retourne les métriques du run qui a produit la version aliasée.
+
+    C'est la référence de la surveillance : un écart n'a de sens que rapporté
+    à ce que le modèle savait faire quand on l'a accepté. La chercher dans le
+    registre plutôt que dans un fichier garantit qu'elle suit le modèle —
+    promouvoir une autre version change la référence du même geste.
+    """
     client = mlflow.MlflowClient()
-    client.set_registered_model_alias(name, STAGING_ALIAS, version)
-    logger.info("modèle %s version %s marqué %s", name, version, STAGING_ALIAS)
+    version = client.get_model_version_by_alias(name, alias)
+    return dict(client.get_run(version.run_id).data.metrics)
+
+
+def served_version(name: str, alias: str) -> str:
+    """Retourne la version du registre que l'alias désigne aujourd'hui."""
+    return str(mlflow.MlflowClient().get_model_version_by_alias(name, alias).version)

@@ -25,7 +25,7 @@ END   ?= $(DATE)
 # ne crée aucun couplage : le seul état partagé, ce sont les partitions et le
 # registre MLflow.
 .PHONY: help install lint test check collect poll etl train serve run-day \
-        backfill openapi up down clean
+        backfill drift openapi up down clean storage
 
 help:  ## Liste les cibles disponibles
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -54,6 +54,9 @@ etl:  ## `mesure` -> variables d'une journée : make etl DATE=... FV=v1
 train:  ## Entraîne un modèle : make train FV=v1 HISTORY_DAYS=90
 	uv run python -m training --feature-version $(FV) \
 		--history-days $(HISTORY_DAYS) --until $(DATE)
+
+drift:  ## Mesure l'écart prédiction/réel : make drift SINCE=2026-08-26
+	uv run python -m training.drift $(if $(SINCE),--since $(SINCE)) 		$(if $(UNTIL),--until $(UNTIL)) --feature-version $(FV)
 
 serve:  ## Démarre le service d'inférence en local
 	uv run uvicorn serving.api:app --reload
