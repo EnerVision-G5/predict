@@ -14,21 +14,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - uses: actions/setup-python@v5
         with:
+          # 3.11 comme les autres repos du projet. Les versions épinglées de
+          # requirements-ml.txt sont choisies pour tenir sur cette version :
+          # monter numpy ou xgboost impose de monter Python ici d'abord.
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-ml.txt
+            requirements-dev.txt
 
-      - run: pip install -r requirements.txt ruff pytest
+      - run: pip install -r requirements-dev.txt
 
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Tests (pytest)
-        run: python -m pytest -q
+        run: pytest
 
       - name: Build (génération de la spécification OpenAPI)
         run: python scripts/export_openapi.py > /dev/null
@@ -46,6 +51,8 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      # requirements.txt seul : régénérer la spécification ne demande que
+      # fastapi et pydantic, pas la pile ML.
       - run: pip install -r requirements.txt
 
       - name: Récupérer le contrat gelé

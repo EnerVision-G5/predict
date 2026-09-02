@@ -1,0 +1,68 @@
+# Pile locale ETL + MLflow.
+# Usage : cp .env.example .env  →  docker compose up -d mlflow
+#
+# La base TimescaleDB n'est volontairement pas déclarée ici : elle est déjà
+# fournie par api/enervision-db/docker-compose.yml, qui porte le schéma figé
+# v1.0. La dupliquer donnerait deux schémas à maintenir et deux vérités sur la
+# table `mesure`. DATABASE_URL pointe donc vers cette base, joignable depuis le
+# conteneur via host.docker.internal.
+services:
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/etl.Dockerfile
+    container_name: enervision-mlflow
+    restart: unless-stopped
+    # Le backend store est un SQLite dans le volume mlruns, hors Git : c'est
+    # lui qui versionne les runs et les modèles enregistrés. Un file store
+    # simple ne suffirait pas, le Model Registry exige une base.
+    entrypoint: ["mlflow"]
+    command:
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --backend-store-uri=sqlite:////mlruns/mlflow.db
+      - --artifacts-destination=/mlruns/artifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - mlruns:/mlruns
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  etl:
+    build:
+      context: .
+      dockerfile: docker/etl.Dockerfile
+    container_name: enervision-etl
+    # Traitement par lot : il s'exécute, il se termine. Le relancer en boucle
+    # rejouerait la même fenêtre sans fin.
+    restart: "no"
+    # Sans ce profil, docker compose up déclencherait une ingestion à chaque
+    # démarrage de la pile. Lancement explicite : docker compose run --rm etl
+    profiles: ["etl"]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      # Les variables *_CONTAINER et non leurs homonymes du poste : depuis le
+      # conteneur, le localhost du .env désignerait le conteneur lui-même.
+      DATABASE_URL: ${DATABASE_URL_CONTAINER:?definir DATABASE_URL_CONTAINER dans .env}
+      MOCK_API_URL: ${MOCK_API_URL_CONTAINER:-http://host.docker.internal:8000}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT: ${MLFLOW_EXPERIMENT:-enervision-consumption}
+      ETL_BATCH_SIZE: ${ETL_BATCH_SIZE:-1000}
+    extra_hosts:
+      # Linux ne résout pas host.docker.internal par défaut, contrairement à
+      # Docker Desktop. Sans cette ligne, l'ETL ne verrait ni la base ni l'API
+      # Mock lancées sur la machine hôte.
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  # Volume nommé : le backend store MLflow survit à docker compose down et
+  # n'entre jamais dans Git.
+  mlruns:
+    driver: local
