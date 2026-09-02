@@ -1,0 +1,30 @@
+# Service de transformation.
+#
+# SQLAlchemy et psycopg ne servent qu'à la sortie annexe TimescaleDB, qui est
+# désactivée par défaut. Ils restent des dépendances du service et non un
+# extra optionnel : une image qui n'aurait pas le driver échouerait au moment
+# où l'exploitant pose --load-db, c'est-à-dire au pire moment.
+#
+# Aucune dépendance ML : l'ETL produit le jeu d'apprentissage, il ne
+# l'apprend pas.
+
+[project]
+name = "etl"
+version = "0.1.0"
+description = "Transformation des mesures EnerVision en variables."
+requires-python = ">=3.11"
+dependencies = [
+    "predict-common",
+    "SQLAlchemy==2.0.52",
+    "psycopg[binary]==3.3.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/etl"]
+
+[tool.uv.sources]
+predict-common = { workspace = true }

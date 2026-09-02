@@ -1,8 +1,0 @@
-# Environnement de développement complet : service d'inférence, ETL, ML et
-# outillage de qualité. C'est ce fichier qu'installe la CI du job
-# lint-test-build, et c'est lui qu'un nouvel arrivant installe.
--r requirements.txt
--r requirements-ml.txt
-
-pytest==9.1.1
-ruff==0.16.5

@@ -7,36 +7,79 @@ on:
 env:
   # Branche du repo enervision qui porte le contrat gelé de référence.
   CONTRACTS_REF: develop
+  # uv.lock fige la pile entière : la CI installe exactement ce qui tournera
+  # dans les images, et `--frozen` échoue si le lock a dérivé des manifestes.
+  UV_FROZEN: "1"
 
 jobs:
-  lint-test-build:
-    name: Lint, tests et build
+  lint-test:
+    name: Lint et tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
-          # 3.11 comme les autres repos du projet. Les versions épinglées de
-          # requirements-ml.txt sont choisies pour tenir sur cette version :
-          # monter numpy ou xgboost impose de monter Python ici d'abord.
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-ml.txt
-            requirements-dev.txt
+          enable-cache: true
+          cache-dependency-glob: uv.lock
 
-      - run: pip install -r requirements-dev.txt
+      - name: Installer le workspace
+        # 3.11 comme les autres repos du projet. Les versions épinglées sont
+        # choisies pour tenir sur cette version : monter numpy ou xgboost
+        # impose de monter Python ici d'abord.
+        run: uv sync --python 3.11
 
       - name: Lint (ruff)
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: Tests (pytest)
-        run: pytest
+        # La suite couvre les quatre services et la bibliothèque partagée, dont
+        # les tests d'architecture qui vérifient qu'aucun service n'importe le
+        # code d'un autre, et que seuls le collecteur et l'ETL joignent la base.
+        #
+        # Aucun test ne joint PostgreSQL : la base est remplacée par un moteur
+        # qui mémorise les instructions. Ce qui compte n'est pas que PostgreSQL
+        # les accepte — c'est son métier, et le schéma figé le garantit — mais
+        # que chaque service produise la bonne.
+        run: uv run pytest
 
-      - name: Build (génération de la spécification OpenAPI)
-        run: python scripts/export_openapi.py > /dev/null
+  build-images:
+    name: Build des images
+    runs-on: ubuntu-latest
+    # Le build est ce qui vérifie vraiment la séparation : chaque image ne
+    # copie que la bibliothèque partagée et son propre service. Un import d'un
+    # service vers un autre passerait les tests sur un poste, où les quatre
+    # sont installés ensemble, et échouerait ici.
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [collector, etl, training, serving]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construire l'image ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          push: false
+          load: true
+          tags: enervision-${{ matrix.service }}:ci
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Vérifier que le point d'entrée démarre
+        # Un service qui ne sait pas afficher son aide ne démarrera pas non
+        # plus en production, et l'échec serait alors découvert au déploiement.
+        run: |
+          if [ "${{ matrix.service }}" = "serving" ]; then
+            docker run --rm --entrypoint python enervision-serving:ci \
+              -c "import serving.api; print('serving importable')"
+          else
+            docker run --rm enervision-${{ matrix.service }}:ci --help
+          fi
 
   contract-drift:
     name: Dérive du contrat OpenAPI
@@ -46,14 +89,14 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          enable-cache: true
+          cache-dependency-glob: uv.lock
 
-      # requirements.txt seul : régénérer la spécification ne demande que
-      # fastapi et pydantic, pas la pile ML.
-      - run: pip install -r requirements.txt
+      # Le paquet `serving` seul : régénérer la spécification n'a aucune raison
+      # d'installer la pile ETL ni scikit-learn.
+      - run: uv sync --python 3.11 --package serving
 
       - name: Récupérer le contrat gelé
         uses: actions/checkout@v4
@@ -62,14 +105,16 @@ jobs:
           ref: ${{ env.CONTRACTS_REF }}
           path: enervision
           # Le GITHUB_TOKEN par défaut ne lit pas les autres repos privés de
-          # l'organisation. On passe par une clé de déploiement en lecture seule
-          # posée sur enervision, dont la partie privée est le secret ci-dessous.
-          # Une clé de déploiement n'est liée à aucun compte, contrairement à un
-          # PAT qui expire ou disparaît avec le départ de son porteur.
+          # l'organisation. On passe par une clé de déploiement en lecture
+          # seule posée sur enervision, dont la partie privée est le secret
+          # ci-dessous. Une clé de déploiement n'est liée à aucun compte,
+          # contrairement à un PAT qui expire ou disparaît avec son porteur.
           ssh-key: ${{ secrets.CONTRACTS_SSH_KEY }}
 
       - name: Comparer le code au contrat gelé
         run: |
-          python scripts/export_openapi.py > /tmp/openapi-current.json
-          diff -u enervision/docs/contracts/openapi-predict.json /tmp/openapi-current.json \
+          uv run --package serving python scripts/export_openapi.py \
+            > /tmp/openapi-current.json
+          diff -u enervision/docs/contracts/openapi-predict.json \
+            /tmp/openapi-current.json \
             || { echo "::error::Le code a dérivé du contrat gelé. Ouvrir une PR sur enervision/docs/contracts ou corriger le code."; exit 1; }

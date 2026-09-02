@@ -1,0 +1,27 @@
+# Service d'entraînement.
+#
+# Il ne déclare ni httpx ni SQLAlchemy : il ne parle ni à la source ni à la
+# base. Son amont est un ensemble de partitions, son aval est le registre
+# MLflow, et ces deux frontières sont les seules qu'il connaisse.
+
+[project]
+name = "training"
+version = "0.1.0"
+description = "Entraînement des modèles de prévision EnerVision."
+requires-python = ">=3.11"
+dependencies = [
+    "predict-common",
+    "scikit-learn==1.9.0",
+    "xgboost==3.2.0",
+    "mlflow==3.15.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/training"]
+
+[tool.uv.sources]
+predict-common = { workspace = true }
