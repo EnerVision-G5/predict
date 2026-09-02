@@ -1,19 +1,62 @@
-# Configuration de l'outillage du repo predict.
+# Racine du workspace uv du repo predict.
 #
-# Le projet n'est pas packagé : il n'y a ni [project] ni build-backend. Les
-# modules vivent sous src/ et sont rendus importables par PYTHONPATH, aussi
-# bien en test (pythonpath ci-dessous) que dans l'image Docker. Publier un
-# paquet installable serait un contrat de plus à maintenir pour aucun
-# consommateur : personne n'importe ce code depuis l'extérieur du repo.
+# Le repo ne publie pas un paquet : il porte cinq paquets, une bibliothèque
+# partagée et quatre services, chacun avec son propre pyproject et ses propres
+# dépendances. La racine ne sert qu'à trois choses — déclarer les membres du
+# workspace, réunir un environnement unique pour les tests et le lint, et
+# porter la configuration de ruff et de pytest.
+#
+# Ce découpage est ce qui rend la séparation des services vérifiable. Le
+# service serving ne déclare ni pandas, ni xgboost, ni SQLAlchemy : un
+# `from etl.clean import ...` glissé dans son code ne compilerait pas dans son
+# image. La frontière n'est plus une consigne, c'est une contrainte
+# d'installation.
+
+[project]
+name = "predict"
+version = "0.0.0"
+description = "Chaîne de prévision de consommation EnerVision."
+requires-python = ">=3.11"
+# La racine tire les cinq membres : c'est ce qui donne un environnement unique
+# où pytest voit les tests des quatre services d'un coup.
+dependencies = [
+    "predict-common",
+    "collector",
+    "etl",
+    "training",
+    "serving",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.16.5",
+    "httpx==0.28.1",
+]
+
+[tool.uv]
+# Racine virtuelle : elle n'est pas installée comme paquet, elle n'a pas de
+# code à elle.
+package = false
+
+[tool.uv.workspace]
+members = ["libs/*", "services/*"]
+
+[tool.uv.sources]
+predict-common = { workspace = true }
+collector = { workspace = true }
+etl = { workspace = true }
+training = { workspace = true }
+serving = { workspace = true }
 
 [tool.ruff]
-src = ["src", "tests", "scripts"]
 target-version = "py311"
-# 88 et non 80 : les docstrings de src/inference/schemas.py alimentent les
-# descriptions du contrat OpenAPI gelé. Les replier pour tenir en 80 colonnes
-# insérerait un retour à la ligne dans les descriptions et ferait échouer le
-# job contract-drift sans aucune évolution métier.
+# 88 et non 80 : les docstrings de services/serving/src/serving/schemas.py
+# alimentent les descriptions du contrat OpenAPI gelé. Les replier pour tenir
+# en 80 colonnes insérerait un retour à la ligne dans les descriptions et
+# ferait échouer le job contract-drift sans aucune évolution métier.
 line-length = 88
+exclude = ["data", "mlruns", "notebooks"]
 
 [tool.ruff.lint]
 select = [
@@ -26,10 +69,8 @@ select = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["etl", "inference", "training"]
+known-first-party = ["predict_common", "collector", "etl", "training", "serving"]
 
 [tool.pytest.ini_options]
-# src/ n'est pas installé : pytest doit l'ajouter au chemin d'import lui-même.
-pythonpath = ["src"]
-testpaths = ["tests"]
+testpaths = ["tests", "libs", "services"]
 addopts = "-q"
