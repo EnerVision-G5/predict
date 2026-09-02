@@ -22,6 +22,7 @@ from predict_common.schemas import (
     features_schema,
     is_sequence,
     lag_column,
+    published_columns,
     rolling_column,
 )
 
@@ -197,6 +198,34 @@ def test_feature_columns_puts_the_calendar_before_the_lags() -> None:
     # L'ordre est celui de la signature MLflow : le service d'inférence le
     # déduit du même appel, ce qui empêche les deux côtés de diverger.
     assert feature_columns(LAGS, WINDOW) == (
+        "hour",
+        "day_of_week",
+        "is_weekend",
+        "lag_1h",
+        "lag_24h",
+        "lag_168h",
+        "roll_mean_24h",
+    )
+
+
+def test_the_model_is_not_given_the_temperature() -> None:
+    # Le service ne connaît pas la météo des heures qu'il prédit : il la
+    # présenterait vide à chaque requête, et le modèle aurait appris des
+    # séparations qu'il ne pourrait plus emprunter.
+    assert "temperature_celsius" not in feature_columns(LAGS, WINDOW)
+
+
+def test_the_partition_keeps_the_temperature() -> None:
+    # Elle reste une mesure réelle, et servira le jour où une prévision météo
+    # alimentera l'inférence. La sortir de la partition changerait le contrat
+    # de la couche, donc imposerait une feature_version.
+    published = published_columns(LAGS, WINDOW)
+    assert "temperature_celsius" in published
+    assert set(feature_columns(LAGS, WINDOW)) < set(published)
+
+
+def test_published_columns_puts_the_calendar_before_the_lags() -> None:
+    assert published_columns(LAGS, WINDOW) == (
         "hour",
         "day_of_week",
         "is_weekend",

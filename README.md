@@ -244,6 +244,35 @@ Produire une journée demande donc de lire les journées précédentes. La
 profondeur est déduite du plus long décalage — neuf jours pour `lag_168h` — et
 l'ETL le fait seul : `--date` reste la seule chose à lui donner.
 
+### Ce que la partition publie, ce que le modèle apprend
+
+Ce ne sont pas les mêmes colonnes, et les confondre coûtait cher. La
+température est une mesure réelle, la partition la porte — mais le service
+d'inférence ne connaît pas la météo des heures qu'il prédit : il la
+présenterait vide à chaque requête. Un modèle entraîné dessus apprend des
+séparations qu'il ne peut plus emprunter en production, et chaque arbre qui
+teste la température envoie alors toutes les lignes servies dans sa branche
+par défaut. Ce n'est pas une information perdue proprement, c'est un biais
+fixe que rien ne signale — et la surveillance ne le voyait pas, puisqu'elle
+rejoue le modèle sur des partitions où la température, elle, est présente.
+
+Deux listes tiennent donc la distinction, dans `predict_common.schemas` :
+`published_columns` dit ce que l'ETL écrit, `feature_columns` ce que le modèle
+consomme. La seconde est un sous-ensemble de la première.
+
+| Colonne | Publiée | Apprise |
+|---|---|---|
+| `hour`, `day_of_week`, `is_weekend` | oui | oui |
+| `lag_1h`, `lag_24h`, `lag_168h`, `roll_mean_24h` | oui | oui |
+| `temperature_celsius` | oui | **non** |
+| `data_quality`, `imputed_ratio` | oui | non — elles décrivent la ligne |
+
+Retirer une colonne de `published_columns` change le contrat de la couche,
+donc impose une nouvelle `feature_version`. En retirer une de
+`feature_columns` ne change que le modèle, que MLflow versionne déjà : c'est
+pour cela que sortir la température n'a pas demandé de `v2`. Le jour où une
+prévision météo alimentera l'inférence, la colonne est déjà là.
+
 ### Changer de version
 
 `etl.lag_hours`, `etl.rolling_window_h` et `etl.resample_rule` décident des
@@ -468,6 +497,33 @@ Les trois erreurs ne disent pas la même chose, et les confondre enverrait les
 exploitants chercher la panne du mauvais côté : **404** le site n'a pas
 d'historique récent, **422** la requête sort des bornes du contrat, **503** le
 registre n'a résolu aucun modèle.
+
+### L'intervalle de confiance
+
+`lower_bound_kw` et `upper_bound_kw` encadrent chaque point à 95 %. La demi-
+largeur vaut `1.96 × residual_std × √pas`, où `residual_std` est la dispersion
+de l'erreur du modèle **sur son jeu de test**, mesurée à l'entraînement et
+posée en tag sur la version enregistrée.
+
+Un tag et non une constante du service : la dispersion suit le modèle, donc
+promouvoir une autre version change la largeur des intervalles du même geste,
+sans redéployer. Une version qui ne déclare pas ce tag est servie sans bornes
+— le contrat les prévoit optionnelles depuis l'origine — plutôt qu'avec une
+bande inventée dont rien ne dirait qu'elle ne repose sur rien.
+
+La largeur croît en **racine** du pas, et non linéairement. Le service prédit
+par récurrence : chaque heure repart des heures qu'il vient lui-même de
+prédire, et deux erreurs successives s'additionnent en variance, pas en écart-
+type. Une croissance linéaire donnerait à l'horizon 48 une bande quatre fois
+trop large, que personne ne lirait.
+
+C'est une approximation, et elle est optimiste sur deux points : elle suppose
+les erreurs successives indépendantes, et elle ignore que le modèle se trompe
+davantage sur ses propres prédictions que sur des mesures. Elle dit un ordre de
+grandeur, pas une garantie. Elle est en outre **globale** : un seul écart-type
+pour les sept sites, alors qu'ils vont de 90 à 580 kW. La bande est donc large
+pour un petit site et étroite pour un gros. Un `residual_std` par site est la
+suite naturelle.
 
 ## Contrat OpenAPI
 
