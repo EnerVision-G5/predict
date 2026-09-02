@@ -20,6 +20,27 @@ DEFAULT_MLFLOW_EXPERIMENT = "enervision-consumption"
 DEFAULT_BATCH_SIZE = 1000
 DEFAULT_REQUEST_TIMEOUT_S = 30.0
 
+# Le mode continu lit la mesure courante d'un site, pas une page d'historique :
+# c'est un autre endpoint que celui du rattrapage.
+DEFAULT_CURRENT_PATH = "/api/v1/sites/{site_id}/current"
+
+# Une minute : la source produit une mesure par minute et par site. Interroger
+# plus vite relirait la même valeur, plus lentement en perdrait.
+DEFAULT_POLL_INTERVAL_S = 60.0
+
+# Une seule reprise immédiate. Au-delà, insister mangerait la cadence pour
+# rien : la vraie reprise, c'est le tick suivant.
+DEFAULT_POLL_RETRIES = 1
+DEFAULT_POLL_BACKOFF_S = 2.0
+
+# Plus court que le timeout du rattrapage : un site muet ne doit pas retarder
+# les six autres au-delà de leur propre cadence.
+DEFAULT_POLL_TIMEOUT_S = 10.0
+
+# Trois minutes, soit trois cadences manquées : en deçà, un simple à-coup de la
+# source déclencherait une alerte sans qu'aucune donnée ne soit perdue.
+DEFAULT_LAG_WARNING_S = 180.0
+
 
 class ConfigError(RuntimeError):
     """Une variable d'environnement obligatoire manque ou est invalide."""
@@ -35,6 +56,12 @@ class EtlConfig:
     mlflow_experiment: str = DEFAULT_MLFLOW_EXPERIMENT
     batch_size: int = DEFAULT_BATCH_SIZE
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
+    current_path: str = DEFAULT_CURRENT_PATH
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S
+    poll_retries: int = DEFAULT_POLL_RETRIES
+    poll_backoff_s: float = DEFAULT_POLL_BACKOFF_S
+    poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S
+    lag_warning_s: float = DEFAULT_LAG_WARNING_S
 
 
 def read_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -83,6 +110,22 @@ def load_config(env: Mapping[str, str] | None = None) -> EtlConfig:
         batch_size=read_int(source, "ETL_BATCH_SIZE", DEFAULT_BATCH_SIZE),
         request_timeout_s=read_float(
             source, "ETL_REQUEST_TIMEOUT_S", DEFAULT_REQUEST_TIMEOUT_S
+        ),
+        current_path=read_text(
+            source, "MOCK_API_CURRENT_PATH", DEFAULT_CURRENT_PATH
+        ),
+        poll_interval_s=read_float(
+            source, "ETL_POLL_INTERVAL_S", DEFAULT_POLL_INTERVAL_S
+        ),
+        poll_retries=read_int(source, "ETL_POLL_RETRIES", DEFAULT_POLL_RETRIES),
+        poll_backoff_s=read_float(
+            source, "ETL_POLL_BACKOFF_S", DEFAULT_POLL_BACKOFF_S
+        ),
+        poll_timeout_s=read_float(
+            source, "ETL_POLL_TIMEOUT_S", DEFAULT_POLL_TIMEOUT_S
+        ),
+        lag_warning_s=read_float(
+            source, "ETL_LAG_WARNING_S", DEFAULT_LAG_WARNING_S
         ),
     )
 

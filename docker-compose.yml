@@ -61,6 +61,41 @@ services:
       # Mock lancées sur la machine hôte.
       - "host.docker.internal:host-gateway"
 
+  poller:
+    build:
+      context: .
+      dockerfile: docker/etl.Dockerfile
+    container_name: enervision-poller
+    # Contrairement au service etl, qui est un traitement par lot, le poller
+    # est un processus long : s'il sort, c'est un incident, et il doit
+    # repartir. unless-stopped et non always, pour qu'un arrêt volontaire de
+    # l'exploitant ne soit pas défait au redémarrage du démon Docker.
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "etl.poller"]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL_CONTAINER:?definir DATABASE_URL_CONTAINER dans .env}
+      MOCK_API_URL: ${MOCK_API_URL_CONTAINER:-http://host.docker.internal:8000}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      ETL_BATCH_SIZE: ${ETL_BATCH_SIZE:-1000}
+      ETL_POLL_INTERVAL_S: ${ETL_POLL_INTERVAL_S:-60}
+      ETL_POLL_RETRIES: ${ETL_POLL_RETRIES:-1}
+      ETL_POLL_BACKOFF_S: ${ETL_POLL_BACKOFF_S:-2}
+      ETL_POLL_TIMEOUT_S: ${ETL_POLL_TIMEOUT_S:-10}
+      ETL_LAG_WARNING_S: ${ETL_LAG_WARNING_S:-180}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Le poller n'expose pas de port : sa santé se lit dans son journal. On
+    # laisse Docker borner la rotation, sans quoi un processus qui tourne des
+    # semaines finit par remplir le disque de la VM.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
 volumes:
   # Volume nommé : le backend store MLflow survit à docker compose down et
   # n'entre jamais dans Git.
