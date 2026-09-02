@@ -71,3 +71,13 @@ def test_parse_args_accepts_repeated_sites() -> None:
 def test_run_report_totals_every_site() -> None:
     report = RunReport(rows_per_site={"SITE001": 10, "SITE002": 5})
     assert report.total_rows == 15
+
+
+def test_run_report_counts_exclusions_apart_from_rows() -> None:
+    """Une mesure écartée est chargée : la retrancher fausserait le suivi."""
+    report = RunReport(
+        rows_per_site={"SITE001": 10, "SITE002": 5},
+        excluded_per_site={"SITE001": 2},
+    )
+    assert report.total_rows == 15
+    assert report.total_excluded == 2

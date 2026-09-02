@@ -16,7 +16,9 @@ import pandas as pd
 import pytest
 import requests
 
+from etl.exclude import to_exclusions
 from etl.extract import ExtractionError
+from etl.impute import IMPUTED_COLUMN, METHOD_COLUMN, METHOD_NONE
 from etl.poller import (
     EXIT_STARTUP_FAILED,
     PollContext,
@@ -274,6 +276,7 @@ class TestPollSite:
     def _stub_io(self, monkeypatch, make_reading):
         """Remplace la source et la base par des doubles observables."""
         self.loaded: list[pd.DataFrame] = []
+        self.excluded: list[pd.DataFrame] = []
         self.records = [make_reading("2026-01-15T07:59:00Z")]
 
         monkeypatch.setattr(
@@ -285,6 +288,11 @@ class TestPollSite:
             lambda engine, frame, batch_size: self.loaded.append(frame)
             or len(frame),
         )
+        monkeypatch.setattr(
+            "etl.poller.load_exclusions",
+            lambda engine, frame, batch_size: self.excluded.append(frame)
+            or len(to_exclusions(frame)),
+        )
 
     def test_the_current_reading_is_written(self, context) -> None:
         tick = poll_site(context, "SITE001", NOW)
@@ -292,6 +300,35 @@ class TestPollSite:
         assert tick == SiteTick(site_id="SITE001", rows=1, lag_s=60.0)
         assert len(self.loaded) == 1
         assert self.loaded[0]["site_id"].tolist() == ["SITE001"]
+
+    def test_the_written_batch_carries_its_imputation_columns(
+        self, context
+    ) -> None:
+        """Le mode continu passe par les mêmes étages que le rattrapage."""
+        poll_site(context, "SITE001", NOW)
+
+        written = self.loaded[0]
+        assert written.loc[0, IMPUTED_COLUMN] == 87.34
+        assert written.loc[0, METHOD_COLUMN] == METHOD_NONE
+
+    def test_an_outage_alone_on_its_tick_is_filed_and_logged(
+        self, context, make_reading, caplog
+    ) -> None:
+        """Un tick ne porte qu'une mesure : rien ne permet de l'imputer."""
+        self.records = [
+            make_reading(
+                "2026-01-15T07:59:00Z",
+                consumption_kw=None,
+                null_reasons=["sensor_failure"],
+            )
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            tick = poll_site(context, "SITE001", NOW)
+
+        assert tick.excluded == 1
+        assert "1 mesure(s) écartée(s)" in caplog.text
+        assert pd.isna(self.loaded[0].loc[0, "consumption_kw"])
 
     def test_a_silent_site_reports_no_lag(self, context) -> None:
         self.records = []
