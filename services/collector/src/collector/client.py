@@ -34,13 +34,18 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
 
 from predict_common.config import Config
+
+# Plafond de `limit` imposé par la source : au-delà, elle répond 422. Le
+# refuser ici plutôt que de le découvrir en réponse évite de partir sur un
+# rattrapage de trois mois qui échouera à la première page.
+MAX_PAGE_SIZE = 1000
 
 # Nom de l'horodatage tel que la source le sert. Le collecteur le traduit à
 # l'écriture ; ici, il ne sert qu'à savoir où reprendre la pagination.
@@ -98,6 +103,20 @@ class SourceSettings:
     retries: int
     backoff_s: float
     rate_limit_rps: float
+
+    def with_page_size(self, page_size: int) -> SourceSettings:
+        """Retourne les mêmes réglages avec la taille de page demandée.
+
+        La borne est celle de la source, pas une préférence : une valeur plus
+        grande ferait répondre 422 à chaque page, et l'exploitant chercherait
+        la panne du côté du réseau.
+        """
+        if not 1 <= page_size <= MAX_PAGE_SIZE:
+            raise ValueError(
+                f"--limit doit être compris entre 1 et {MAX_PAGE_SIZE},"
+                f" reçu {page_size}."
+            )
+        return replace(self, page_size=page_size)
 
     @classmethod
     def from_config(cls, config: Config) -> SourceSettings:

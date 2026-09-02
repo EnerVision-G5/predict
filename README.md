@@ -62,12 +62,45 @@ dernière partition de variables pour reconstruire les décalages d'un site. Il
 ne les recalcule pas depuis les mesures brutes, ce qui donnerait un second jeu
 de règles qui finirait par diverger du premier.
 
+## Rattraper l'historique
+
+C'est ce qui alimente le premier entraînement. Sans historique, la couche des
+variables n'a pas de quoi calculer un décalage de 168 heures, et le modèle n'a
+rien à apprendre.
+
+```bash
+python -m collector --start 2026-08-01 --end 2026-09-01
+python -m collector --start 2026-08-01 --end 2026-09-01 --site SITE001 --limit 500
+```
+
+Deux façons de dire la période, parce qu'elles ne servent pas au même usage.
+`--start/--end` nomme une période, ce que fait un analyste qui rattrape ;
+`--date/--days` nomme une journée et sa profondeur, ce que fait un
+ordonnanceur, où la date est un paramètre et la profondeur une constante. Les
+deux formes s'excluent : les mélanger laisserait deux périodes possibles pour
+un même appel, et le run partirait sur l'une des deux sans dire laquelle.
+
+`--limit` borne le nombre de mesures demandées par requête. Le plafond est
+celui de la source, **1000**, et il est refusé ici plutôt que découvert dans
+une réponse 422 — sans quoi un rattrapage de trois mois échouerait à sa
+première page, en laissant chercher la panne du côté du réseau.
+
+Sans `--site`, les sept sites du référentiel sont collectés.
+
+**Le rejeu est sans effet de bord.** Relancer la même période ne double rien :
+l'insertion est un `ON CONFLICT DO NOTHING` sur la clé naturelle
+`(site_id, ts)`. Elle n'écrase rien non plus, et c'est le point qui compte pour
+un rattrapage lancé après coup : les lignes visées peuvent déjà porter les
+colonnes que l'ETL a déduites, et un `DO UPDATE` déferait la transformation en
+croyant rafraîchir la source.
+
 ## Les points d'entrée
 
 Chaque service est lançable seul, sans les autres.
 
 ```bash
-python -m collector --date 2026-09-02                    # rattrapage d'une journée
+python -m collector --start 2026-08-01 --end 2026-09-01  # rattrapage d'un mois
+python -m collector --date 2026-09-02                    # une journée, forme courte
 python -m collector.poller                               # collecte au fil de l'eau
 python -m etl       --date 2026-09-02 --feature-version v1
 python -m training  --feature-version v1 --history-days 90
@@ -272,7 +305,7 @@ les enchaîne, et c'est aujourd'hui le `Makefile`.
 
 ```bash
 make run-day DATE=2026-09-02 FV=v1     # collect → etl → train
-make backfill DATE=2026-09-02 DAYS=30  # rattrapage d'un mois
+make backfill START=2026-08-01 END=2026-09-01   # rattrapage d'un mois
 make help                              # toutes les cibles
 ```
 
