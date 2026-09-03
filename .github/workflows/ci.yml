@@ -1,9 +1,11 @@
 name: ci
 
+# Déclenchée uniquement par pull request : sur une branche de travail, chaque
+# push rejouait la CI sans que personne ne lise le résultat avant l'ouverture
+# de la PR. Conséquence assumée : un push direct sur une branche protégée
+# n'est plus testé, le passage par une PR devient la seule voie contrôlée.
 on:
   pull_request:
-  push: 
-    branches: [develop]
 
 env:
   # Branche du repo enervision qui porte le contrat gelé de référence.
