@@ -25,6 +25,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import mlflow
@@ -45,6 +46,11 @@ STAGING_ALIAS = "challenger"
 # résout, et lui que la surveillance prend pour référence.
 PRODUCTION_ALIAS = "champion"
 
+# MLflow date ses runs en millisecondes depuis l'époque ; `date_entrainement`
+# est un TIMESTAMPTZ. La conversion est ici, à côté de ce qui produit la
+# valeur, et le diviseur est nommé plutôt que posé en clair dans le calcul.
+MILLISECONDS_PER_SECOND = 1000
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,6 +63,17 @@ class TrackingSettings:
     registered_model: str
 
 
+def connect(settings: TrackingSettings) -> None:
+    """Fixe le serveur MLflow visé, hors de tout run.
+
+    Les clients de ce module lisent l'URI globale : sans cet appel, une
+    promotion faite sans ouvrir de run s'adresserait au serveur par défaut,
+    c'est-à-dire au répertoire `mlruns` du poste, et poserait l'alias là où
+    personne ne le cherche.
+    """
+    mlflow.set_tracking_uri(settings.tracking_uri)
+
+
 @contextmanager
 def run(settings: TrackingSettings, run_name: str):
     """Ouvre un run MLflow, en fixant serveur et expérience au préalable.
@@ -65,7 +82,7 @@ def run(settings: TrackingSettings, run_name: str):
     métrique hors run : une métrique orpheline part dans l'expérience par
     défaut, où plus personne ne la relie à son modèle.
     """
-    mlflow.set_tracking_uri(settings.tracking_uri)
+    connect(settings)
     mlflow.set_experiment(settings.experiment)
     with mlflow.start_run(run_name=run_name) as active:
         yield active
@@ -106,6 +123,34 @@ def log_model(
         set_version_tags(settings.registered_model, version, tags or {})
         set_alias(settings.registered_model, version, STAGING_ALIAS)
     return version
+
+
+def started_at(active: Any) -> datetime:
+    """Retourne l'instant où le run a commencé, en UTC.
+
+    C'est cette date qui part dans `modele.date_entrainement`, et non l'heure
+    de la promotion : promouvoir six semaines plus tard une version déjà
+    entraînée ne change pas quand elle a appris.
+    """
+    return _as_datetime(active.info.start_time)
+
+
+def version_identity(name: str, version: str) -> tuple[str, datetime]:
+    """Retourne le run d'une version du registre et l'instant où il a commencé.
+
+    C'est ce que la promotion d'une version déjà enregistrée doit inscrire
+    dans `modele`. Les valeurs sont relues dans le registre plutôt que
+    demandées à l'exploitant : un identifiant de run saisi à la main serait
+    une traçabilité qui a l'air d'en être une.
+    """
+    client = mlflow.MlflowClient()
+    run_id = client.get_model_version(name, version).run_id
+    return run_id, _as_datetime(client.get_run(run_id).info.start_time)
+
+
+def _as_datetime(epoch_ms: int) -> datetime:
+    """Convertit un horodatage MLflow en TIMESTAMPTZ exploitable."""
+    return datetime.fromtimestamp(epoch_ms / MILLISECONDS_PER_SECOND, tz=UTC)
 
 
 def set_version_tags(
