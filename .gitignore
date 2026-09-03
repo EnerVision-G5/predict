@@ -26,3 +26,8 @@ data/
 # couverture d'un autre commit que celui qu'on analyse.
 .coverage
 coverage.xml
+
+# Traces du service lancé en tâche de fond par le job DAST, reproduites à
+# l'identique quand on rejoue le scan ZAP en local.
+uvicorn.log
+uvicorn.pid
