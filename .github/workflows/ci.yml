@@ -2,6 +2,8 @@ name: ci
 
 on:
   pull_request:
+  push: 
+    branches: [develop]
 
 env:
   # Branche du repo enervision qui porte le contrat gelé de référence.
