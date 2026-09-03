@@ -1,10 +1,17 @@
 """Repose dans `mesure` ce que l'ETL a déduit, sans toucher à la source.
 
 C'est le `Load` du schéma : la mesure ressort enrichie de ce que les étages
-précédents ont établi. Quatre colonnes seulement sont écrites — la cause de
+précédents ont établi. Cinq colonnes seulement sont écrites — la cause de
 chaque valeur absente, la qualification que les données imposent, la valeur
-reconstruite et la méthode qui l'a produite. Les sept colonnes de mesure ne
-sont jamais réécrites : elles appartiennent au collecteur, et à lui seul.
+reconstruite, la méthode qui l'a produite, et la signature du passage. Les
+sept colonnes de mesure ne sont jamais réécrites : elles appartiennent au
+collecteur, et à lui seul.
+
+La cinquième, `quality_source`, ne décrit pas la mesure mais le traitement.
+Elle bascule de `source` à `etl` et répond à une question que rien d'autre ne
+tranche : ce `good` est-il celui que le collecteur a posé faute de mieux, ou
+celui que la qualification a confirmé. Sans elle, une fenêtre fraîchement
+collectée passerait pour une fenêtre saine.
 
 La distinction n'est pas théorique. Le `DO UPDATE` ci-dessous ne liste que les
 colonnes déduites : même si le lot soumis portait une consommation différente
@@ -35,12 +42,13 @@ from predict_common.db import (
     mesure_exclu,
     write_batches,
 )
+from predict_common.schemas import QUALITY_SOURCE_COLUMN
 
 # Le lot soumis porte toutes les colonnes, parce qu'une insertion en a besoin
 # si la ligne n'existait pas. Seules celles de DERIVED_COLUMNS sont réécrites
 # quand elle existe — et c'est toujours le cas ici, puisque le lot vient d'être
 # lu dans cette même table.
-STORED_COLUMNS = (*SOURCE_COLUMNS, *IMPUTATION_COLUMNS)
+STORED_COLUMNS = (*SOURCE_COLUMNS, *IMPUTATION_COLUMNS, QUALITY_SOURCE_COLUMN)
 
 logger = logging.getLogger(__name__)
 

@@ -26,6 +26,12 @@ Le retard est journalisé sous ses deux formes, parce qu'elles ne désignent pas
 la même panne : le retard de données mesure l'âge de ce que sert la source, le
 retard d'ordonnancement mesure ce que le poller lui-même a pris de retard.
 
+Chaque tick repose en plus son état dans `ingestion_etat`, une ligne par site.
+Le journal ne suffisait pas : personne ne le lit depuis un dashboard, et
+surtout un site en échec n'écrit rien dans `mesure`, si bien que rien en base
+ne le distinguait d'un site dont la source n'avait rien de neuf. Cette
+écriture-là ne peut jamais interrompre la boucle — voir `record_tick`.
+
 Ni le poller ni le rattrapage n'écrasent quoi que ce soit : les deux insèrent
 en `ON CONFLICT DO NOTHING`. Une minute déjà relevée au fil de l'eau n'est donc
 pas réécrite par le rattrapage du lendemain, et surtout, aucun des deux ne
@@ -50,9 +56,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from collector.client import SourceClient, SourceError, SourceSettings
-from collector.sink import sync_sites, to_measures, write
+from collector.sink import IngestionState, sync_sites, to_measures, write, write_state
 from predict_common.config import Config, ConfigError, load_config
-from predict_common.db import DatabaseError, open_engine
+from predict_common.db import INGESTION_SOURCE_POLLER, DatabaseError, open_engine
 from predict_common.schemas import TIMESTAMP_COLUMN
 
 # Le démarrage n'a pas le luxe d'attendre le tick suivant : sans référentiel
@@ -110,11 +116,21 @@ class SiteTick:
 
 @dataclass(frozen=True)
 class TickReport:
-    """Bilan consolidé d'un tick, tel qu'il part au journal."""
+    """Bilan consolidé d'un tick, tel qu'il part au journal et en base."""
 
     rows: int
     lags_s: tuple[float, ...]
-    failed_sites: tuple[str, ...]
+    # Un état par site interrogé, succès comme échec. Le journal en tire son
+    # résumé, `ingestion_etat` en tire ses lignes : les deux disent la même
+    # chose du même tick, ce qui n'est vrai que parce qu'ils partent d'ici.
+    states: tuple[IngestionState, ...]
+
+    @property
+    def failed_sites(self) -> tuple[str, ...]:
+        """Sites dont le tick a échoué, dans l'ordre d'interrogation."""
+        return tuple(
+            state.site_id for state in self.states if not state.succeeded
+        )
 
     @property
     def max_lag_s(self) -> float | None:
@@ -195,21 +211,61 @@ def run_tick(
     sites: Sequence[str],
     now: datetime,
 ) -> TickReport:
-    """Interroge tous les sites une fois et retourne le bilan du tick."""
+    """Interroge tous les sites une fois et retourne le bilan du tick.
+
+    Un état est produit pour chaque site, y compris en échec — et c'est le
+    point : un site qui n'a rien écrit ne laisse aucune trace dans `mesure`,
+    et sans cet état il serait indiscernable d'un site que la source n'avait
+    simplement rien à dire.
+    """
     rows = 0
     lags: list[float] = []
-    failed: list[str] = []
+    states: list[IngestionState] = []
     for site_id in sites:
         try:
             tick = poll_site(context, site_id, now)
         except (SourceError, SQLAlchemyError, OSError, ValueError) as exc:
-            failed.append(site_id)
             logger.error("site %s : tick abandonné (%s)", site_id, exc)
+            states.append(
+                IngestionState(
+                    site_id=site_id,
+                    attempted_at=now,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
             continue
         rows += tick.rows
         if tick.lag_s is not None:
             lags.append(tick.lag_s)
-    return TickReport(rows=rows, lags_s=tuple(lags), failed_sites=tuple(failed))
+        states.append(
+            IngestionState(
+                site_id=site_id,
+                attempted_at=now,
+                rows=tick.rows,
+                data_lag_s=tick.lag_s,
+            )
+        )
+    return TickReport(rows=rows, lags_s=tuple(lags), states=tuple(states))
+
+
+def record_tick(context: PollContext, report: TickReport) -> None:
+    """Repose l'état de collecte du tick, sans jamais interrompre la boucle.
+
+    L'écriture est rattrapée ici et nulle part ailleurs. Un tick dont la base
+    vient de refuser les mesures ne pourra pas non plus y écrire son échec :
+    laisser remonter l'exception ferait mourir le processus au moment précis
+    où il a le plus de raisons de continuer à essayer. Le journal garde alors
+    la trace, et le tick suivant retentera.
+    """
+    try:
+        write_state(
+            context.engine,
+            report.states,
+            context.settings.batch_size,
+            INGESTION_SOURCE_POLLER,
+        )
+    except (SQLAlchemyError, OSError) as exc:
+        logger.error("état d'ingestion non enregistré : %s", exc)
 
 
 def poll_forever(
@@ -232,6 +288,7 @@ def poll_forever(
         started_at = clock()
         _log_skew(started_at, schedule)
         report = run_tick(context, sites, started_at)
+        record_tick(context, report)
         finished_at = clock()
         _log_tick(report, len(sites), (finished_at - started_at).total_seconds())
         completed += 1

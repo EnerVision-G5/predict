@@ -15,9 +15,10 @@
 # collecteur y écrit, l'ETL y lit et y repose. La dupliquer ici donnerait deux
 # vérités sur la table `mesure`. `DATABASE_URL_CONTAINER` la désigne.
 #
-# Les trois traitements datés — collector, etl, training — sont derrière le
-# profil `jobs`. Sans lui, un `docker compose up` déclencherait une collecte,
-# une transformation et un entraînement à chaque démarrage de la pile.
+# Les quatre traitements datés — collector, etl, training, drift — sont
+# derrière le profil `jobs`. Sans lui, un `docker compose up` déclencherait une
+# collecte, une transformation, un entraînement et une surveillance à chaque
+# démarrage de la pile.
 
 x-artifacts: &artifacts
   # Racine des partitions de variables, montée depuis le poste pour qu'on
@@ -150,6 +151,43 @@ services:
     environment:
       <<: [*artifacts, *database]
       MLFLOW_EXPERIMENT: ${MLFLOW_EXPERIMENT:-enervision-consumption}
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Surveillance de dérive. Même image que l'entraînement — c'est le même
+  # paquet — mais un entrypoint différent : `python -m training.drift` là où
+  # l'image sert `python -m training`.
+  #
+  # Derrière le profil `jobs` comme les trois autres traitements datés, et
+  # pour la même raison. Mais à la différence d'un entraînement, celui-ci a
+  # vocation à tourner tous les jours : c'est l'ordonnanceur de
+  # l'infrastructure qui le déclenche (`docker compose --profile jobs run
+  # --rm drift`), comme il déclenche la collecte de la veille. Un indicateur
+  # de dérive affiché sur un dashboard mais produit à la main vieillit en
+  # silence, ce qui est pire que pas d'indicateur du tout.
+  #
+  # Le code de sortie porte le verdict : 0 stable, 2 dérive — d'ensemble ou
+  # d'un seul site — 1 le calcul lui-même a échoué. L'ordonnanceur décide
+  # là-dessus, sans lire le journal.
+  drift:
+    build:
+      context: .
+      dockerfile: services/training/Dockerfile
+    container_name: enervision-drift
+    restart: "no"
+    profiles: ["jobs"]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "training.drift"]
+    # La base n'est pas lue : la surveillance relit les partitions de
+    # variables publiées par l'ETL, pas la couche brute. Elle est déclarée
+    # comme ailleurs pour que la pile échoue au démarrage plutôt qu'en cours.
+    environment:
+      <<: [*artifacts, *database]
+      MLFLOW_DRIFT_EXPERIMENT: ${MLFLOW_DRIFT_EXPERIMENT:-enervision-drift}
     volumes:
       - ./data:/app/data
     extra_hosts:
