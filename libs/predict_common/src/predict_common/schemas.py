@@ -62,6 +62,20 @@ DATA_QUALITY_VALUES = (
     QUALITY_CRITICAL,
 )
 
+# Qui a posé `data_quality` et `null_reasons`, migration
+# 07_mesure_quality_source.sql.
+#
+# `data_quality` est NOT NULL DEFAULT 'good' : le schéma figé ne sait pas dire
+# « pas encore qualifiée ». Le collecteur retombe donc sur le défaut quand la
+# source se tait, et l'ETL repose la qualification à son passage. Sans cette
+# colonne, les deux 'good' sont indiscernables, et une fenêtre non encore
+# traitée par l'ETL passe pour une fenêtre saine — ce que l'indicateur de
+# mesures dégradées publié par l'API métier lirait comme 0 % de dégradation.
+QUALITY_SOURCE_COLUMN = "quality_source"
+QUALITY_SOURCE_SOURCE = "source"
+QUALITY_SOURCE_ETL = "etl"
+QUALITY_SOURCE_VALUES = (QUALITY_SOURCE_SOURCE, QUALITY_SOURCE_ETL)
+
 # Valeurs admises par la contrainte CHECK de `imputation_method`.
 METHOD_NONE = "none"
 METHOD_LOCF = "locf"

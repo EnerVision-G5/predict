@@ -58,7 +58,7 @@ train:  ## Entraîne un modèle : make train FV=v1 HISTORY_DAYS=90
 promote:  ## Met une version en service et l'inscrit dans `modele` : make promote V=7
 	uv run python -m training --promote-version $(V)
 
-drift:  ## Mesure l'écart prédiction/réel : make drift SINCE=2026-08-26
+drift:  ## Mesure la dérive du modèle servi, par site : make drift SINCE=2026-08-26
 	uv run python -m training.drift $(if $(SINCE),--since $(SINCE)) 		$(if $(UNTIL),--until $(UNTIL)) --feature-version $(FV)
 
 serve:  ## Démarre le service d'inférence en local

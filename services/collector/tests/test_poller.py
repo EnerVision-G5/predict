@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from conftest import FakeEngine
+from sqlalchemy.exc import SQLAlchemyError
 
 from collector.client import SourceClient, SourceError
 from collector.poller import (
@@ -23,14 +24,16 @@ from collector.poller import (
     PollContext,
     PollSettings,
     Schedule,
+    TickReport,
     ingestion_lag_s,
     poll_forever,
     poll_site,
     quality_summary,
+    record_tick,
     resolve_targets,
     run_tick,
 )
-from collector.sink import to_measures
+from collector.sink import IngestionState, to_measures
 
 NOW = datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
 
@@ -304,3 +307,90 @@ def test_a_batch_the_source_cannot_place_is_not_written(
     tick = poll_site(context, "SITE001", NOW)
     assert tick.rows == 0
     assert engine.executed == []
+
+
+class TestIngestionState:
+    """Ce que le tick repose en base, et que `mesure` ne peut pas dire.
+
+    Un site en échec n'écrit aucune mesure. Sans cette table, il serait
+    indiscernable d'un site dont la source n'avait rien de neuf — et c'est
+    justement la panne qu'on cherche à voir.
+    """
+
+    @staticmethod
+    def _state_statements(engine: FakeEngine) -> list[str]:
+        """Rend les instructions visant `ingestion_etat`, compilées."""
+        from sqlalchemy.dialects import postgresql
+
+        compiled = [
+            str(statement.compile(dialect=postgresql.dialect()))
+            for statement in engine.executed
+        ]
+        return [text for text in compiled if "ingestion_etat" in text]
+
+    def test_a_successful_tick_records_a_success(
+        self, make_context, make_reading
+    ) -> None:
+        engine = FakeEngine()
+        context = make_context(current(make_reading), engine=engine)
+        report = run_tick(context, ["SITE001"], NOW)
+        record_tick(context, report)
+
+        statements = self._state_statements(engine)
+        assert len(statements) == 1
+        # Le présent, pas un historique : la ligne du site est reposée.
+        assert "DO UPDATE" in statements[0]
+        assert "last_success_at" in statements[0]
+
+    def test_a_failed_tick_records_the_failure(self, make_context) -> None:
+        engine = FakeEngine()
+        context = make_context(lambda _: httpx.Response(503), engine=engine)
+        report = run_tick(context, ["SITE001"], NOW)
+        record_tick(context, report)
+
+        assert report.states[0].succeeded is False
+        statements = self._state_statements(engine)
+        assert len(statements) == 1
+        # Ni la date du dernier succès, ni le nombre de lignes, ni le retard
+        # ne sont touchés : un échec n'a rien à en dire, et les écraser
+        # effacerait la seule chose vraie qu'on sache encore du site.
+        assert "last_success_at" not in statements[0]
+        assert "consecutive_failures" in statements[0]
+
+    def test_a_mixed_tick_records_both_shapes(
+        self, make_context, make_reading, monkeypatch
+    ) -> None:
+        def poll(context, site_id, now):
+            if site_id == "SITE002":
+                raise SourceError("site muet")
+            return poll_site(context, site_id, now)
+
+        monkeypatch.setattr("collector.poller.poll_site", poll)
+        engine = FakeEngine()
+        context = make_context(current(make_reading), engine=engine)
+        record_tick(context, run_tick(context, ["SITE001", "SITE002"], NOW))
+
+        # Deux instructions et non une : succès et échecs ne posent pas les
+        # mêmes colonnes, un lot mixte devrait choisir une forme pour les deux.
+        assert len(self._state_statements(engine)) == 2
+
+    def test_a_database_failure_on_the_state_write_does_not_kill_the_loop(
+        self, make_context, make_reading, caplog
+    ) -> None:
+        # Le tick dont la base vient de refuser les mesures ne pourra pas non
+        # plus y écrire son échec. Mourir là serait mourir au moment précis où
+        # le processus a le plus de raisons de continuer à essayer.
+        class BrokenEngine(FakeEngine):
+            def begin(self):
+                raise SQLAlchemyError("base injoignable")
+
+        engine = BrokenEngine()
+        context = make_context(current(make_reading), engine=engine)
+        report = TickReport(
+            rows=0,
+            lags_s=(),
+            states=(IngestionState(site_id="SITE001", attempted_at=NOW),),
+        )
+        with caplog.at_level(logging.ERROR, logger="collector.poller"):
+            record_tick(context, report)
+        assert "état d'ingestion non enregistré" in caplog.text

@@ -29,6 +29,14 @@ même geste.
 journal pour savoir s'il doit alerter. Le code 2 dit « dérive », distinct du 1
 qui dit « le calcul lui-même a échoué » — les confondre ferait chercher un
 problème de modèle là où il n'y a qu'une base injoignable.
+
+**La mesure est faite site par site autant que d'ensemble.** Une MAE unique
+sur tout le parc est dominée par le plus gros consommateur : elle dit ce que
+le parc coûte en erreur, pas où l'erreur se trouve, et un bureau qui double la
+sienne disparaît dans la moyenne d'une usine dix fois plus grande. Le code 2
+sort donc aussi quand un seul site dérive, sans quoi le détail par site serait
+publié sans jamais être écouté. La référence, elle, reste celle du modèle et
+n'est pas propre au site : voir `SiteMeasure.verdict`.
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ import pandas as pd
 
 from predict_common.config import Config, ConfigError, load_config
 from predict_common.paths import PathError, parse_date
-from predict_common.schemas import feature_columns
+from predict_common.schemas import SITE_COLUMN, feature_columns
 from training import tracking
 from training.dataset import DatasetError, matrices, read_features
 from training.model import evaluate
@@ -63,6 +71,13 @@ EXIT_DRIFTED = 2
 # amplifie les grands écarts et se compare mal d'un site à l'autre.
 DECISION_METRIC = "mae"
 
+# Les quatre conclusions possibles. Nommées parce qu'elles voyagent : le
+# journal les imprime, MLflow les pose en tag, et le code de sortie en dépend.
+VERDICT_STABLE = "stable"
+VERDICT_DRIFTED = "dérive"
+VERDICT_UNDECIDED = "indécis"
+VERDICT_NO_REFERENCE = "sans référence"
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +93,7 @@ class DriftSettings:
     window_days: int
     alert_ratio: float
     min_rows: int
+    min_rows_per_site: int
     registered_model: str
     alias: str
 
@@ -89,8 +105,78 @@ class DriftSettings:
             window_days=config.get_int("monitoring.window_days"),
             alert_ratio=config.get_float("monitoring.mae_alert_ratio"),
             min_rows=config.get_int("monitoring.min_rows"),
+            min_rows_per_site=config.get_int("monitoring.min_rows_per_site"),
             registered_model=config.get_str("training.registered_model"),
             alias=tracking.PRODUCTION_ALIAS,
+        )
+
+
+def error_ratio(
+    metrics: dict[str, float],
+    baseline: dict[str, float],
+) -> float | None:
+    """Rapport entre l'erreur mesurée et celle de l'entraînement.
+
+    `None` quand la référence manque ou vaut zéro : un modèle enregistré sans
+    métrique de test ne permet aucune comparaison, inventer un rapport de 1
+    laisserait croire que tout va bien, et diviser par zéro donnerait un
+    infini, donc une alerte permanente.
+    """
+    reference = baseline.get(DECISION_METRIC)
+    if not reference:
+        return None
+    return metrics[DECISION_METRIC] / reference
+
+
+def verdict_for(
+    metrics: dict[str, float],
+    baseline: dict[str, float],
+    rows: int,
+    min_rows: int,
+    alert_ratio: float,
+) -> str:
+    """Conclut, ou dit pourquoi il n'y a rien à conclure.
+
+    Sortie ici plutôt que portée par le rapport : la même règle tranche pour
+    l'ensemble de la fenêtre et pour chacun de ses sites, avec un plancher de
+    lignes différent. L'écrire deux fois laisserait les deux dériver.
+    """
+    if rows < min_rows:
+        return VERDICT_UNDECIDED
+    ratio = error_ratio(metrics, baseline)
+    if ratio is None:
+        return VERDICT_NO_REFERENCE
+    return VERDICT_DRIFTED if ratio > alert_ratio else VERDICT_STABLE
+
+
+@dataclass(frozen=True)
+class SiteMeasure:
+    """Ce que le modèle servi a donné sur un seul site de la fenêtre."""
+
+    site_id: str
+    metrics: dict[str, float]
+    rows: int
+
+    def verdict(
+        self,
+        settings: DriftSettings,
+        baseline: dict[str, float],
+    ) -> str:
+        """Conclut pour ce site, avec le plancher de lignes qui lui convient.
+
+        La référence reste celle du modèle, mesurée sur tout son jeu de test :
+        elle n'est pas propre au site. Un site structurellement plus difficile
+        que la moyenne paraîtra donc dégradé dès le premier jour. Ce verdict
+        sert à ranger les sites entre eux et à voir l'un d'eux se détacher, pas
+        à juger un site dans l'absolu — une référence par site demanderait que
+        l'entraînement en enregistre une, ce qu'il ne fait pas encore.
+        """
+        return verdict_for(
+            self.metrics,
+            baseline,
+            self.rows,
+            settings.min_rows_per_site,
+            settings.alert_ratio,
         )
 
 
@@ -103,28 +189,38 @@ class DriftReport:
     rows: int
     version: str
     window: str
+    # Le détail par site. Vide quand la partition n'en porte pas la colonne,
+    # ce qui n'empêche pas la mesure d'ensemble d'exister.
+    sites: tuple[SiteMeasure, ...] = ()
 
     @property
     def ratio(self) -> float | None:
-        """Rapport entre l'erreur mesurée et celle de l'entraînement.
-
-        `None` quand la référence manque : un modèle enregistré sans métrique
-        de test ne permet aucune comparaison, et inventer un rapport de 1
-        laisserait croire que tout va bien.
-        """
-        reference = self.baseline.get(DECISION_METRIC)
-        if not reference:
-            return None
-        return self.metrics[DECISION_METRIC] / reference
+        """Rapport entre l'erreur mesurée et celle de l'entraînement."""
+        return error_ratio(self.metrics, self.baseline)
 
     def verdict(self, settings: DriftSettings) -> str:
-        """Dit ce que la mesure permet de conclure, en une ligne de journal."""
-        if self.rows < settings.min_rows:
-            return "indécis"
-        ratio = self.ratio
-        if ratio is None:
-            return "sans référence"
-        return "dérive" if ratio > settings.alert_ratio else "stable"
+        """Dit ce que la mesure d'ensemble permet de conclure."""
+        return verdict_for(
+            self.metrics,
+            self.baseline,
+            self.rows,
+            settings.min_rows,
+            settings.alert_ratio,
+        )
+
+    def drifted_sites(self, settings: DriftSettings) -> tuple[str, ...]:
+        """Sites dont l'erreur dépasse le seuil, dans l'ordre alphabétique.
+
+        C'est la raison d'être de la découpe. Une MAE d'ensemble est dominée
+        par le plus gros consommateur : un site de bureau qui double son
+        erreur disparaît dans la moyenne d'une usine dix fois plus grande, et
+        la dérive qu'on cherche est précisément celle-là.
+        """
+        return tuple(
+            site.site_id
+            for site in self.sites
+            if site.verdict(settings, self.baseline) == VERDICT_DRIFTED
+        )
 
 
 def window(
@@ -173,10 +269,45 @@ def measure(
     antérieures : c'est la tâche à un pas, celle qu'on sait comparer à
     l'entraînement. Le service, lui, prédit par récurrence, et son erreur
     grandit avec l'horizon pour une raison qui n'a rien à voir avec la dérive.
+
+    C'est aussi pourquoi ce nombre n'est pas celui que l'API métier publie
+    sous « écart prédiction / consommation réelle » : celui-là compare les
+    prévisions réellement servies, récursives, à ce qui est arrivé ensuite.
+    Les deux sont justes, celui-ci sera toujours le meilleur des deux, et les
+    afficher sous le même libellé serait un contresens.
     """
     explanatory, observed = matrices(frame, columns)
     predicted = model.predict(explanatory)
     return evaluate(observed, predicted)
+
+
+def measure_sites(
+    model: object,
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+) -> tuple[SiteMeasure, ...]:
+    """Refait la même mesure, site par site, dans l'ordre des identifiants.
+
+    Une moyenne d'ensemble est dominée par le plus gros consommateur : elle
+    dit ce que le parc coûte en erreur, pas où l'erreur se trouve. Le tri par
+    identifiant rend le journal comparable d'un run à l'autre.
+
+    Une partition dépourvue de la colonne de site rend un tuple vide plutôt
+    qu'une erreur : la mesure d'ensemble, elle, reste valable.
+    """
+    if SITE_COLUMN not in frame.columns:
+        logger.warning(
+            "partition sans colonne %s : pas de détail par site", SITE_COLUMN
+        )
+        return ()
+    return tuple(
+        SiteMeasure(
+            site_id=str(site_id),
+            metrics=measure(model, group, columns),
+            rows=len(group),
+        )
+        for site_id, group in frame.groupby(SITE_COLUMN, sort=True)
+    )
 
 
 def evaluate_window(
@@ -205,6 +336,7 @@ def evaluate_window(
         rows=len(frame),
         version=version,
         window=f"{since}/{until}",
+        sites=measure_sites(model, frame, columns),
     )
 
 
@@ -237,10 +369,18 @@ def publish(report: DriftReport, settings: DriftSettings, feature_version: str) 
         if ratio is not None:
             mlflow.log_metric("mae_ratio", ratio)
         mlflow.set_tag("verdict", report.verdict(settings))
+        _publish_sites(report, settings)
 
 
 def run(config: Config, since: date | None, until: date | None, version: str) -> int:
-    """Mesure l'écart, le publie, et retourne le code de sortie qui convient."""
+    """Mesure l'écart, le publie, et retourne le code de sortie qui convient.
+
+    Le code 2 sort dès qu'un site dérive, et pas seulement quand l'ensemble
+    dérive. C'est ce que la découpe par site sert à voir : une MAE globale est
+    dominée par le plus gros consommateur, et attendre qu'elle bouge
+    reviendrait à ne jamais réagir à la dérive d'un petit site — c'est-à-dire
+    à publier un détail par site sans jamais l'écouter.
+    """
     settings = DriftSettings.from_config(config)
     mlflow.set_tracking_uri(config.get_str("mlflow.tracking_uri"))
     first, last = window(since, until, settings.window_days)
@@ -250,7 +390,11 @@ def run(config: Config, since: date | None, until: date | None, version: str) ->
     verdict = report.verdict(settings)
     ratio = report.ratio
     _log_verdict(report, settings, verdict, ratio)
-    return EXIT_DRIFTED if verdict == "dérive" else EXIT_OK
+    drifted = report.drifted_sites(settings)
+    _log_sites(report, settings, drifted)
+    if verdict == VERDICT_DRIFTED or drifted:
+        return EXIT_DRIFTED
+    return EXIT_OK
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -311,7 +455,7 @@ def _log_verdict(
     """Journalise la conclusion, en disant toujours sur quoi elle repose."""
     mesure = report.metrics[DECISION_METRIC]
     reference = report.baseline.get(DECISION_METRIC)
-    if verdict == "indécis":
+    if verdict == VERDICT_UNDECIDED:
         logger.warning(
             "%d heure(s) seulement sur %s : trop peu pour conclure (minimum %d)",
             report.rows,
@@ -327,7 +471,7 @@ def _log_verdict(
             mesure,
         )
         return
-    niveau = logger.warning if verdict == "dérive" else logger.info
+    niveau = logger.warning if verdict == VERDICT_DRIFTED else logger.info
     niveau(
         "version %s sur %s : MAE %.2f kW contre %.2f à l'entraînement"
         " (×%.2f, seuil ×%.2f) — %s",
@@ -339,6 +483,51 @@ def _log_verdict(
         settings.alert_ratio,
         verdict,
     )
+
+
+def _publish_sites(report: DriftReport, settings: DriftSettings) -> None:
+    """Publie le détail par site : une métrique et un tag par identifiant.
+
+    Les noms sont préfixés par le site plutôt que regroupés dans un seul
+    dictionnaire : la vue « Chart » de MLflow trace une métrique nommée, et un
+    dictionnaire ne s'y trace pas.
+    """
+    for site in report.sites:
+        for name, value in site.metrics.items():
+            mlflow.log_metric(f"{site.site_id}_{name}", value)
+        mlflow.log_metric(f"{site.site_id}_rows", site.rows)
+        mlflow.set_tag(
+            f"verdict_{site.site_id}", site.verdict(settings, report.baseline)
+        )
+
+
+def _log_sites(
+    report: DriftReport,
+    settings: DriftSettings,
+    drifted: Sequence[str],
+) -> None:
+    """Journalise le détail par site, du plus en erreur au moins en erreur.
+
+    Le tri par erreur décroissante, et non par identifiant : ce qu'on vient
+    lire dans ce journal, c'est quel site s'est détaché.
+    """
+    if not report.sites:
+        return
+    ordered = sorted(
+        report.sites, key=lambda site: site.metrics[DECISION_METRIC], reverse=True
+    )
+    for site in ordered:
+        logger.info(
+            "  %s : MAE %.2f kW sur %d heure(s) — %s",
+            site.site_id,
+            site.metrics[DECISION_METRIC],
+            site.rows,
+            site.verdict(settings, report.baseline),
+        )
+    if drifted:
+        logger.warning(
+            "%d site(s) en dérive : %s", len(drifted), ", ".join(drifted)
+        )
 
 
 def _configure_logging() -> None:

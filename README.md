@@ -55,7 +55,7 @@ c'est la politique d'écriture qui le garantit.
 | | Colonnes écrites | Sur conflit |
 |---|---|---|
 | `collector` | les sept mesures, `null_reasons`, `data_quality` de la source | `DO NOTHING` |
-| `etl` | `null_reasons`, `data_quality`, `consumption_kw_imputed`, `imputation_method` | `DO UPDATE` sur ces quatre |
+| `etl` | `null_reasons`, `data_quality`, `consumption_kw_imputed`, `imputation_method`, `quality_source` | `DO UPDATE` sur ces cinq |
 
 Le collecteur n'écrase rien : une recollecte ne défait donc pas la
 transformation déjà faite. L'ETL repose, lui, parce qu'il a du nouveau à dire —
@@ -65,10 +65,44 @@ déduites : même si le lot soumis portait une consommation différente de celle
 en base, la base garderait celle de la source. La panne capteur ne peut pas
 être effacée par l'étage qui a justement pour métier de la décrire.
 
+`quality_source` est la cinquième colonne, et elle ne décrit pas la mesure mais
+le traitement. `data_quality` est `NOT NULL DEFAULT 'good'` : le collecteur
+retombe sur le défaut quand la source se tait, et l'ETL repose la vraie
+qualification à son passage. Entre les deux, les deux `good` sont le même
+caractère. La colonne vaut `source` tant que l'ETL n'est pas passé, `etl`
+ensuite — sans elle, l'API métier compterait **0 % de mesures dégradées** sur
+une journée fraîchement collectée, et le site paraîtrait parfait.
+
 Une quatrième frontière existe, de même forme : le service d'inférence lit la
 dernière partition de variables pour reconstruire les décalages d'un site. Il
 ne les recalcule pas depuis les mesures brutes, ce qui donnerait un second jeu
 de règles qui finirait par diverger du premier.
+
+### `ingestion_etat` : ce que `mesure` ne peut pas dire
+
+`mesure.inserted_at` répond **tant qu'il y a des lignes**. Un capteur mort en
+produit encore — nulles, avec leurs motifs — donc `max(inserted_at)` avance. Un
+poller arrêté, une source en 500 ou une base injoignable n'en produisent
+aucune : `max(inserted_at)` se fige alors exactement comme si le site avait
+cessé d'exister. Aucune requête ne distingue « la collecte a tourné et il n'y
+avait rien » de « la collecte n'a pas tourné », et c'est la panne la plus grave
+qui devient la plus discrète.
+
+Les deux points d'entrée du collecteur reposent donc leur état dans
+`ingestion_etat`, **une ligne par site**, en `DO UPDATE` :
+
+| Colonne | Ce qu'elle permet de voir |
+|---|---|
+| `last_attempt_at` / `last_success_at` | égales, tout va bien ; écartées, la collecte tourne et échoue ; les deux figées, le collecteur ne tourne plus |
+| `last_data_lag_s` | âge de la mesure servie par la source, mesuré par le collecteur — pas reconstructible depuis `inserted_at - ts`, qui mélange retard de source et retard d'écriture |
+| `consecutive_failures` | l'à-coup contre la panne installée |
+| `source` | `poller` ou `backfill` : un rattrapage lancé à la main pendant que le poller est arrêté ne doit pas faire paraître l'ingestion vivante |
+
+Pas de journal par tick : sept sites à la minute feraient dix mille lignes par
+jour à purger, pour une question qui est au présent. L'écriture ne peut jamais
+interrompre la boucle — un tick dont la base vient de refuser les mesures ne
+pourra pas y écrire son échec non plus, et mourir là serait mourir au moment
+où le processus a le plus de raisons de continuer.
 
 ## Rattraper l'historique
 
@@ -396,13 +430,39 @@ la seule comparable. Le service d'inférence, lui, prédit par récurrence sur
 48 heures et son erreur s'accumule mécaniquement à chaque pas ; mêler les deux
 rendrait la dégradation du modèle indiscernable de l'effet d'horizon.
 
+**Ce n'est donc pas le nombre que le dashboard affiche.** L'API métier publie
+un « écart prédiction / consommation réelle » qui compare les prévisions
+réellement servies — récursives — à ce qui est arrivé ensuite. Les deux sont
+justes, celui d'ici sera toujours le meilleur des deux, et les afficher sous le
+même libellé serait un contresens.
+
+### Site par site, et pas seulement d'ensemble
+
+Une MAE unique sur tout le parc est dominée par le plus gros consommateur :
+elle dit ce que le parc coûte en erreur, pas où l'erreur se trouve. Un bureau
+de 200 kW qui double la sienne disparaît dans la moyenne d'une usine de 1000.
+
+Chaque run mesure donc aussi chaque site, publie `SITE00X_mae` et un tag
+`verdict_SITE00X` dans MLflow, et journalise le détail trié par erreur
+décroissante. Le code de sortie `2` sort **dès qu'un site dérive**, sans
+attendre que la moyenne d'ensemble bouge — sinon le détail par site serait
+publié sans jamais être écouté.
+
+Une limite à connaître : la référence reste celle du modèle, mesurée sur tout
+son jeu de test, et n'est pas propre au site. Un site structurellement plus
+difficile que la moyenne paraîtra dégradé dès le premier jour. Le verdict par
+site sert à ranger les sites entre eux et à voir l'un d'eux se détacher, pas à
+juger un site dans l'absolu — une référence par site demanderait que
+l'entraînement en enregistre une.
+
 ### Le seuil
 
 | Réglage | Défaut | Ce qu'il décide |
 |---|---|---|
 | `monitoring.mae_alert_ratio` | **1.5** | Rapport toléré entre l'erreur mesurée et celle du modèle sur son jeu de test |
 | `monitoring.window_days` | 7 | Profondeur évaluée quand aucune borne n'est donnée |
-| `monitoring.min_rows` | 24 | En deçà, le run est publié sans verdict |
+| `monitoring.min_rows` | 168 | En deçà, le verdict d'ensemble n'est pas rendu |
+| `monitoring.min_rows_per_site` | 24 | En deçà, le verdict d'un site n'est pas rendu |
 
 Le seuil est un **rapport**, pas des kilowatts. Un écart de 20 kW n'a pas le
 même sens sur un bureau de 200 kW et sur une usine de 1000, et un seuil absolu
@@ -423,7 +483,7 @@ Un ordonnanceur n'a pas à lire un journal pour savoir s'il doit alerter.
 |---|---|
 | `0` | Stable, ou trop peu d'heures pour conclure |
 | `1` | La surveillance elle-même a échoué — partitions absentes, registre injoignable |
-| `2` | **Dérive** : l'écart dépasse le seuil |
+| `2` | **Dérive** : l'écart dépasse le seuil, d'ensemble ou sur un seul site |
 
 Le `2` est distinct du `1` à dessein : les confondre ferait chercher un
 problème d'infrastructure là où le modèle a simplement vieilli.
@@ -454,12 +514,19 @@ docker compose up -d mlflow serving
 docker compose --profile jobs run --rm collector --date 2026-09-02
 docker compose --profile jobs run --rm etl --date 2026-09-02
 docker compose --profile jobs run --rm training --feature-version v1
+docker compose --profile jobs run --rm drift               # surveillance
 docker compose up -d poller                # collecte au fil de l'eau
 ```
 
-Les trois traitements datés sont derrière le profil `jobs` : sans lui, un
-`docker compose up` déclencherait une collecte, une transformation et un
-entraînement à chaque démarrage de la pile.
+Les quatre traitements datés sont derrière le profil `jobs` : sans lui, un
+`docker compose up` déclencherait une collecte, une transformation, un
+entraînement et une surveillance à chaque démarrage de la pile.
+
+`drift` partage l'image de `training` — c'est le même paquet — avec un
+entrypoint différent. Contrairement à un entraînement, il a vocation à tourner
+**tous les jours**, déclenché par l'ordonnanceur de l'infrastructure comme la
+collecte de la veille : un indicateur de dérive affiché sur un dashboard mais
+produit à la main vieillit en silence, ce qui est pire que pas d'indicateur.
 
 Deux dépendances ne sont volontairement pas déclarées, pour la même raison —
 elles ont déjà une vérité ailleurs. **L'API Mock IoT** est fournie par le
@@ -518,6 +585,7 @@ uvicorn serving.api:app --reload
 | Méthode | Route | Réponse |
 |---|---|---|
 | GET | `/health` | `HealthOut` |
+| GET | `/ready` | `ReadinessOut` |
 | POST | `/api/v1/predict` | `PredictionOut`, erreurs 404, 422 et 503 |
 
 `/health` n'est volontairement pas préfixé par `/api/v1` : c'est la sonde de
@@ -525,10 +593,29 @@ disponibilité utilisée par l'hébergeur. Elle ne consulte pas le registre —
 la lier à MLflow ferait redémarrer un service en parfait état chaque fois que
 le registre tousse.
 
+`/ready`, elle, consulte : elle dit si un modèle est résolu, si des variables
+existent, et jusqu'à quelle heure elles vont. Elle répond **toujours 200**, y
+compris quand rien n'est prêt — un 503 en ferait une seconde sonde, et
+l'hébergeur redémarrerait le service à chaque hoquet de MLflow. Son
+consommateur est l'API métier, qui doit pouvoir dire *pourquoi* la prévision
+manque : « aucun modèle au registre » et « partitions absentes » sortent tous
+deux en 503 sur `/predict`, et ce 503-là ne les distingue pas.
+
 Les trois erreurs ne disent pas la même chose, et les confondre enverrait les
 exploitants chercher la panne du mauvais côté : **404** le site n'a pas
 d'historique récent, **422** la requête sort des bornes du contrat, **503** le
 registre n'a résolu aucun modèle.
+
+### Sur quelles variables la prévision s'appuie
+
+`history_end` donne la dernière heure observée dont la récurrence est partie,
+et `feature_lag_hours` son âge au moment de la réponse. Le service lit les
+partitions publiées par l'ETL, pas la base : une prévision calculée sur des
+variables vieilles de trois jours n'est pas fausse, elle est **aveugle**, et
+rien dans le contrat ne le disait jusqu'ici. Un `feature_lag_hours` négatif
+n'est pas ramené à zéro — il signale une partition en avance sur l'horloge du
+service, ce que masquer ferait passer un problème de fuseau pour une prévision
+fraîche.
 
 ### L'intervalle de confiance
 

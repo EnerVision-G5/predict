@@ -24,6 +24,8 @@ from predict_common.schemas import (
     QUALITY_DEGRADED,
     QUALITY_GOOD,
     QUALITY_PARTIAL,
+    QUALITY_SOURCE_COLUMN,
+    QUALITY_SOURCE_ETL,
 )
 
 
@@ -166,3 +168,24 @@ class TestWorst:
         # Ne rien savoir de la qualité d'une heure n'est pas la même chose que
         # la savoir bonne.
         assert worst([]) == QUALITY_CRITICAL
+
+
+class TestQualitySource:
+    """La marque qui distingue un `good` posé d'un `good` confirmé.
+
+    `data_quality` est NOT NULL DEFAULT 'good' : le collecteur retombe sur le
+    défaut quand la source se tait. Sans cette marque, l'API métier compterait
+    0 % de mesures dégradées sur une journée que l'ETL n'a pas encore vue, et
+    le site paraîtrait parfait — l'inverse de ce que l'indicateur doit dire.
+    """
+
+    def test_a_qualified_batch_is_signed_by_the_etl(
+        self, make_raw, make_reading
+    ) -> None:
+        frame = to_measures(make_raw([make_reading("2026-09-02T08:00:00Z")]))
+        assert frame.loc[0, QUALITY_SOURCE_COLUMN] == QUALITY_SOURCE_ETL
+
+    def test_an_empty_batch_still_carries_the_column(self, make_raw) -> None:
+        # Le lot vide traverse `qualify` sans y passer : la colonne doit venir
+        # de la projection, sinon le chargement échouerait sur une absence.
+        assert QUALITY_SOURCE_COLUMN in to_measures(make_raw([])).columns
