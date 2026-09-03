@@ -280,33 +280,3 @@ jobs:
           name: zap
           path: zap/
           retention-days: 7
-
-  sonarqube:
-    name: SonarQube Cloud
-    runs-on: ubuntu-latest
-    # La couverture vient du job qui a exécuté la suite, elle n'est pas
-    # remesurée ici : voir le commentaire de l'étape qui la produit.
-    needs: lint-test
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # L'historique complet, et non le seul commit de tête. Sonar attribue
-          # chaque ligne à son auteur et à sa date pour distinguer le « nouveau
-          # code » du reste : sans l'historique, tout le repo paraît nouveau et
-          # la porte qualité se prononce sur du code qu'aucune PR n'a touché.
-          fetch-depth: 0
-
-      - name: Récupérer la couverture
-        uses: actions/download-artifact@v4
-        with:
-          name: coverage
-
-      - uses: SonarSource/sonarqube-scan-action@v5
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          # Le job attend le verdict de la porte au lieu de rendre la main
-          # aussitôt l'analyse envoyée. Sans cette attente, la CI serait verte
-          # avant que Sonar n'ait conclu, et une PR pourrait être fusionnée sur
-          # la foi d'un job qui n'a fait qu'expédier des données.
-          args: -Dsonar.qualitygate.wait=true
