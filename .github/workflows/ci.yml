@@ -181,6 +181,15 @@ jobs:
             anchore/grype:latest \
             dir:/src --exclude './.venv/**' -o json > grype.json
 
+      # Grype tourne en root dans son conteneur et laisse une base que
+      # l'utilisateur du runner ne sait plus lire. Le pas de sauvegarde du
+      # cache tarait alors un répertoire interdit, échouait en avertissement,
+      # et le cache n'a jamais été écrit une seule fois : chaque run
+      # retéléchargeait la base que le bloc ci-dessus prétend garder.
+      - name: Rendre la base lisible par le runner
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cache/grype"
+
       # Le verdict est séparé du scan, et il ne se lit pas dans un journal :
       # ce qui bloque est le critique, ce qui alerte est le haut. Confondre les
       # deux rendrait la porte inutilisable — le verrou porte aujourd'hui des
@@ -226,15 +235,23 @@ jobs:
           # demanderait un registre et une partition de variables.
           MLFLOW_HTTP_REQUEST_MAX_RETRIES: "0"
           MLFLOW_HTTP_REQUEST_TIMEOUT: "2"
+        # Le journal part dans un fichier plutôt que sur la sortie du pas :
+        # un processus de fond qui garde le tube du runner ouvert fait traîner
+        # le pas au-delà de sa propre fin. Il sert accessoirement de trace le
+        # jour où le service ne démarre pas, où l'échec ne disait rien.
         run: |
           uv run --package serving uvicorn serving.api:app \
-            --host 127.0.0.1 --port 8000 &
+            --host 127.0.0.1 --port 8000 > uvicorn.log 2>&1 &
+          echo "$!" > uvicorn.pid
           for _ in $(seq 1 60); do
             curl -sf http://127.0.0.1:8000/health > /dev/null && break
             sleep 2
           done
-          curl -sf http://127.0.0.1:8000/health \
-            || { echo "::error::le service d'inférence n'a pas démarré"; exit 1; }
+          curl -sf http://127.0.0.1:8000/health || {
+            cat uvicorn.log
+            echo "::error::le service d'inférence n'a pas démarré"
+            exit 1
+          }
 
       # `zap-api-scan.py` et non le scan de base : la ligne de base explore un
       # site en suivant ses liens, et une API JSON n'en a aucun. Le scan d'API
@@ -263,6 +280,26 @@ jobs:
               -r zap-report.html \
               -w zap-report.md \
               -J zap-report.json
+
+      # Sans cet arrêt, le service vit jusqu'au « Cleaning up orphan
+      # processes » du runner, qui vient après les post-steps. Le `uv run` qui
+      # le porte tient alors le verrou du cache uv, le `uv cache prune` de
+      # setup-uv attend ce verrou, et le runner le tue au bout de cinq minutes.
+      # Le job échouait là, scan réussi et rapports publiés.
+      #
+      # Le fils d'abord : c'est uvicorn qui écoute, mais c'est `uv run` qui
+      # tient le verrou, et il ne le rend qu'une fois son fils parti.
+      - name: Arrêter le service d'inférence
+        if: always()
+        run: |
+          pid=$(cat uvicorn.pid 2>/dev/null) || exit 0
+          pkill -TERM -P "$pid" || true
+          kill -TERM "$pid" 2>/dev/null || true
+          for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || exit 0
+            sleep 1
+          done
+          kill -KILL "$pid" 2>/dev/null || true
 
       - name: Publier le résumé
         if: always()
