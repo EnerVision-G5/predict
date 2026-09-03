@@ -161,15 +161,33 @@ def test_the_measure_table_is_declared_once() -> None:
     )
 
 
-def test_only_the_two_writers_of_the_raw_layer_reach_the_database() -> None:
-    # Le collecteur y écrit les mesures, l'ETL les relit et y repose ce qu'il
-    # en déduit. Les deux autres n'ont rien à y faire : l'entraînement lit des
-    # partitions et écrit dans MLflow, le service d'inférence calcule et rend
-    # une réponse — l'archiver est le métier de l'API EnerVision.
+def test_the_serving_service_never_reaches_the_database() -> None:
+    # Le collecteur écrit les mesures, l'ETL les relit et y repose ce qu'il en
+    # déduit, l'entraînement inscrit dans `modele` la version qu'il promeut.
+    # Le service d'inférence, lui, calcule et rend une réponse : l'archiver
+    # dans `prediction` est le métier de l'API EnerVision. Lui ouvrir la base
+    # ferait d'un service dimensionné pour répondre vite un quatrième
+    # écrivain, et d'une panne de base une panne de prévision.
     reaching = {
         service
         for service in SERVICES
         for path in service_sources(service)
         if {"sqlalchemy", "psycopg"} & imported_roots(path)
     }
-    assert reaching == {"collector", "etl"}
+    assert reaching == {"collector", "etl", "training"}
+
+
+def test_the_training_service_reaches_the_database_only_to_promote() -> None:
+    # L'entraînement ne lit rien en base : son amont est un ensemble de
+    # partitions. La base ne lui sert qu'à inscrire dans `modele` la version
+    # que l'alias champion désigne, et cette écriture tient dans un seul
+    # module. Le point d'entrée le nomme aussi, parce qu'il ouvre le moteur et
+    # traduit un refus de la base en code de sortie, comme celui de l'ETL. La
+    # voir déborder sur dataset.py ou model.py voudrait dire que
+    # l'apprentissage s'est mis à dépendre de la couche brute.
+    touching = {
+        path.name
+        for path in service_sources("training")
+        if {"sqlalchemy", "psycopg"} & imported_roots(path)
+    }
+    assert touching == {"registry.py", "__main__.py"}

@@ -24,7 +24,7 @@ END   ?= $(DATE)
 # Chaque cible est un processus indépendant, lançable seul. Les enchaîner ici
 # ne crée aucun couplage : le seul état partagé, ce sont les partitions et le
 # registre MLflow.
-.PHONY: help install lint test check collect poll etl train serve run-day \
+.PHONY: help install lint test check collect poll etl train promote serve run-day \
         backfill drift openapi up down clean storage
 
 help:  ## Liste les cibles disponibles
@@ -54,6 +54,9 @@ etl:  ## `mesure` -> variables d'une journée : make etl DATE=... FV=v1
 train:  ## Entraîne un modèle : make train FV=v1 HISTORY_DAYS=90
 	uv run python -m training --feature-version $(FV) \
 		--history-days $(HISTORY_DAYS) --until $(DATE)
+
+promote:  ## Met une version en service et l'inscrit dans `modele` : make promote V=7
+	uv run python -m training --promote-version $(V)
 
 drift:  ## Mesure l'écart prédiction/réel : make drift SINCE=2026-08-26
 	uv run python -m training.drift $(if $(SINCE),--since $(SINCE)) 		$(if $(UNTIL),--until $(UNTIL)) --feature-version $(FV)

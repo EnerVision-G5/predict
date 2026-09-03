@@ -5,10 +5,11 @@ registre MLflow, lit la dernière partition de variables publiée par l'ETL, et
 enchaîne les deux. Il n'importe le code d'aucun autre service : ses entrées
 sont un alias et un chemin.
 
-Il n'écrit rien. L'archivage des prévisions et le référencement du modèle dans
-`modele` appartiennent à l'API EnerVision, qui sert ce contrat à ses
-consommateurs et tient sa propre base. Ce service calcule et répond ; ce qu'on
-fait de sa réponse ne le regarde pas.
+Il n'écrit rien. L'archivage des prévisions dans `prediction` appartient à
+l'API EnerVision, qui sert ce contrat à ses consommateurs et tient sa propre
+base ; le référencement du modèle dans `modele` appartient à l'entraînement,
+qui est le seul à savoir quelle version il vient de mettre en service. Ce
+service calcule et répond ; ce qu'on fait de sa réponse ne le regarde pas.
 
 Source de vérité du contrat. Toute modification exige une PR sur
 enervision/docs/contracts et la relecture des trois consommateurs.
