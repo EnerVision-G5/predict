@@ -1,0 +1,191 @@
+name: cd-serving
+
+# Livraison de l'image Docker du service serving.
+#
+# Déclenchée uniquement par un changement dans services/serving poussé sur
+# master. Le gate ne rejoue que ce qui concerne le service d'inférence (lint +
+# tests du service et de la bibliothèque partagée), pas toute la CI du
+# monorepo. Si le gate passe, l'image est construite, taguée avec le SHA Git et
+# poussée sur GHCR.
+#
+# Portée volontairement étroite : une modif de uv.lock ou de libs/predict_common
+# seule ne redéclenche pas ce workflow. Reconstruire le service après un tel
+# changement se fait par un commit qui touche aussi services/serving, ou via un
+# déclenchement manuel.
+#
+# La dérive du contrat gelé n'est pas revérifiée ici : elle est gardée par le
+# job `contract-drift` de la CI, qui tourne sur chaque PR et a donc déjà statué
+# sur le commit fusionné. La rejouer demanderait la clé de déploiement du repo
+# enervision au moment de la livraison, et ferait dépendre un déploiement de la
+# disponibilité d'un second dépôt.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "services/serving/**"
+      - ".github/workflows/cd-serving.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: cd-serving-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # uv.lock fige la pile entière : le gate installe exactement ce que l'image
+  # embarquera, et `--frozen` échoue si le lock a dérivé des manifestes.
+  UV_FROZEN: "1"
+
+jobs:
+  gate:
+    name: Lint & tests (serving)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Installer le workspace
+        # Le workspace entier, et non `--package serving`. Les outils du gate —
+        # ruff, pytest et httpx, dont le client de test FastAPI a besoin — sont
+        # déclarés dans le groupe `dev` de la racine, que `--package` ne sait
+        # pas atteindre : il vise le manifeste du membre, qui n'a pas de groupe
+        # à lui. Un `uv sync --package serving` les retire de l'environnement,
+        # et le `uv run` suivant réinstalle le workspace complet pour les
+        # retrouver — deux installations au lieu d'une.
+        #
+        # Le rétrécissement ne coûterait de toute façon presque rien à ce
+        # service : MLflow et xgboost, qui font l'essentiel du poids du
+        # workspace, sont ses propres dépendances.
+        run: uv sync --python 3.11
+
+      - name: Lint (ruff)
+        run: uv run ruff check services/serving libs/predict_common
+
+      - name: Tests (pytest)
+        # Les tests du service ne joignent ni MLflow ni le stockage : le
+        # registre est simulé, et le test de fumée du contrat vérifie que la
+        # spécification reste générable sans aucune dépendance de démarrage.
+        run: uv run pytest services/serving
+
+  build:
+    name: Build & push image (GHCR)
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Libérer de la place sur le runner
+        # Un runner GitHub n'a qu'une quinzaine de gigaoctets libres, dont une
+        # bonne part occupée par des outils dont ce build ne se sert pas.
+        # L'image porte MLflow complet et xgboost : l'étage de construction et
+        # l'étage d'exécution coexistent sur le disque le temps du build, et la
+        # pile y tient alors deux fois.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          df -h /
+
+      # Nom d'image en minuscules (GHCR l'exige) :
+      # ghcr.io/<org>/predict/serving
+      - name: Préparer la référence d'image
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/serving" >> "$GITHUB_ENV"
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # Jeton éphémère fourni par Actions, jamais stocké dans l'image.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculer tags et labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # Contexte = racine du workspace : le Dockerfile a besoin des
+          # manifestes des membres pour résoudre predict-common via uv.
+          context: .
+          file: services/serving/Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=serving
+          cache-to: type=gha,mode=min,scope=serving
+
+      # Reproduit un démarrage sur machine vierge : pull par digest immuable,
+      # exécution du point d'entrée sans aucun fichier du dépôt.
+      #
+      # Les trois autres services sont des traitements par lot, et leur `--help`
+      # suffit à dire que le point d'entrée démarre. Celui-ci est un processus
+      # long qui expose un port : ce qu'il faut vérifier, c'est qu'il écoute et
+      # qu'il répond, pas qu'il sait s'afficher.
+      #
+      # Aucun registre ne tourne ici, et c'est sans conséquence : le service
+      # démarre quand même et sert /health, sa règle depuis l'origine — lier la
+      # sonde de vivacité à MLflow ferait redémarrer un service en parfait état
+      # chaque fois que le registre tousse. Mais le client MLflow réessaie sept
+      # fois avec une attente croissante avant d'abandonner, et le démarrage
+      # dépasse alors deux minutes. Couper les reprises le ramène à quelques
+      # secondes.
+      - name: Smoke test de l'image publiée
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker run -d --name serving-smoke -p 127.0.0.1:8000:8000 \
+            -e MLFLOW_HTTP_REQUEST_MAX_RETRIES=0 \
+            -e MLFLOW_HTTP_REQUEST_TIMEOUT=2 \
+            "$REF"
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health > /dev/null && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8000/health | grep -q '"status":"ok"' || {
+            docker logs serving-smoke
+            echo "::error::le service publié n'a pas répondu sur /health"
+            exit 1
+          }
+          # La spécification est servie par le service lui-même : c'est d'elle
+          # que part le scan d'API, et c'est elle que les consommateurs du
+          # contrat lisent. Une image qui écoute mais ne sait plus la produire
+          # passerait /health sans être livrable.
+          curl -sf http://127.0.0.1:8000/openapi.json > /dev/null || {
+            docker logs serving-smoke
+            echo "::error::le service publié ne sert pas sa spécification"
+            exit 1
+          }
+
+      - name: Arrêter le conteneur de fumée
+        if: always()
+        run: docker rm -f serving-smoke 2>/dev/null || true
+
+      - name: Récapitulatif
+        run: |
+          {
+            echo "### Image publiée"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "digest : \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

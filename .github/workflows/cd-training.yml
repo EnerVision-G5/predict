@@ -1,0 +1,151 @@
+name: cd-training
+
+# Livraison de l'image Docker du service training.
+#
+# Déclenchée uniquement par un changement dans services/training poussé sur
+# master. Le gate ne rejoue que ce qui concerne l'entraînement (lint + tests du
+# service et de la bibliothèque partagée), pas toute la CI du monorepo. Si le
+# gate passe, l'image est construite, taguée avec le SHA Git et poussée sur
+# GHCR.
+#
+# Portée volontairement étroite : une modif de uv.lock ou de libs/predict_common
+# seule ne redéclenche pas ce workflow. Reconstruire l'entraînement après un tel
+# changement se fait par un commit qui touche aussi services/training, ou via
+# un déclenchement manuel.
+#
+# L'image publiée sert aussi de serveur MLflow dans docker-compose, qui
+# redéclare son entrypoint. Un déploiement de ce service change donc aussi la
+# version du MLflow qui sert l'UI : c'est le but, un écart entre le mlflow qui
+# écrit les runs et celui qui les affiche produit des runs illisibles.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "services/training/**"
+      - ".github/workflows/cd-training.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: cd-training-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # uv.lock fige la pile entière : le gate installe exactement ce que l'image
+  # embarquera, et `--frozen` échoue si le lock a dérivé des manifestes.
+  UV_FROZEN: "1"
+
+jobs:
+  gate:
+    name: Lint & tests (training)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Installer le workspace
+        # Le workspace entier, et non `--package training`. Les outils du gate —
+        # ruff et pytest — sont déclarés dans le groupe `dev` de la racine, que
+        # `--package` ne sait pas atteindre : il vise le manifeste du membre,
+        # qui n'a pas de groupe à lui. Un `uv sync --package training` retire
+        # donc ruff et pytest de l'environnement, et le `uv run` suivant
+        # réinstalle le workspace complet pour les retrouver — deux
+        # installations au lieu d'une.
+        #
+        # Le rétrécissement ne coûterait de toute façon presque rien à ce
+        # service : scikit-learn, xgboost et MLflow, qui font l'essentiel du
+        # poids du workspace, sont ses propres dépendances.
+        run: uv sync --python 3.11
+
+      - name: Lint (ruff)
+        run: uv run ruff check services/training libs/predict_common
+
+      - name: Tests (pytest)
+        # Les tests de l'entraînement ne joignent ni MLflow ni PostgreSQL :
+        # le suivi est enregistré dans un répertoire temporaire et la base est
+        # remplacée par un moteur qui mémorise les instructions — ce qui est
+        # vérifié de la promotion, ce sont les instructions produites.
+        run: uv run pytest services/training
+
+  build:
+    name: Build & push image (GHCR)
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Libérer de la place sur le runner
+        # Un runner GitHub n'a qu'une quinzaine de gigaoctets libres, dont une
+        # bonne part occupée par des outils dont ce build ne se sert pas.
+        # L'image porte scikit-learn, xgboost et MLflow : l'étage de
+        # construction et l'étage d'exécution coexistent sur le disque le temps
+        # du build, et la pile scientifique y tient alors deux fois.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          df -h /
+
+      # Nom d'image en minuscules (GHCR l'exige) :
+      # ghcr.io/<org>/predict/training
+      - name: Préparer la référence d'image
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/training" \
+            >> "$GITHUB_ENV"
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # Jeton éphémère fourni par Actions, jamais stocké dans l'image.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculer tags et labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # Contexte = racine du workspace : le Dockerfile a besoin des
+          # manifestes des membres pour résoudre predict-common via uv.
+          context: .
+          file: services/training/Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=training
+          cache-to: type=gha,mode=min,scope=training
+
+      # Reproduit un démarrage sur machine vierge : pull par digest immuable,
+      # exécution du point d'entrée sans aucun fichier du dépôt.
+      - name: Smoke test de l'image publiée
+        run: docker run --rm "${IMAGE}@${{ steps.build.outputs.digest }}" --help
+
+      - name: Récapitulatif
+        run: |
+          {
+            echo "### Image publiée"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "digest : \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
