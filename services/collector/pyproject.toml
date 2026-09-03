@@ -1,0 +1,33 @@
+# Service de collecte.
+#
+# Ses dépendances disent ce qu'il fait : parler HTTP et écrire dans `mesure`.
+# Ni scikit-learn, ni xgboost, ni MLflow — un import de l'entraînement ou du
+# service ne s'installerait pas dans son image, et c'est ce qui rend la
+# frontière vérifiable plutôt que recommandée.
+#
+# SQLAlchemy et psycopg sont là parce que la couche brute est une table, pas un
+# fichier. Le collecteur partage avec l'ETL la définition de cette table, et
+# elle seule : les politiques d'écriture des deux services n'ont rien en
+# commun, et vivent chacune chez elle.
+
+[project]
+name = "collector"
+version = "0.1.0"
+description = "Collecte des mesures EnerVision vers TimescaleDB."
+requires-python = ">=3.11"
+dependencies = [
+    "predict-common",
+    "httpx==0.28.1",
+    "SQLAlchemy==2.0.52",
+    "psycopg[binary]==3.3.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/collector"]
+
+[tool.uv.sources]
+predict-common = { workspace = true }

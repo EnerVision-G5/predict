@@ -1,0 +1,193 @@
+"""La règle centrale de la découpe, rendue exécutable.
+
+Aucun service n'importe le code d'un autre. Si `etl` faisait
+`from collector.client import fetch`, il n'y aurait plus deux services mais un
+monolithe avec deux dossiers : le déploiement séparé deviendrait un mensonge,
+et une modification du collecteur casserait l'ETL sans que rien ne le
+signale.
+
+La règle est déjà tenue par les dépendances déclarées — aucun `pyproject.toml`
+de service ne nomme un autre service, donc un tel import ne s'installerait pas
+dans l'image. Ce test la vérifie une seconde fois, à la source, parce qu'un
+environnement de développement unique installe les quatre services ensemble :
+sur un poste, l'import fautif marcherait, et la panne n'apparaîtrait qu'au
+premier déploiement.
+
+Le fichier vérifie enfin ce que la bibliothèque partagée a le droit de faire.
+`predict_common` ne connaît aucun service ni aucune règle métier ; le jour où
+elle en porterait une, elle serait redevenue le monolithe que la découpe vient
+de défaire.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+import pytest
+
+SERVICES = ("collector", "etl", "training", "serving")
+SHARED = "predict_common"
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def service_sources(name: str) -> list[Path]:
+    """Retourne les fichiers de code d'un service, tests exclus.
+
+    Les tests sont exclus parce qu'ils n'entrent pas dans l'image : ils
+    peuvent lire le schéma partagé sans que cela dise quoi que ce soit du
+    couplage entre services.
+    """
+    return sorted((ROOT / "services" / name / "src").rglob("*.py"))
+
+
+def imported_roots(path: Path) -> set[str]:
+    """Retourne les paquets racines importés par un fichier."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots.add(node.module.split(".")[0])
+    return roots
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_a_service_never_imports_another_service(service: str) -> None:
+    forbidden = set(SERVICES) - {service}
+    offenders = {
+        path.relative_to(ROOT).as_posix(): sorted(imported_roots(path) & forbidden)
+        for path in service_sources(service)
+    }
+    breaches = {path: names for path, names in offenders.items() if names}
+    assert not breaches, (
+        f"{service} importe le code d'un autre service : {breaches}."
+        " Les frontières passent par les artefacts — un chemin et un schéma —"
+        " jamais par l'espace de noms Python."
+    )
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_a_service_has_at_least_one_entry_point(service: str) -> None:
+    # Chaque service est lançable seul, sans les autres. Un service sans point
+    # d'entrée ne serait qu'une bibliothèque de plus.
+    package = ROOT / "services" / service / "src" / service
+    entry_points = [package / "__main__.py", package / "api.py"]
+    assert any(path.is_file() for path in entry_points), (
+        f"{service} n'a ni __main__.py ni api.py."
+    )
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_a_service_declares_no_other_service_as_a_dependency(service: str) -> None:
+    # C'est la vérification qui compte vraiment : elle porte sur ce qui sera
+    # installé dans l'image, et pas seulement sur ce que le code écrit.
+    manifest = (ROOT / "services" / service / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    dependencies = manifest.split("dependencies = [", 1)[1].split("]", 1)[0]
+    declared = {
+        line.strip().strip('",').split("=")[0].split("[")[0].strip().lower()
+        for line in dependencies.splitlines()
+        if line.strip()
+    }
+    assert not declared & (set(SERVICES) - {service})
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_a_service_has_a_dockerfile(service: str) -> None:
+    assert (ROOT / "services" / service / "Dockerfile").is_file()
+
+
+def test_the_shared_library_knows_no_service() -> None:
+    # `predict_common` est en dessous des services, jamais à côté : une
+    # dépendance vers l'un d'eux inverserait le sens de la pile.
+    sources = sorted((ROOT / "libs" / SHARED / "src").rglob("*.py"))
+    breaches = {
+        path.relative_to(ROOT).as_posix(): sorted(imported_roots(path) & set(SERVICES))
+        for path in sources
+    }
+    assert not any(breaches.values()), breaches
+
+
+def test_the_shared_library_carries_only_its_declared_modules() -> None:
+    # Toute fonction qui n'aurait qu'un seul appelant appartient au service qui
+    # l'appelle. Un module de plus ici serait le premier pas du retour au
+    # monolithe : s'il est justifié, ce test se met à jour délibérément.
+    #
+    # `db` a rejoint les quatre premiers le jour où la couche brute est
+    # devenue une table : le collecteur et l'ETL écrivent tous deux `mesure`,
+    # et deux définitions de cette table donneraient deux vérités sur elle.
+    modules = {
+        path.stem
+        for path in (ROOT / "libs" / SHARED / "src" / SHARED).glob("*.py")
+        if path.stem != "__init__"
+    }
+    assert modules == {"config", "paths", "schemas", "io", "db"}
+
+
+def test_every_partition_path_is_built_by_the_shared_module() -> None:
+    # Deux services qui ne construiraient pas le même chemin pour la même
+    # journée ne se parleraient plus. Personne ne compose donc `dt=` à la main.
+    offenders: list[str] = []
+    for service in SERVICES:
+        for path in service_sources(service):
+            text = path.read_text(encoding="utf-8")
+            if 'f"dt=' in text or '"dt=" +' in text:
+                offenders.append(path.relative_to(ROOT).as_posix())
+    assert not offenders, (
+        f"Chemin de partition composé à la main : {offenders}."
+        " Utiliser predict_common.paths."
+    )
+
+
+def test_the_measure_table_is_declared_once() -> None:
+    # Le collecteur et l'ETL écrivent la même table. Deux déclarations
+    # donneraient deux vérités sur `mesure`, ce que le repo enervision-db
+    # interdit précisément en détenant le schéma.
+    declared_table = re.compile(r"Table\(\s*[\"'](mesure|mesure_exclu)[\"']")
+    declaring = [
+        path.relative_to(ROOT).as_posix()
+        for service in SERVICES
+        for path in service_sources(service)
+        if declared_table.search(path.read_text(encoding="utf-8"))
+    ]
+    assert not declaring, (
+        f"La table `mesure` est redéclarée dans {declaring}."
+        " Sa définition appartient à predict_common.db."
+    )
+
+
+def test_the_serving_service_never_reaches_the_database() -> None:
+    # Le collecteur écrit les mesures, l'ETL les relit et y repose ce qu'il en
+    # déduit, l'entraînement inscrit dans `modele` la version qu'il promeut.
+    # Le service d'inférence, lui, calcule et rend une réponse : l'archiver
+    # dans `prediction` est le métier de l'API EnerVision. Lui ouvrir la base
+    # ferait d'un service dimensionné pour répondre vite un quatrième
+    # écrivain, et d'une panne de base une panne de prévision.
+    reaching = {
+        service
+        for service in SERVICES
+        for path in service_sources(service)
+        if {"sqlalchemy", "psycopg"} & imported_roots(path)
+    }
+    assert reaching == {"collector", "etl", "training"}
+
+
+def test_the_training_service_reaches_the_database_only_to_promote() -> None:
+    # L'entraînement ne lit rien en base : son amont est un ensemble de
+    # partitions. La base ne lui sert qu'à inscrire dans `modele` la version
+    # que l'alias champion désigne, et cette écriture tient dans un seul
+    # module. Le point d'entrée le nomme aussi, parce qu'il ouvre le moteur et
+    # traduit un refus de la base en code de sortie, comme celui de l'ETL. La
+    # voir déborder sur dataset.py ou model.py voudrait dire que
+    # l'apprentissage s'est mis à dépendre de la couche brute.
+    touching = {
+        path.name
+        for path in service_sources("training")
+        if {"sqlalchemy", "psycopg"} & imported_roots(path)
+    }
+    assert touching == {"registry.py", "__main__.py"}

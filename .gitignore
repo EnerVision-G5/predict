@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Backend store et artefacts MLflow : c'est là que vivent les runs et les
+# modèles enregistrés. Ils sont versionnés par MLflow, jamais par Git.
+mlruns/
+
+# Couches d'artefacts : partitions brutes et variables. Elles sont
+# reproductibles à partir de la source et d'une commande datée, ce qui est
+# exactement ce qu'un dépôt de code n'a pas à porter.
+data/
+
+# Sorties de notebooks.
+.ipynb_checkpoints/
+
+# Secrets d'exécution. Seul .env.example est versionné.
+.env
+
+# Rapports de couverture. Ils sont produits à chaque run et lus par SonarQube
+# Cloud dans le job qui vient de les écrire : les versionner ferait scanner la
+# couverture d'un autre commit que celui qu'on analyse.
+.coverage
+coverage.xml
+
+# Traces du service lancé en tâche de fond par le job DAST, reproduites à
+# l'identique quand on rejoue le scan ZAP en local.
+uvicorn.log
+uvicorn.pid

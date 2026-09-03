@@ -1,0 +1,116 @@
+# Racine du workspace uv du repo predict.
+#
+# Le repo ne publie pas un paquet : il porte cinq paquets, une bibliothèque
+# partagée et quatre services, chacun avec son propre pyproject et ses propres
+# dépendances. La racine ne sert qu'à trois choses — déclarer les membres du
+# workspace, réunir un environnement unique pour les tests et le lint, et
+# porter la configuration de ruff et de pytest.
+#
+# Ce découpage est ce qui rend la séparation des services vérifiable. Le
+# service serving ne déclare ni pandas, ni xgboost, ni SQLAlchemy : un
+# `from etl.clean import ...` glissé dans son code ne compilerait pas dans son
+# image. La frontière n'est plus une consigne, c'est une contrainte
+# d'installation.
+
+[project]
+name = "predict"
+version = "0.0.0"
+description = "Chaîne de prévision de consommation EnerVision."
+requires-python = ">=3.11"
+# La racine tire les cinq membres : c'est ce qui donne un environnement unique
+# où pytest voit les tests des quatre services d'un coup.
+dependencies = [
+    "predict-common",
+    "collector",
+    "etl",
+    "training",
+    "serving",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    # La couverture n'est pas une métrique de confort : c'est SonarQube Cloud
+    # qui la lit, et sa porte qualité en fait une condition de fusion. Épinglée
+    # comme les autres : une montée de version qui changerait le format de
+    # coverage.xml ferait chuter la couverture mesurée sans qu'une seule ligne
+    # de test ait bougé.
+    "pytest-cov==7.0.0",
+    "ruff==0.16.5",
+    "httpx==0.28.1",
+]
+
+[tool.uv]
+# Racine virtuelle : elle n'est pas installée comme paquet, elle n'a pas de
+# code à elle.
+package = false
+
+# xgboost déclare `nvidia-nccl-cu12` sur Linux : 450 Mo de bibliothèques CUDA
+# pour la seule communication entre plusieurs GPU d'un entraînement distribué.
+# Rien de tout cela ne sert ici — l'entraînement tient sur un CPU et
+# l'inférence est un `predict` — et ce poids ne se voyait pas depuis Windows,
+# où le marqueur ne s'applique pas. Le marqueur ci-dessous est faux partout,
+# ce qui écarte le paquet sans toucher à la déclaration de xgboost.
+#
+# À revoir le jour où un entraînement passe sur GPU : ce serait alors la
+# première chose à réactiver.
+override-dependencies = ["nvidia-nccl-cu12 ; sys_platform == 'never'"]
+
+[tool.uv.workspace]
+members = ["libs/*", "services/*"]
+
+[tool.uv.sources]
+predict-common = { workspace = true }
+collector = { workspace = true }
+etl = { workspace = true }
+training = { workspace = true }
+serving = { workspace = true }
+
+[tool.ruff]
+target-version = "py311"
+# 88 et non 80 : les docstrings de services/serving/src/serving/schemas.py
+# alimentent les descriptions du contrat OpenAPI gelé. Les replier pour tenir
+# en 80 colonnes insérerait un retour à la ligne dans les descriptions et
+# ferait échouer le job contract-drift sans aucune évolution métier.
+line-length = 88
+exclude = ["data", "mlruns", "notebooks"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["predict_common", "collector", "etl", "training", "serving"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "libs", "services"]
+addopts = "-q"
+
+# La couverture est mesurée sur le code livré, jamais sur les tests. Les
+# inclure gonfle le chiffre sans rien garantir : un fichier de tests est
+# exécuté à 100 % par construction, et une suite qui ne testerait rien
+# afficherait encore une couverture flatteuse.
+[tool.coverage.run]
+branch = true
+source = ["libs", "services"]
+# Chemins relatifs à la racine du repo, et non absolus. Le rapport est écrit
+# sur le runner et lu par un scanner qui, lui, voit l'arborescence depuis un
+# autre chemin : des chemins absolus feraient perdre à SonarQube Cloud le lien
+# entre la mesure et le fichier, et la couverture s'afficherait à zéro.
+relative_files = true
+omit = ["*/tests/*", "*/__main__.py"]
+
+[tool.coverage.report]
+# `if TYPE_CHECKING:` et les gardes `__main__` ne s'exécutent jamais sous
+# pytest, et les compter en manquant ferait baisser la mesure sans qu'aucun
+# test ne puisse les couvrir.
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise SystemExit",
+]

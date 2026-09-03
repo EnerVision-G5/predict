@@ -1,0 +1,16 @@
+# Surcharges du poste de développement, superposées à conf/base.yaml.
+#
+# C'est la couche par défaut : PREDICT_ENV vaut `local` quand rien ne le fixe.
+# Elle n'écrit que ce qu'elle change, le reste vient de la base.
+
+source:
+  # Le poste travaille sur des fenêtres courtes et n'a aucune raison de
+  # ménager une API Mock qui tourne sur la même machine.
+  rate_limit_rps: 0
+  retries: 1
+
+training:
+  params:
+    # Un aller-retour rapide : l'entraînement de référence est celui de la CI
+    # et du déploiement, pas celui du poste.
+    n_estimators: 120

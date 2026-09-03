@@ -1,0 +1,25 @@
+# Le contexte de build est la racine du workspace : uv a besoin de voir les
+# manifestes de tous les membres pour résoudre predict-common. Tout le reste
+# est exclu, y compris les artefacts, qui pèsent lourd et n'ont rien à faire
+# dans une image.
+.git/
+.github/
+.venv/
+venv/
+mlruns/
+data/
+notebooks/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+Makefile
+README.md
+docker-compose.yml
+
+# Les tests ne partent pas en image : ils vérifient le code avant qu'il ne
+# soit construit, pas pendant qu'il tourne.
+libs/*/tests/
+services/*/tests/
+tests/

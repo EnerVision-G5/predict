@@ -1,0 +1,263 @@
+"""Point d'entrée du collecteur : rattrapage de l'historique par lot.
+
+    python -m collector --start 2026-08-01 --end 2026-09-01
+    python -m collector --start 2026-08-01 --end 2026-09-01 --site SITE001
+    python -m collector --date 2026-09-02 --days 7
+
+Deux façons de dire la même chose, parce qu'elles ne servent pas au même
+usage. `--start/--end` nomme une période, ce que fait un analyste qui rattrape
+un historique. `--date/--days` nomme une journée et sa profondeur, ce que fait
+un ordonnanceur qui rejoue la veille : la date y est un paramètre, et la
+profondeur une constante.
+
+Le collecteur remplit la couche brute, qui est la table `mesure` de
+TimescaleDB. Il ne connaît ni l'ETL, ni l'entraînement, ni le service : sa
+sortie est une table et un schéma, et c'est tout ce que son consommateur a
+besoin de savoir.
+
+Une journée est traitée en entier avant la suivante. Le lot d'un jour tient en
+mémoire — sept sites à la minute font une dizaine de milliers de lignes — là
+où trois mois n'y tiendraient pas, et une journée soumise en une transaction
+est soit chargée, soit absente, jamais à moitié écrite.
+
+Relancer la même date ne double rien et n'efface rien : l'insertion est un
+`ON CONFLICT DO NOTHING`. C'est ce qui rend le rejeu après incident sans effet
+de bord — et le rejeu est le mode d'exploitation normal, pas l'exception : une
+source indisponible pendant deux heures se rattrape en relançant la journée.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from collections.abc import Sequence
+from datetime import UTC, date, datetime, time, timedelta
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from collector.client import (
+    MAX_PAGE_SIZE,
+    SourceClient,
+    SourceError,
+    SourceSettings,
+)
+from collector.sink import sync_sites, to_measures, write
+from predict_common.config import ConfigError, load_config
+from predict_common.db import DatabaseError, open_engine
+from predict_common.paths import PathError, date_range, parse_date
+
+DEFAULT_DAYS = 1
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+
+logger = logging.getLogger(__name__)
+
+
+def day_window(day: date) -> tuple[datetime, datetime]:
+    """Retourne la fenêtre UTC `[minuit, minuit du lendemain[` d'une journée.
+
+    Les mesures rendues par la source sont ensuite filtrées sur le jour
+    demandé : une source qui déborderait d'une seconde ne serait pas comptée
+    dans une journée qu'elle ne concerne pas.
+    """
+    start = datetime.combine(day, time.min, tzinfo=UTC)
+    return start, start + timedelta(days=1)
+
+
+def collect_day(
+    client: SourceClient,
+    engine,
+    batch_size: int,
+    day: date,
+    sites: Sequence[str],
+) -> int:
+    """Collecte une journée pour les sites demandés et la charge en base."""
+    start_time, end_time = day_window(day)
+    records: list[dict] = []
+    for site_id in sites:
+        page = list(client.iter_readings(site_id, start_time, end_time))
+        logger.info("site %s : %d mesure(s) lue(s)", site_id, len(page))
+        records.extend(page)
+    report = write(engine, to_measures(records), batch_size, day=day)
+    logger.info(
+        "%s : %d mesure(s) soumise(s)%s",
+        day,
+        report.rows,
+        f", {report.dropped} écartée(s)" if report.dropped else "",
+    )
+    return report.rows
+
+
+def resolve_sites(
+    client: SourceClient,
+    engine,
+    batch_size: int,
+    requested: Sequence[str] | None,
+) -> list[str]:
+    """Synchronise le référentiel et retourne les sites à collecter.
+
+    La synchronisation entretient `site`, que `mesure.site_id` référence : un
+    site absent de la table ferait rejeter ses mesures sans que rien
+    n'explique pourquoi. C'est aussi ce que le seed `02_seed_sites.sql`
+    attend, ses capacités des sites 4 à 7 étant des placeholders.
+
+    Elle n'est exigée que lorsqu'on en dépend pour savoir quoi collecter.
+    Avec `--site`, l'exploitant a nommé ses sites : une source qui ne sert pas
+    son référentiel ne doit pas l'empêcher de rattraper une journée, puisque
+    le seed a déjà posé les sites courants. L'échec est journalisé, et c'est
+    la clé étrangère qui tranchera s'il manquait vraiment quelque chose.
+    """
+    try:
+        referential = client.fetch_sites()
+    except SourceError:
+        if not requested:
+            raise
+        logger.warning(
+            "référentiel indisponible : collecte des sites demandés sans"
+            " synchronisation"
+        )
+        return list(requested)
+    sync_sites(engine, referential, batch_size)
+    if requested:
+        return list(requested)
+    return [str(entry["site_id"]) for entry in referential if "site_id" in entry]
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Analyse la ligne de commande du collecteur."""
+    parser = argparse.ArgumentParser(
+        prog="collector",
+        description="Collecte des mesures EnerVision vers TimescaleDB.",
+    )
+    parser.add_argument(
+        "--start",
+        default=None,
+        help="Première journée collectée, incluse, au format YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--end",
+        default=None,
+        help="Dernière journée collectée, incluse. Défaut : --start.",
+    )
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="Dernière journée collectée. Forme courte, avec --days.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAYS,
+        help="Nombre de journées remontées depuis --date. Défaut : 1.",
+    )
+    parser.add_argument(
+        "--site",
+        action="append",
+        dest="sites",
+        help="Site à collecter. Répétable. Par défaut : tout le référentiel.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            f"Mesures demandées par requête, au plus {MAX_PAGE_SIZE}."
+            " Défaut : source.page_size."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def requested_days(args: argparse.Namespace) -> list[date]:
+    """Retourne les journées à collecter, dans l'ordre chronologique.
+
+    Les deux formes s'excluent : les mélanger laisserait deux périodes
+    possibles pour un même appel, et le run partirait sur l'une des deux sans
+    que rien ne dise laquelle.
+    """
+    borne = args.start is not None or args.end is not None
+    if borne and args.date is not None:
+        raise ValueError(
+            "--date et --start/--end désignent tous deux la période :"
+            " en choisir une seule."
+        )
+    if borne:
+        if args.start is None:
+            raise ValueError("--end demande --start.")
+        # Une borne haute absente vaut la borne basse : `--start` seul collecte
+        # cette journée, ce qui est la lecture naturelle.
+        first = parse_date(args.start)
+        last = parse_date(args.end) if args.end else first
+        return date_range(first, last)
+    if args.date is None:
+        raise ValueError(
+            "Période absente : donner --start/--end, ou --date avec --days."
+        )
+    if args.days < 1:
+        raise ValueError("--days doit valoir au moins 1.")
+    last = parse_date(args.date)
+    return date_range(last - timedelta(days=args.days - 1), last)
+
+
+def _configure_logging() -> None:
+    """Arme le journal, et met la sortie standard à l'abri de l'encodage local.
+
+    MLflow imprime des emoji quand il rend la main ; une console Windows en
+    cp1252 lève alors une UnicodeEncodeError au beau milieu d'un run qui, lui,
+    s'est bien passé. On ne peut pas demander à MLflow de se taire, mais on
+    peut faire en sorte qu'un caractère non représentable dégrade l'affichage
+    au lieu d'interrompre le traitement.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Point d'entrée du conteneur de collecte."""
+    _configure_logging()
+    args = parse_args(argv)
+    try:
+        config = load_config()
+        days = requested_days(args)
+        settings = SourceSettings.from_config(config)
+        if args.limit is not None:
+            settings = settings.with_page_size(args.limit)
+        engine = open_engine(config.get_optional_str("database.url"))
+        batch_size = config.get_int("database.batch_size")
+    except (ConfigError, DatabaseError, PathError, ValueError) as exc:
+        logger.error("configuration invalide : %s", exc)
+        return EXIT_FAILED
+
+    total = 0
+    try:
+        with SourceClient(settings) as client:
+            sites = resolve_sites(client, engine, batch_size, args.sites)
+            logger.info(
+                "collecte de %d site(s) du %s au %s, %d mesure(s) par requête",
+                len(sites),
+                days[0],
+                days[-1],
+                settings.page_size,
+            )
+            for day in days:
+                total += collect_day(client, engine, batch_size, day, sites)
+    except (SourceError, SQLAlchemyError) as exc:
+        logger.error("collecte interrompue : %s", exc)
+        return EXIT_FAILED
+    finally:
+        engine.dispose()
+    logger.info("collecte terminée : %d mesure(s) soumise(s)", total)
+    return EXIT_OK
+
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

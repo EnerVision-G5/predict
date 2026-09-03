@@ -1,0 +1,319 @@
+name: ci
+
+on:
+  pull_request:
+  push: 
+    branches: [develop]
+
+env:
+  # Branche du repo enervision qui porte le contrat gelé de référence.
+  CONTRACTS_REF: develop
+  # uv.lock fige la pile entière : la CI installe exactement ce qui tournera
+  # dans les images, et `--frozen` échoue si le lock a dérivé des manifestes.
+  UV_FROZEN: "1"
+
+jobs:
+  lint-test:
+    name: Lint et tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Installer le workspace
+        # 3.11 comme les autres repos du projet. Les versions épinglées sont
+        # choisies pour tenir sur cette version : monter numpy ou xgboost
+        # impose de monter Python ici d'abord.
+        run: uv sync --python 3.11
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Tests (pytest)
+        # La suite couvre les quatre services et la bibliothèque partagée, dont
+        # les tests d'architecture qui vérifient qu'aucun service n'importe le
+        # code d'un autre, et que seuls le collecteur et l'ETL joignent la base.
+        #
+        # Aucun test ne joint PostgreSQL : la base est remplacée par un moteur
+        # qui mémorise les instructions. Ce qui compte n'est pas que PostgreSQL
+        # les accepte — c'est son métier, et le schéma figé le garantit — mais
+        # que chaque service produise la bonne.
+        #
+        # La couverture est produite ici et nulle part ailleurs. La rejouer
+        # dans le job SonarQube donnerait une seconde mesure, sur un second
+        # environnement, qui pourrait diverger de celle qui a fait passer la
+        # CI — et personne ne saurait laquelle fait foi.
+        run: uv run pytest --cov --cov-report=xml:coverage.xml
+
+      - name: Conserver la couverture pour l'analyse
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 1
+
+  build-images:
+    name: Build des images
+    runs-on: ubuntu-latest
+    # Le build est ce qui vérifie vraiment la séparation : chaque image ne
+    # copie que la bibliothèque partagée et son propre service. Un import d'un
+    # service vers un autre passerait les tests sur un poste, où les quatre
+    # sont installés ensemble, et échouerait ici.
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [collector, etl, training, serving]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Libérer de la place sur le runner
+        # Un runner GitHub n'a qu'une quinzaine de gigaoctets libres, dont une
+        # bonne part occupée par des outils dont aucun build ici ne se sert :
+        # .NET, Android, GHC, les images Docker préchargées. `load: true`
+        # exporte l'image en archive avant de l'importer, donc la pile
+        # scientifique tient deux fois sur le disque au moment le plus tendu.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc             /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construire l'image ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          push: false
+          load: true
+          tags: enervision-${{ matrix.service }}:ci
+          cache-from: type=gha,scope=${{ matrix.service }}
+          # mode=min et non max : le cache d'actions est plafonné à 10 Go pour
+          # tout le dépôt, et quatre images exportant chacune leurs couches
+          # intermédiaires s'évinceraient mutuellement — on paierait le stockage
+          # pour un cache qui ne resservirait jamais.
+          cache-to: type=gha,mode=min,scope=${{ matrix.service }}
+
+      - name: Vérifier que le point d'entrée démarre
+        # Un service qui ne sait pas afficher son aide ne démarrera pas non
+        # plus en production, et l'échec serait alors découvert au déploiement.
+        run: |
+          if [ "${{ matrix.service }}" = "serving" ]; then
+            docker run --rm --entrypoint python enervision-serving:ci \
+              -c "import serving.api; print('serving importable')"
+          else
+            docker run --rm enervision-${{ matrix.service }}:ci --help
+          fi
+
+  contract-drift:
+    name: Dérive du contrat OpenAPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Le paquet `serving` seul : régénérer la spécification n'a aucune raison
+      # d'installer la pile ETL ni scikit-learn.
+      - run: uv sync --python 3.11 --package serving
+
+      - name: Récupérer le contrat gelé
+        uses: actions/checkout@v4
+        with:
+          repository: EnerVision-G5/enervision
+          ref: ${{ env.CONTRACTS_REF }}
+          path: enervision
+          # Le GITHUB_TOKEN par défaut ne lit pas les autres repos privés de
+          # l'organisation. On passe par une clé de déploiement en lecture
+          # seule posée sur enervision, dont la partie privée est le secret
+          # ci-dessous. Une clé de déploiement n'est liée à aucun compte,
+          # contrairement à un PAT qui expire ou disparaît avec son porteur.
+          ssh-key: ${{ secrets.CONTRACTS_SSH_KEY }}
+
+      - name: Comparer le code au contrat gelé
+        run: |
+          uv run --package serving python scripts/export_openapi.py \
+            > /tmp/openapi-current.json
+          diff -u enervision/docs/contracts/openapi-predict.json \
+            /tmp/openapi-current.json \
+            || { echo "::error::Le code a dérivé du contrat gelé. Ouvrir une PR sur enervision/docs/contracts ou corriger le code."; exit 1; }
+
+  dependency-scan:
+    name: Vulnérabilités des dépendances (Grype)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Le cache porte la base de vulnérabilités, pas le résultat. Elle pèse
+      # quelques centaines de mégaoctets et change tous les jours : la
+      # retélécharger à chaque run ajouterait une minute à chaque PR, la figer
+      # ferait scanner avec les CVE de la semaine dernière. La clé porte donc
+      # le numéro de run, et le `restore-keys` reprend la plus récente.
+      - name: Cache de la base de vulnérabilités
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/grype
+          key: grype-db-${{ github.run_id }}
+          restore-keys: grype-db-
+
+      # Le scan porte sur l'arborescence nue, avant tout `uv sync`. C'est
+      # délibéré : Grype sait lire `uv.lock`, et le verrou est exactement ce
+      # que les quatre images installent (`uv sync --frozen`). Scanner un
+      # `.venv` ajouterait l'interpréteur et les bibliothèques natives de la
+      # machine, qui ne sont pas ce qui est livré, et noierait les paquets du
+      # projet sous des CVE qu'aucune PR ne peut corriger ici.
+      - name: Scanner le système de fichiers
+        run: |
+          mkdir -p "$HOME/.cache/grype"
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$HOME/.cache/grype:/cache" \
+            -e GRYPE_DB_CACHE_DIR=/cache \
+            anchore/grype:latest \
+            dir:/src --exclude './.venv/**' -o json > grype.json
+
+      # Grype tourne en root dans son conteneur et laisse une base que
+      # l'utilisateur du runner ne sait plus lire. Le pas de sauvegarde du
+      # cache tarait alors un répertoire interdit, échouait en avertissement,
+      # et le cache n'a jamais été écrit une seule fois : chaque run
+      # retéléchargeait la base que le bloc ci-dessus prétend garder.
+      - name: Rendre la base lisible par le runner
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cache/grype"
+
+      # Le verdict est séparé du scan, et il ne se lit pas dans un journal :
+      # ce qui bloque est le critique, ce qui alerte est le haut. Confondre les
+      # deux rendrait la porte inutilisable — le verrou porte aujourd'hui des
+      # failles hautes sans correctif publié, et une porte rouge en permanence
+      # est une porte que l'équipe finit par contourner.
+      - name: Publier le verdict
+        run: python3 .github/scripts/grype_verdict.py grype.json
+
+      - name: Conserver le rapport
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype
+          path: grype.json
+          retention-days: 7
+
+  dast:
+    name: Surface HTTP du service d'inférence (ZAP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Le paquet `serving` seul : attaquer la surface HTTP n'a aucune raison
+      # d'installer la pile ETL ni xgboost.
+      - run: uv sync --python 3.11 --package serving
+
+      - name: Démarrer le service d'inférence
+        env:
+          # Ni registre ni modèle en CI, et c'est sans conséquence : le service
+          # démarre quand même, sert /health, et répond 503 sur /predict — sa
+          # règle depuis l'origine. Mais le client MLflow réessaie sept fois
+          # avec une attente croissante avant d'abandonner, et le démarrage
+          # dépasse alors deux minutes. Couper les reprises le ramène à sept
+          # secondes.
+          #
+          # Ce que ZAP éprouve ici est donc la surface HTTP — en-têtes, codes
+          # d'erreur, robustesse aux entrées — et non le chemin du modèle, qui
+          # demanderait un registre et une partition de variables.
+          MLFLOW_HTTP_REQUEST_MAX_RETRIES: "0"
+          MLFLOW_HTTP_REQUEST_TIMEOUT: "2"
+        # Le journal part dans un fichier plutôt que sur la sortie du pas :
+        # un processus de fond qui garde le tube du runner ouvert fait traîner
+        # le pas au-delà de sa propre fin. Il sert accessoirement de trace le
+        # jour où le service ne démarre pas, où l'échec ne disait rien.
+        run: |
+          uv run --package serving uvicorn serving.api:app \
+            --host 127.0.0.1 --port 8000 > uvicorn.log 2>&1 &
+          echo "$!" > uvicorn.pid
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8000/health > /dev/null && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8000/health || {
+            cat uvicorn.log
+            echo "::error::le service d'inférence n'a pas démarré"
+            exit 1
+          }
+
+      # `zap-api-scan.py` et non le scan de base : la ligne de base explore un
+      # site en suivant ses liens, et une API JSON n'en a aucun. Le scan d'API
+      # part au contraire de la spécification, qu'il lit sur le service
+      # lui-même plutôt que dans un fichier — ce qui garantit qu'il attaque les
+      # routes servies, et non une spécification qui aurait dérivé.
+      #
+      # `--network host` : le conteneur ZAP doit joindre un service qui écoute
+      # sur la boucle locale du runner. Sans lui, `127.0.0.1` désignerait le
+      # conteneur, où rien n'écoute.
+      #
+      # `-I` : un avertissement ne fait pas échouer le job. Les règles par
+      # défaut de ZAP alertent sur des en-têtes que FastAPI ne pose pas seul, et
+      # une porte rouge dès le premier run serait ignorée dès le deuxième. Une
+      # règle passée en FAIL dans un fichier de règles, elle, bloquera.
+      - name: Scan actif de l'API
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host \
+            -v "$PWD/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-api-scan.py \
+              -t http://127.0.0.1:8000/openapi.json \
+              -f openapi \
+              -I \
+              -r zap-report.html \
+              -w zap-report.md \
+              -J zap-report.json
+
+      # Sans cet arrêt, le service vit jusqu'au « Cleaning up orphan
+      # processes » du runner, qui vient après les post-steps. Le `uv run` qui
+      # le porte tient alors le verrou du cache uv, le `uv cache prune` de
+      # setup-uv attend ce verrou, et le runner le tue au bout de cinq minutes.
+      # Le job échouait là, scan réussi et rapports publiés.
+      #
+      # Le fils d'abord : c'est uvicorn qui écoute, mais c'est `uv run` qui
+      # tient le verrou, et il ne le rend qu'une fois son fils parti.
+      - name: Arrêter le service d'inférence
+        if: always()
+        run: |
+          pid=$(cat uvicorn.pid 2>/dev/null) || exit 0
+          pkill -TERM -P "$pid" || true
+          kill -TERM "$pid" 2>/dev/null || true
+          for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || exit 0
+            sleep 1
+          done
+          kill -KILL "$pid" 2>/dev/null || true
+
+      - name: Publier le résumé
+        if: always()
+        run: |
+          {
+            echo "## ZAP — surface HTTP du service d'inférence"
+            echo
+            cat zap/zap-report.md 2>/dev/null || echo "Aucun rapport produit."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Conserver les rapports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap
+          path: zap/
+          retention-days: 7

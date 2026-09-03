@@ -1,0 +1,36 @@
+# Service d'entraînement.
+#
+# Il ne déclare pas httpx : il ne parle pas à la source. Son amont est un
+# ensemble de partitions, son aval est le registre MLflow.
+#
+# SQLAlchemy et psycopg ne servent qu'à la promotion : poser l'alias champion
+# inscrit aussi la version dans `modele`, la table du schéma figé que les
+# consommateurs de `prediction` référencent. Un entraînement ordinaire ne les
+# touche pas. Ils restent des dépendances du service et non un extra
+# optionnel, pour la même raison que dans l'ETL : une image qui n'aurait pas
+# le driver échouerait au moment où l'exploitant pose --promote,
+# c'est-à-dire au pire moment.
+
+[project]
+name = "training"
+version = "0.1.0"
+description = "Entraînement des modèles de prévision EnerVision."
+requires-python = ">=3.11"
+dependencies = [
+    "predict-common",
+    "scikit-learn==1.9.0",
+    "xgboost==3.2.0",
+    "mlflow==3.15.2",
+    "SQLAlchemy==2.0.52",
+    "psycopg[binary]==3.3.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/training"]
+
+[tool.uv.sources]
+predict-common = { workspace = true }
