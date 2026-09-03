@@ -1,0 +1,129 @@
+name: cd-etl
+
+# Livraison de l'image Docker du service etl.
+#
+# Déclenchée uniquement par un changement dans services/etl poussé sur master.
+# Le gate ne rejoue que ce qui concerne l'ETL (lint + tests du service et de la
+# bibliothèque partagée), pas toute la CI du monorepo. Si le gate passe,
+# l'image est construite, taguée avec le SHA Git et poussée sur GHCR.
+#
+# Portée volontairement étroite : une modif de uv.lock ou de libs/predict_common
+# seule ne redéclenche pas ce workflow. Reconstruire l'ETL après un tel
+# changement se fait par un commit qui touche aussi services/etl, ou via un
+# déclenchement manuel.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "services/etl/**"
+      - ".github/workflows/cd-etl.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: cd-etl-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # uv.lock fige la pile entière : le gate installe exactement ce que l'image
+  # embarquera, et `--frozen` échoue si le lock a dérivé des manifestes.
+  UV_FROZEN: "1"
+
+jobs:
+  gate:
+    name: Lint & tests (etl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Installer le workspace
+        # Le workspace entier, et non `--package etl`. Les outils du gate —
+        # ruff et pytest — sont déclarés dans le groupe `dev` de la racine, que
+        # `--package` ne sait pas atteindre : il vise le manifeste du membre,
+        # qui n'a pas de groupe à lui. Un `uv sync --package etl` retire donc
+        # ruff et pytest de l'environnement, et le `uv run` suivant réinstalle
+        # le workspace complet pour les retrouver — deux installations au lieu
+        # d'une, pour un périmètre qui finit large de toute façon.
+        #
+        # Ce qui est étroit ici, et c'est le seul rétrécissement qui tienne,
+        # c'est ce que le gate analyse et exécute : l'ETL et la bibliothèque
+        # partagée, rien d'autre.
+        run: uv sync --python 3.11
+
+      - name: Lint (ruff)
+        run: uv run ruff check services/etl libs/predict_common
+
+      - name: Tests (pytest)
+        # Les tests de l'ETL ne joignent pas PostgreSQL : la base est remplacée
+        # par un moteur qui mémorise les instructions, et les partitions sont
+        # écrites dans un répertoire temporaire.
+        run: uv run pytest services/etl
+
+  build:
+    name: Build & push image (GHCR)
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nom d'image en minuscules (GHCR l'exige) : ghcr.io/<org>/predict/etl
+      - name: Préparer la référence d'image
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/etl" >> "$GITHUB_ENV"
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # Jeton éphémère fourni par Actions, jamais stocké dans l'image.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculer tags et labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # Contexte = racine du workspace : le Dockerfile a besoin des
+          # manifestes des membres pour résoudre predict-common via uv.
+          context: .
+          file: services/etl/Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=etl
+          cache-to: type=gha,mode=min,scope=etl
+
+      # Reproduit un démarrage sur machine vierge : pull par digest immuable,
+      # exécution du point d'entrée sans aucun fichier du dépôt.
+      - name: Smoke test de l'image publiée
+        run: docker run --rm "${IMAGE}@${{ steps.build.outputs.digest }}" --help
+
+      - name: Récapitulatif
+        run: |
+          {
+            echo "### Image publiée"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "digest : \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
