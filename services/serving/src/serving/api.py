@@ -14,11 +14,17 @@ service calcule et répond ; ce qu'on fait de sa réponse ne le regarde pas.
 Source de vérité du contrat. Toute modification exige une PR sur
 enervision/docs/contracts et la relecture des trois consommateurs.
 
-Attention : `CONTRACT_VERSION` est passée en 1.1.0 avec la mise en service du
-modèle. Deux changements l'imposent, tous deux additifs — la description du
-service ne peut plus annoncer un 501 qu'il ne renvoie plus, et un 503 est
-déclaré pour le cas où le registre n'a rien à servir. Le contrat gelé doit
-être régénéré et relu :
+Attention : `CONTRACT_VERSION` est passée en 1.2.0. Trois changements
+l'imposent, tous additifs — `history_end` et `feature_lag_hours` sur
+`PredictionOut`, et la route `/ready`. Les deux champs disent sur quelles
+variables la prévision s'appuie, information que personne d'autre ne détient :
+le service lit les partitions publiées par l'ETL, et une prévision calculée
+sur des variables vieilles de trois jours n'est pas fausse, elle est aveugle.
+La route dit pourquoi une prévision manque, là où un 503 nu ne le dit pas.
+
+`/health` reste sans dépendance, et c'est délibéré : voir `get_health`.
+
+Le contrat gelé doit être régénéré et relu :
 
     python scripts/export_openapi.py ../docs/contracts/openapi-predict.json
 """
@@ -35,6 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
 from predict_common.config import load_config
+from predict_common.schemas import TIMESTAMP_COLUMN
 from serving.forecast import (
     ForecastSpec,
     NoHistory,
@@ -49,14 +56,17 @@ from serving.schemas import (
     PredictionOut,
     PredictionPoint,
     PredictionRequest,
+    ReadinessOut,
 )
 
 # Version du contrat gelé dans enervision/docs/contracts/openapi-predict.json.
 # Incrémentée en semver : patch pour une description, minor pour un champ
 # optionnel ajouté, major pour un champ retiré ou renommé.
-CONTRACT_VERSION = "1.1.0"
+CONTRACT_VERSION = "1.2.0"
 
 API_PREFIX = "/api/v1"
+
+SECONDS_PER_HOUR = 3600.0
 
 logger = logging.getLogger(__name__)
 
@@ -192,10 +202,18 @@ def predict(payload: PredictionRequest) -> PredictionOut:
                 " demandés par le modèle ne sont pas tous disponibles."
             ),
         )
+    generated_at = datetime.now(UTC)
+    history_end = history.index.max().to_pydatetime()
     return PredictionOut(
         site_id=payload.site_id,
         model_version=model.version,
-        generated_at=datetime.now(UTC),
+        generated_at=generated_at,
+        # Le service prédit à partir des partitions publiées par l'ETL, pas de
+        # la base : ses variables peuvent dater sans que rien ne le signale.
+        # C'est ce couple qui le dit, et il est calculé ici parce que le
+        # service est le seul à savoir sur quoi il vient de s'appuyer.
+        history_end=history_end,
+        feature_lag_hours=feature_lag_hours(generated_at, history_end),
         points=[
             PredictionPoint(
                 timestamp=point.stamp.to_pydatetime(),
@@ -210,6 +228,83 @@ def predict(payload: PredictionRequest) -> PredictionOut:
             for point in points
         ],
     )
+
+
+def feature_lag_hours(generated_at: datetime, history_end: datetime) -> float:
+    """Âge des variables ayant servi la prévision, en heures.
+
+    Un écart négatif n'est pas ramené à zéro : il signale une partition dont
+    l'horodatage est en avance sur l'horloge du service, et masquer cela
+    ferait passer un problème de fuseau pour une prévision fraîche.
+    """
+    return (generated_at - history_end).total_seconds() / SECONDS_PER_HOUR
+
+
+@app.get(
+    "/ready",
+    response_model=ReadinessOut,
+    tags=["health"],
+    summary="Dire ce dont le service dispose pour prédire",
+)
+def get_readiness() -> ReadinessOut:
+    """Diagnostic, et non sonde de vivacité : voir ReadinessOut.
+
+    Répond toujours 200, y compris quand rien n'est prêt. Un 503 ici ferait
+    de cette route une seconde sonde et l'hébergeur redémarrerait le service
+    à chaque hoquet de MLflow, ce que `/health` évite précisément. Son
+    consommateur est l'API métier, qui a besoin de dire à ses utilisateurs
+    pourquoi la prévision manque — un 503 nu ne le dit pas.
+    """
+    registry, spec = state.get("registry"), state.get("spec")
+    if registry is None or spec is None:
+        return ReadinessOut(
+            ready=False,
+            model_resolved=False,
+            model_version=None,
+            features_available=False,
+            history_end=None,
+            detail="Service non configuré : aucune ressource chargée.",
+        )
+
+    version, model_detail = _model_state(registry)
+    history_end, feature_detail = _feature_state(spec)
+    detail = " ".join(part for part in (model_detail, feature_detail) if part)
+    return ReadinessOut(
+        ready=version is not None and history_end is not None,
+        model_resolved=version is not None,
+        model_version=version,
+        features_available=history_end is not None,
+        history_end=history_end,
+        detail=detail,
+    )
+
+
+def _model_state(registry: ModelRegistry) -> tuple[str | None, str]:
+    """Retourne la version servie, ou la raison pour laquelle il n'y en a pas."""
+    try:
+        return registry.current().version, ""
+    except ModelUnavailable as exc:
+        return None, f"Modèle : {exc}"
+
+
+def _feature_state(spec: ForecastSpec) -> tuple[datetime | None, str]:
+    """Retourne la dernière heure disponible, ou la raison de son absence.
+
+    Le filet est large à dessein : cette route existe pour dire ce qui ne va
+    pas, et une lecture de partitions qui échoue est exactement ce qu'elle
+    doit rapporter plutôt que propager.
+    """
+    try:
+        frame = read_history(spec)
+    except Exception as exc:  # noqa: BLE001 - la lecture d'objets lève large
+        logger.warning("variables illisibles : %s", exc)
+        return None, f"Variables : {type(exc).__name__}: {exc}"
+    if frame.empty:
+        return None, (
+            f"Variables : aucune partition {spec.feature_version} sur les"
+            f" {spec.lookback_days} dernière(s) journée(s)."
+        )
+    return frame[TIMESTAMP_COLUMN].max().to_pydatetime(), ""
 
 
 def _resources() -> tuple[ModelRegistry, ForecastSpec]:

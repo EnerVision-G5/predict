@@ -128,7 +128,18 @@ monitoring:
   # En deçà, l'écart mesuré ne veut rien dire : une poignée d'heures suffit à
   # faire dire n'importe quoi à une moyenne. Le run est alors journalisé sans
   # verdict plutôt que de produire une alerte que personne ne saura lire.
-  min_rows: 24
+  #
+  # 168 et non 24 depuis la découpe par site. La fenêtre porte sept sites :
+  # 24 lignes toutes confondues, c'est trois heures par site, ce qui ne fonde
+  # aucun verdict d'ensemble. 168 est une semaine d'un site, le plus petit
+  # volume où une moyenne globale commence à vouloir dire quelque chose.
+  min_rows: 168
+
+  # Plancher du verdict d'un site pris seul. Il mord bien plus tôt que le
+  # précédent, et c'est normal : il compte les heures d'UN site. Une journée
+  # complète est le minimum, faute de quoi le cycle jour/nuit à lui seul
+  # décide de la moyenne.
+  min_rows_per_site: 24
 
 serving:
   # Alias et non version figée : promouvoir un modèle se fait en déplaçant

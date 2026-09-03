@@ -17,14 +17,17 @@ incident, et la fenêtre rejouée recouvre toujours des lignes déjà écrites. 
 clé primaire composite (site_id, ts) porte tout : c'est elle que vise chaque
 ON CONFLICT.
 
-Attention : la migration `03_mesure_imputation.sql` du repo enervision-db doit
-être appliquée. Le schéma figé v1.0 n'a ni `consumption_kw_imputed` ni
-`imputation_method`, que l'ETL écrit à chaque lot.
+Attention : trois migrations du repo enervision-db doivent être appliquées.
+Le schéma figé v1.0 n'a ni `consumption_kw_imputed` ni `imputation_method`
+(`03_mesure_imputation.sql`), ni la table `ingestion_etat`
+(`06_ingestion_etat.sql`), ni `mesure.quality_source`
+(`07_mesure_quality_source.sql`) — les trois sont écrites par cette chaîne.
 
 Les déclarations ci-dessous sont relevées sur `enervision-db/initdb/01_schema.sql`
-et sa migration `03_mesure_imputation.sql`. Seules les tables que cette chaîne
-écrit sont déclarées, et dans chacune, seules les colonnes qu'elle remplit :
-`inserted_at` a un DEFAULT côté base, qui date le chargement mieux que nous.
+et sur ces migrations. Seules les tables que cette chaîne écrit sont déclarées,
+et dans chacune, seules les colonnes qu'elle remplit : `inserted_at` et
+`ingestion_etat.updated_at` ont un DEFAULT côté base, qui date l'écriture mieux
+que nous.
 
 `prediction` n'est donc pas ici : c'est l'API EnerVision qui l'écrit, elle
 sert le contrat de prédiction à ses consommateurs et archive ce qu'elle rend.
@@ -49,6 +52,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Integer,
     MetaData,
     Numeric,
     String,
@@ -58,7 +62,11 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
-from predict_common.schemas import SITE_COLUMN, TIMESTAMP_COLUMN
+from predict_common.schemas import (
+    QUALITY_SOURCE_COLUMN,
+    SITE_COLUMN,
+    TIMESTAMP_COLUMN,
+)
 
 # Clé naturelle de `mesure`, et cible de tous les ON CONFLICT de la chaîne.
 CONFLICT_KEY = (SITE_COLUMN, TIMESTAMP_COLUMN)
@@ -91,6 +99,10 @@ mesure = Table(
     Column("data_quality", String(10)),
     Column("consumption_kw_imputed", Numeric(10, 2)),
     Column("imputation_method", String(20)),
+    # Migration 07_mesure_quality_source.sql. `NOT NULL DEFAULT 'source'` en
+    # base : le collecteur la laisse au défaut, l'ETL y écrit 'etl' quand il a
+    # reposé la qualification. Voir QUALITY_SOURCE_COLUMN.
+    Column("quality_source", String(10)),
 )
 
 # La clé naturelle (site_id, ts) est déclarée primaire parce que c'est elle que
@@ -132,6 +144,44 @@ SITE_COLUMNS = (
     "capacity_kw",
     "status",
 )
+
+# État courant de la collecte, migration 06_ingestion_etat.sql. Une ligne par
+# site, et non un journal par tick : la question posée est au présent.
+#
+# Elle est ici parce que l'API métier la lit, et que db.py est le seul endroit
+# où le schéma est reflété une fois pour toutes. Elle est écrite par les deux
+# points d'entrée du collecteur, jamais par l'ETL ni par l'entraînement : eux
+# ne collectent rien.
+#
+# La table existe parce que `mesure` ne peut pas répondre. Un capteur mort
+# produit quand même une ligne, donc max(inserted_at) avance ; un poller arrêté
+# n'en produit aucune, et max(inserted_at) se fige exactement comme si le site
+# avait cessé d'exister. Aucun agrégat ne distingue ces deux cas.
+#
+# `updated_at` est laissé au DEFAULT now() de la base, comme `inserted_at` sur
+# `mesure` : c'est elle qui date l'écriture, pas nous.
+ingestion_etat = Table(
+    "ingestion_etat",
+    metadata,
+    Column("site_id", String(20), primary_key=True),
+    Column("last_attempt_at", DateTime(timezone=True), nullable=False),
+    Column("last_success_at", DateTime(timezone=True)),
+    Column("last_rows", Integer, nullable=False),
+    Column("last_data_lag_s", Numeric(10, 2)),
+    Column("consecutive_failures", Integer, nullable=False),
+    Column("last_error", Text),
+    Column("source", String(20), nullable=False),
+)
+
+# Clé de `ingestion_etat`, et cible du ON CONFLICT de l'écriture d'état.
+INGESTION_KEY = ("site_id",)
+
+# Points d'entrée admis par le CHECK de `ingestion_etat.source`. Le rattrapage
+# ne doit pas se faire passer pour une collecte vivante : sans cette
+# distinction, une journée rejouée à la main pendant que le poller est arrêté
+# ferait paraître l'ingestion fraîche.
+INGESTION_SOURCE_POLLER = "poller"
+INGESTION_SOURCE_BACKFILL = "backfill"
 
 # Miroir applicatif du Model Registry MLflow, tenu par l'entraînement. Comme
 # ailleurs, seules les colonnes que la chaîne remplit sont déclarées :
@@ -184,11 +234,16 @@ SOURCE_COLUMNS = (
 # Colonnes que l'ETL repose sur une mesure déjà présente. Elles ne recouvrent
 # jamais une valeur de la source : `null_reasons` et `data_quality` sont
 # complétées, pas remplacées — voir `etl.quality`.
+#
+# `quality_source` en fait partie, et c'est ce qui la rend utile : le DO UPDATE
+# la repose à chaque rejeu, si bien que corriger une règle de qualification et
+# relancer la fenêtre remet la marque à jour du même geste.
 DERIVED_COLUMNS = (
     "null_reasons",
     "data_quality",
     "consumption_kw_imputed",
     "imputation_method",
+    QUALITY_SOURCE_COLUMN,
 )
 
 
