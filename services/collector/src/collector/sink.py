@@ -31,6 +31,17 @@ le rejeu d'une journée sans effet de bord, et surtout : il empêche une
 recollecte de recouvrir les colonnes que l'ETL a déduites depuis. Relancer le
 collecteur sur une journée déjà transformée ne défait donc pas la
 transformation.
+
+Une seconde table est écrite ici, et une seule chose la distingue : son contenu
+ne vient pas de la source. `ingestion_etat` dit ce que le collecteur a fait,
+site par site, et c'est la seule chose que `mesure` ne saura jamais dire. Un
+capteur mort y dépose quand même une ligne — nulle, avec ses motifs — donc
+`max(inserted_at)` avance ; un poller arrêté ou une source en 500 n'en dépose
+aucune, et `max(inserted_at)` se fige exactement comme si le site avait cessé
+d'exister. C'est la panne la plus grave, et c'était la plus discrète.
+
+Sa politique d'écriture est l'inverse de celle des mesures : `DO UPDATE`, parce
+qu'elle décrit le présent et non un historique. Voir `write_state`.
 """
 
 from __future__ import annotations
@@ -38,7 +49,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
@@ -47,8 +58,10 @@ from sqlalchemy.engine import Engine
 
 from predict_common.db import (
     CONFLICT_KEY,
+    INGESTION_KEY,
     SITE_COLUMNS,
     SOURCE_COLUMNS,
+    ingestion_etat,
     mesure,
     site,
     write_batches,
@@ -195,6 +208,151 @@ def write(
     if dropped:
         logger.warning("%d mesure(s) écartée(s) : horodatage ou site absent", dropped)
     return WriteReport(rows=rows, dropped=dropped)
+
+
+@dataclass(frozen=True)
+class IngestionState:
+    """Ce qu'un essai de collecte a donné pour un site.
+
+    `error` porte le verdict : rempli, l'essai a échoué. Les deux cas ne
+    s'écrivent pas de la même façon — un échec ne doit toucher ni la date du
+    dernier succès, ni le nombre de lignes, ni le retard mesuré, qui décrivent
+    tous le dernier essai *abouti* et restent la seule chose vraie qu'on
+    sache du site.
+    """
+
+    site_id: str
+    attempted_at: datetime
+    rows: int = 0
+    data_lag_s: float | None = None
+    error: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None
+
+
+def to_success_states(
+    states: Iterable[IngestionState],
+    source: str,
+) -> list[dict[str, Any]]:
+    """Projette les essais aboutis vers les colonnes de `ingestion_etat`.
+
+    `last_error` n'y figure pas : la cause du dernier échec est conservée
+    après un succès. Savoir de quoi un site relève a une valeur, et l'effacer
+    au premier tick réussi ferait disparaître la panne au moment précis où
+    quelqu'un vient la regarder.
+    """
+    return [
+        {
+            "site_id": state.site_id,
+            "last_attempt_at": state.attempted_at,
+            "last_success_at": state.attempted_at,
+            "last_rows": state.rows,
+            "last_data_lag_s": state.data_lag_s,
+            "consecutive_failures": 0,
+            "source": source,
+        }
+        for state in states
+        if state.succeeded
+    ]
+
+
+def to_failure_states(
+    states: Iterable[IngestionState],
+    source: str,
+) -> list[dict[str, Any]]:
+    """Projette les essais en échec vers les colonnes de `ingestion_etat`.
+
+    Trois colonnes sont volontairement absentes — `last_success_at`,
+    `last_rows`, `last_data_lag_s`. Un échec n'a rien à en dire, et les poser
+    à zéro ou à NULL effacerait ce que le dernier succès avait établi. Sur une
+    première insertion, ce sont les DEFAULT de la table qui s'appliquent.
+    """
+    return [
+        {
+            "site_id": state.site_id,
+            "last_attempt_at": state.attempted_at,
+            "consecutive_failures": 1,
+            "last_error": state.error,
+            "source": source,
+        }
+        for state in states
+        if not state.succeeded
+    ]
+
+
+def build_state_success_upsert(records: list[dict[str, Any]]) -> Any:
+    """Construit la mise à jour d'état d'un essai abouti.
+
+    `DO UPDATE` et non `DO NOTHING` : la table décrit le présent, pas un
+    historique. Une ligne existe déjà pour chaque site dès le deuxième tick,
+    et ne rien faire figerait l'état au premier.
+    """
+    statement = insert(ingestion_etat).values(records)
+    return statement.on_conflict_do_update(
+        index_elements=list(INGESTION_KEY),
+        set_={
+            "last_attempt_at": statement.excluded.last_attempt_at,
+            "last_success_at": statement.excluded.last_success_at,
+            "last_rows": statement.excluded.last_rows,
+            "last_data_lag_s": statement.excluded.last_data_lag_s,
+            # Remis à zéro et non décrémenté : le compteur distingue l'à-coup
+            # de la panne installée, et un succès clôt la série.
+            "consecutive_failures": 0,
+            "source": statement.excluded.source,
+        },
+    )
+
+
+def build_state_failure_upsert(records: list[dict[str, Any]]) -> Any:
+    """Construit la mise à jour d'état d'un essai en échec.
+
+    Le compteur est incrémenté depuis la valeur en base et non depuis le lot :
+    c'est le seul endroit qui sache combien d'essais ont déjà échoué, et le
+    calculer côté processus donnerait un compte remis à un à chaque
+    redémarrage du conteneur — c'est-à-dire précisément quand la panne est la
+    plus probable.
+    """
+    statement = insert(ingestion_etat).values(records)
+    return statement.on_conflict_do_update(
+        index_elements=list(INGESTION_KEY),
+        set_={
+            "last_attempt_at": statement.excluded.last_attempt_at,
+            "consecutive_failures": ingestion_etat.c.consecutive_failures + 1,
+            "last_error": statement.excluded.last_error,
+            "source": statement.excluded.source,
+        },
+    )
+
+
+def write_state(
+    engine: Engine,
+    states: Iterable[IngestionState],
+    batch_size: int,
+    source: str,
+) -> int:
+    """Repose l'état de collecte des sites et retourne le nombre de lignes.
+
+    Deux instructions et non une : succès et échecs ne posent pas les mêmes
+    colonnes, et un lot mixte devrait choisir une forme pour les deux. Elles
+    partagent la transaction de `write_batches`, si bien qu'un tick est
+    enregistré en entier ou pas du tout.
+    """
+    collected = list(states)
+    rows = write_batches(
+        engine,
+        to_success_states(collected, source),
+        batch_size,
+        build_state_success_upsert,
+    )
+    rows += write_batches(
+        engine,
+        to_failure_states(collected, source),
+        batch_size,
+        build_state_failure_upsert,
+    )
+    return rows
 
 
 def to_sites(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

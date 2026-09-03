@@ -10,7 +10,7 @@ chercher la panne du mauvais côté.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -223,3 +223,74 @@ def test_a_validation_error_uses_the_shared_model(client) -> None:
     with client() as http:
         response = http.post("/api/v1/predict", json={})
     assert isinstance(response.json()["detail"], str)
+
+
+class TestSurQuoiLaPrevisionSAppuie:
+    """Une prévision calculée sur des variables anciennes n'est pas fausse.
+
+    Elle est aveugle, et rien d'autre dans le contrat ne le disait. Le service
+    lit les partitions publiées par l'ETL, pas la base : lui seul sait de
+    quand datent les variables qu'il vient d'utiliser.
+    """
+
+    def test_the_answer_says_which_hour_it_starts_from(self, client) -> None:
+        with client() as http:
+            body = http.post(
+                "/api/v1/predict", json={"site_id": "SITE001", "horizon_hours": 2}
+            ).json()
+        # La dernière heure publiée est celle qui précède le premier point
+        # prédit : la récurrence part de là.
+        assert body["history_end"] < body["points"][0]["timestamp"]
+
+    def test_the_feature_lag_is_the_gap_to_the_answer(self, client) -> None:
+        with client() as http:
+            body = http.post(
+                "/api/v1/predict", json={"site_id": "SITE001", "horizon_hours": 1}
+            ).json()
+        generated = datetime.fromisoformat(body["generated_at"])
+        history_end = datetime.fromisoformat(body["history_end"])
+        expected = (generated - history_end).total_seconds() / 3600
+        assert body["feature_lag_hours"] == pytest.approx(expected)
+
+    def test_a_clock_ahead_of_the_features_is_not_hidden(self) -> None:
+        # Un écart négatif signale une partition en avance sur l'horloge du
+        # service. Le ramener à zéro ferait passer un problème de fuseau pour
+        # une prévision fraîche.
+        generated = datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
+        history_end = datetime(2026, 9, 2, 10, 0, tzinfo=UTC)
+        assert api.feature_lag_hours(generated, history_end) == pytest.approx(-2.0)
+
+
+class TestReadiness:
+    """Pourquoi la prévision manque, ce qu'un 503 nu ne dit pas."""
+
+    def test_a_served_model_and_features_are_ready(self, client) -> None:
+        with client() as http:
+            body = http.get("/ready").json()
+        assert body["ready"] is True
+        assert body["model_resolved"] is True
+        assert body["features_available"] is True
+        assert body["detail"] == ""
+
+    def test_an_empty_registry_is_named(self, client) -> None:
+        # C'est le cas courant tant qu'aucun modèle n'est promu, et celui que
+        # l'API métier doit pouvoir expliquer à ses utilisateurs.
+        with client(served=False) as http:
+            response = http.get("/ready")
+        # 200 et non 503 : un 503 ferait de cette route une seconde sonde, et
+        # l'hébergeur redémarrerait le service à chaque hoquet de MLflow.
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ready"] is False
+        assert body["model_resolved"] is False
+        assert body["model_version"] is None
+        assert "Modèle" in body["detail"]
+
+    def test_an_unconfigured_service_says_so(self, monkeypatch) -> None:
+        monkeypatch.setattr(api, "configure", lambda: None)
+        api.state["registry"] = None
+        api.state["spec"] = None
+        with TestClient(api.app) as http:
+            body = http.get("/ready").json()
+        assert body["ready"] is False
+        assert "non configuré" in body["detail"]

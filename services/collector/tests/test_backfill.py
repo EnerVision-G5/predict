@@ -27,8 +27,8 @@ import pytest
 from conftest import FakeEngine
 from sqlalchemy.dialects import postgresql
 
-from collector.__main__ import parse_args, requested_days
-from collector.client import MAX_PAGE_SIZE, SourceSettings
+from collector.__main__ import collect_day, parse_args, requested_days
+from collector.client import MAX_PAGE_SIZE, SourceError, SourceSettings
 from collector.sink import build_insert, to_measures, to_records, write
 
 SITES = tuple(f"SITE{index:03d}" for index in range(1, 8))
@@ -211,3 +211,67 @@ def _settings() -> SourceSettings:
         backoff_s=0.0,
         rate_limit_rps=0.0,
     )
+
+
+class _StubSource:
+    """Source réduite à ce que `collect_day` lui demande.
+
+    La pagination réelle, ses reprises et sa limite de débit sont éprouvées
+    par `test_client.py` : les rejouer ici ne testerait pas le rattrapage.
+    """
+
+    def __init__(self, readings: list[dict], failing: str | None = None) -> None:
+        self._readings = readings
+        self._failing = failing
+
+    def iter_readings(self, site_id: str, start_time, end_time):
+        if site_id == self._failing:
+            raise SourceError(f"{site_id} muet")
+        return [dict(reading, site_id=site_id) for reading in self._readings]
+
+
+def _state_params(engine: FakeEngine) -> list[dict]:
+    """Rend les paramètres des instructions visant `ingestion_etat`."""
+    compiled = [
+        statement.compile(dialect=postgresql.dialect())
+        for statement in engine.executed
+    ]
+    return [
+        instruction.params
+        for instruction in compiled
+        if "ingestion_etat" in str(instruction)
+    ]
+
+
+class TestBackfillState:
+    """Un rattrapage ne doit pas se faire passer pour une collecte vivante."""
+
+    def test_a_replayed_day_is_recorded_as_a_backfill(self, make_reading) -> None:
+        # C'est précisément quand le poller est arrêté qu'on rejoue une
+        # journée à la main. Une ligne qui ne dirait pas d'où elle vient
+        # ferait alors paraître l'ingestion fraîche.
+        engine = FakeEngine()
+        source = _StubSource([make_reading("2026-09-02T07:59:00Z")])
+        collect_day(source, engine, 1000, date(2026, 9, 2), ["SITE001"])
+
+        params = _state_params(engine)
+        assert len(params) == 1
+        assert "backfill" in params[0].values()
+
+    def test_a_source_failure_is_recorded_before_it_propagates(
+        self, make_reading
+    ) -> None:
+        # Le rattrapage s'arrête sur un échec de source, mais ce qu'il savait
+        # à cet instant a plus de valeur écrit que perdu.
+        engine = FakeEngine()
+        source = _StubSource(
+            [make_reading("2026-09-02T07:59:00Z")], failing="SITE002"
+        )
+        with pytest.raises(SourceError):
+            collect_day(
+                source, engine, 1000, date(2026, 9, 2), ["SITE001", "SITE002"]
+            )
+
+        params = _state_params(engine)
+        # Un succès et un échec : deux formes, donc deux instructions.
+        assert len(params) == 2

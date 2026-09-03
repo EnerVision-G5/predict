@@ -29,6 +29,8 @@ from predict_common.schemas import (
     QUALITY_DEGRADED,
     QUALITY_GOOD,
     QUALITY_PARTIAL,
+    QUALITY_SOURCE_COLUMN,
+    QUALITY_SOURCE_ETL,
     TARGET_COLUMN,
 )
 
@@ -73,6 +75,12 @@ def qualify(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
     `columns` porte les colonnes de mesure surveillées. Les passer en argument
     évite à ce module de connaître le schéma de la table, dont la
     normalisation reste seule responsable.
+
+    Le passage est signé : `quality_source` bascule de `source` — le défaut de
+    la base, posé par le collecteur — à `etl`. Sans cette marque, le `good`
+    que le collecteur écrit faute de mieux et le `good` que ce module vient de
+    confirmer sont le même caractère, et une fenêtre non encore traitée passe
+    pour une fenêtre saine.
     """
     if frame.empty:
         return frame
@@ -85,6 +93,7 @@ def qualify(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
         _settle_quality(declared, absent)
         for declared, absent in zip(frame["data_quality"], missing, strict=True)
     ]
+    frame[QUALITY_SOURCE_COLUMN] = QUALITY_SOURCE_ETL
     return frame
 
 

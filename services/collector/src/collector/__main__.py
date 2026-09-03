@@ -24,6 +24,12 @@ Relancer la même date ne double rien et n'efface rien : l'insertion est un
 `ON CONFLICT DO NOTHING`. C'est ce qui rend le rejeu après incident sans effet
 de bord — et le rejeu est le mode d'exploitation normal, pas l'exception : une
 source indisponible pendant deux heures se rattrape en relançant la journée.
+
+Le rattrapage repose son état dans `ingestion_etat` comme le poller, mais sous
+`source='backfill'`. La distinction compte : le rattrapage est justement ce
+qu'on lance quand la collecte continue est arrêtée, et une ligne qui ne dirait
+pas d'où elle vient ferait passer une journée rejouée à la main pour une
+ingestion vivante.
 """
 
 from __future__ import annotations
@@ -42,9 +48,15 @@ from collector.client import (
     SourceError,
     SourceSettings,
 )
-from collector.sink import sync_sites, to_measures, write
+from collector.sink import (
+    IngestionState,
+    sync_sites,
+    to_measures,
+    write,
+    write_state,
+)
 from predict_common.config import ConfigError, load_config
-from predict_common.db import DatabaseError, open_engine
+from predict_common.db import INGESTION_SOURCE_BACKFILL, DatabaseError, open_engine
 from predict_common.paths import PathError, date_range, parse_date
 
 DEFAULT_DAYS = 1
@@ -76,10 +88,37 @@ def collect_day(
     """Collecte une journée pour les sites demandés et la charge en base."""
     start_time, end_time = day_window(day)
     records: list[dict] = []
+    states: list[IngestionState] = []
+    attempted_at = datetime.now(UTC)
     for site_id in sites:
-        page = list(client.iter_readings(site_id, start_time, end_time))
+        try:
+            page = list(client.iter_readings(site_id, start_time, end_time))
+        except SourceError as exc:
+            # L'état est posé avant que l'exception ne remonte : le rattrapage
+            # s'arrête sur un échec de source, mais ce qu'il savait à cet
+            # instant a plus de valeur écrit que perdu.
+            states.append(
+                IngestionState(
+                    site_id=site_id,
+                    attempted_at=attempted_at,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
+            record_collection(engine, states, batch_size)
+            raise
         logger.info("site %s : %d mesure(s) lue(s)", site_id, len(page))
         records.extend(page)
+        states.append(
+            IngestionState(
+                site_id=site_id,
+                attempted_at=attempted_at,
+                rows=len(page),
+                # Aucun retard de données n'est mesuré ici, et c'en est le
+                # sens : un rattrapage relit une journée passée, l'âge de ce
+                # qu'il reçoit ne dit rien de la santé de la source.
+                data_lag_s=None,
+            )
+        )
     report = write(engine, to_measures(records), batch_size, day=day)
     logger.info(
         "%s : %d mesure(s) soumise(s)%s",
@@ -87,7 +126,30 @@ def collect_day(
         report.rows,
         f", {report.dropped} écartée(s)" if report.dropped else "",
     )
+    record_collection(engine, states, batch_size)
     return report.rows
+
+
+def record_collection(
+    engine,
+    states: Sequence[IngestionState],
+    batch_size: int,
+) -> None:
+    """Repose l'état de collecte du rattrapage, sans jamais le faire échouer.
+
+    `source='backfill'` et non `'poller'` : un rattrapage lancé à la main
+    pendant que la collecte continue est arrêtée ne doit pas faire paraître
+    l'ingestion vivante. C'est exactement le cas où la fraîcheur affichée
+    deviendrait un mensonge, puisqu'il se produit quand quelque chose ne va
+    déjà pas.
+
+    L'échec de cette écriture n'est pas celui du rattrapage : les mesures,
+    elles, sont chargées. Il est journalisé et n'emporte pas le run.
+    """
+    try:
+        write_state(engine, states, batch_size, INGESTION_SOURCE_BACKFILL)
+    except (SQLAlchemyError, OSError) as exc:
+        logger.error("état d'ingestion non enregistré : %s", exc)
 
 
 def resolve_sites(

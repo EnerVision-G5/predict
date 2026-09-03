@@ -25,6 +25,7 @@ import pandas as pd
 from etl.quality import qualify
 from predict_common.schemas import (
     NUMERIC_COLUMNS,
+    QUALITY_SOURCE_COLUMN,
     SITE_COLUMN,
     TIMESTAMP_COLUMN,
 )
@@ -38,6 +39,10 @@ MEASURE_COLUMNS = (
     *NUMERIC_COLUMNS,
     "null_reasons",
     "data_quality",
+    # Signature du passage, posée par `qualify`. Déclarée ici pour qu'un lot
+    # vide la porte aussi : les étages suivants projettent cette liste, et une
+    # colonne absente n'y ferait défaut qu'au moment du chargement.
+    QUALITY_SOURCE_COLUMN,
 )
 
 
