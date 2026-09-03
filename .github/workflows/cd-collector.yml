@@ -1,0 +1,120 @@
+name: cd-collector
+
+# Livraison de l'image Docker du service collector.
+#
+# Déclenchée uniquement par un changement dans services/collector poussé sur
+# master. Le gate ne rejoue que ce qui concerne le collecteur (lint + tests du
+# service et de la bibliothèque partagée), pas toute la CI du monorepo. Si le
+# gate passe, l'image est construite, taguée avec le SHA Git et poussée sur
+# GHCR.
+#
+# Portée volontairement étroite : une modif de uv.lock ou de libs/predict_common
+# seule ne redéclenche pas ce workflow. Reconstruire le collecteur après un tel
+# changement se fait par un commit qui touche aussi services/collector, ou via
+# un déclenchement manuel.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "services/collector/**"
+      - ".github/workflows/cd-collector.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: cd-collector-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # uv.lock fige la pile entière : le gate installe exactement ce que l'image
+  # embarquera, et `--frozen` échoue si le lock a dérivé des manifestes.
+  UV_FROZEN: "1"
+
+jobs:
+  gate:
+    name: Lint & tests (collector)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Installer le seul paquet collector
+        # --package collector : ni scikit-learn, ni xgboost, ni la pile ETL.
+        # On analyse le collecteur, pas le workspace.
+        run: uv sync --python 3.11 --package collector
+
+      - name: Lint (ruff)
+        run: uv run ruff check services/collector libs/predict_common
+
+      - name: Tests (pytest)
+        # Les tests du collecteur ne joignent ni l'API Mock ni PostgreSQL
+        # (transport HTTP simulé, moteur SQLAlchemy factice).
+        run: uv run pytest services/collector
+
+  build:
+    name: Build & push image (GHCR)
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nom d'image en minuscules (GHCR l'exige) : ghcr.io/<org>/predict/collector
+      - name: Préparer la référence d'image
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/collector" >> "$GITHUB_ENV"
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # Jeton éphémère fourni par Actions, jamais stocké dans l'image.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculer tags et labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # Contexte = racine du workspace : le Dockerfile a besoin des
+          # manifestes des membres pour résoudre predict-common via uv.
+          context: .
+          file: services/collector/Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=collector
+          cache-to: type=gha,mode=min,scope=collector
+
+      # Reproduit un démarrage sur machine vierge : pull par digest immuable,
+      # exécution du point d'entrée sans aucun fichier du dépôt.
+      - name: Smoke test de l'image publiée
+        run: docker run --rm "${IMAGE}@${{ steps.build.outputs.digest }}" --help
+
+      - name: Récapitulatif
+        run: |
+          {
+            echo "### Image publiée"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "digest : \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
