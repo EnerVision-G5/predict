@@ -26,11 +26,16 @@ et sa migration `03_mesure_imputation.sql`. Seules les tables que cette chaîne
 écrit sont déclarées, et dans chacune, seules les colonnes qu'elle remplit :
 `inserted_at` a un DEFAULT côté base, qui date le chargement mieux que nous.
 
-`modele` et `prediction` ne sont donc pas ici. Elles existent bien dans le
-schéma figé, mais c'est l'API EnerVision qui les écrit — elle sert le contrat
-de prédiction à ses consommateurs et archive ce qu'elle rend. Le service
-d'inférence de ce repo calcule et répond ; ce qu'on fait de sa réponse ne le
-regarde pas.
+`prediction` n'est donc pas ici : c'est l'API EnerVision qui l'écrit, elle
+sert le contrat de prédiction à ses consommateurs et archive ce qu'elle rend.
+Le service d'inférence de ce repo calcule et répond ; ce qu'on fait de sa
+réponse ne le regarde pas.
+
+`modele`, en revanche, y est. Elle décrit le modèle en service, pas la
+prévision qu'il produit, et le seul geste qui change ce qu'elle doit dire est
+la promotion d'un alias dans MLflow — un geste de l'entraînement. L'API ne
+peut que la déduire en interrogeant le registre, ce qui donnerait deux
+sources pour un fait dont une seule est autoritaire.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from typing import Any
 
 from sqlalchemy import (
     ARRAY,
+    Boolean,
     Column,
     DateTime,
     MetaData,
@@ -127,6 +133,37 @@ SITE_COLUMNS = (
     "status",
 )
 
+# Miroir applicatif du Model Registry MLflow, tenu par l'entraînement. Comme
+# ailleurs, seules les colonnes que la chaîne remplit sont déclarées :
+# `modele_id` est laissé à l'IDENTITY de la base, et `created_at` à son
+# DEFAULT now(). Les deux dates ne disent pas la même chose et aucune ne
+# remplace l'autre — `created_at` date l'entrée de la ligne dans la table,
+# `date_entrainement` date le run MLflow qui a produit le modèle.
+#
+# La clé naturelle (nom, version) est déclarée primaire parce que c'est elle
+# que vise le ON CONFLICT, et qu'elle porte déjà un UNIQUE dans le schéma figé.
+modele = Table(
+    "modele",
+    metadata,
+    Column("nom", String(100), primary_key=True),
+    Column("version", String(20), primary_key=True),
+    Column("mlflow_run_id", String(64)),
+    Column("date_entrainement", DateTime(timezone=True)),
+    Column("actif", Boolean, nullable=False),
+)
+
+# Clé naturelle de `modele`, et cible du ON CONFLICT de la promotion.
+MODELE_KEY = ("nom", "version")
+
+# Colonnes qu'une promotion repose sur une version déjà connue. `nom` et
+# `version` en sont exclues : ce sont les colonnes de la clé, les réécrire
+# n'aurait pas de sens.
+MODELE_UPDATED_COLUMNS = (
+    "mlflow_run_id",
+    "date_entrainement",
+    "actif",
+)
+
 
 # Colonnes que le collecteur écrit : celles que la source sert, et rien de
 # plus. Les colonnes déduites appartiennent à l'ETL.
@@ -175,8 +212,9 @@ def open_engine(database_url: str, pool_pre_ping: bool = False) -> Engine:
     """
     if not is_configured(database_url):
         raise DatabaseError(
-            "DATABASE_URL est obligatoire : la table `mesure` est la couche"
-            " brute de la chaîne. Copier .env.example en .env et la renseigner."
+            "DATABASE_URL est obligatoire pour cette opération : la base porte"
+            " la couche brute de la chaîne et le registre applicatif des"
+            " modèles. Copier .env.example en .env et la renseigner."
         )
     return create_engine(database_url, pool_pre_ping=pool_pre_ping)
 

@@ -142,11 +142,18 @@ services:
     depends_on:
       mlflow:
         condition: service_healthy
+    # La base n'est lue par aucun entraînement : elle ne sert qu'à `--promote`,
+    # qui inscrit la version promue dans `modele`. Elle est déclarée quand
+    # même, et avec le même `:?` que pour les autres services : une promotion
+    # lancée sans base s'arrête avant d'apprendre, plutôt que de poser l'alias
+    # et de laisser le miroir en arrière.
     environment:
-      <<: *artifacts
+      <<: [*artifacts, *database]
       MLFLOW_EXPERIMENT: ${MLFLOW_EXPERIMENT:-enervision-consumption}
     volumes:
       - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   serving:
     build:

@@ -25,11 +25,19 @@ par un **emplacement** plus un **schéma**, jamais par un appel de fonction.
 | `etl` | table `mesure`, colonnes déduites | API EnerVision |
 | `etl` | `features/v1/dt=2026-09-02/part-*.parquet` (Garage) | `training`, `serving` |
 | `training` | `models:/enervision_xgboost@champion` (MLflow) | `serving` |
+| `training` | table `modele`, ligne active de la version promue | API EnerVision |
 
 Le service d'inférence, lui, ne produit aucun artefact : il calcule une
-prévision et la rend. L'archiver dans `prediction` et référencer le modèle dans
-`modele` sont le métier de l'API EnerVision, qui sert ce contrat à ses
-consommateurs et tient sa propre base.
+prévision et la rend. L'archiver dans `prediction` est le métier de l'API
+EnerVision, qui sert ce contrat à ses consommateurs et tient sa propre base.
+
+`modele`, en revanche, est écrite ici. Elle dit quel modèle est en service, et
+le seul geste qui change cette réponse est la promotion d'un alias — un geste
+de l'entraînement. Laisser l'API la déduire en interrogeant MLflow donnerait
+deux sources pour un fait dont une seule est autoritaire, et rendrait la
+chaîne de prédiction dépendante d'un service dont ce n'est pas le contrat.
+C'est aussi ce qui rend `prediction` remplissable : sa colonne `modele_id` est
+NOT NULL et n'aurait sinon aucune ligne à référencer.
 
 Une frontière est une table ou un chemin ; ce qui compte est qu'elle ne soit
 jamais un import. Les chemins sont construits par `predict_common.paths`, la
@@ -325,13 +333,37 @@ d'exploitation, pas une conséquence automatique de la fin d'un run.
 # promouvoir depuis l'entraînement, quand on sait déjà qu'on veut la servir
 python -m training --feature-version v1 --promote
 
-# ou promouvoir après coup une version déjà enregistrée
-mlflow models set-alias -m enervision_xgboost -a champion -v 7
+# ou promouvoir après coup une version déjà enregistrée, sans réapprendre
+python -m training --promote-version 7
+
+# le service résout son alias au démarrage : il le relit au redémarrage,
+# sans reconstruction d'image ni redéploiement
 docker compose restart serving
 ```
 
 Résultat : on promeut sans redéployer, et le retour arrière est le même geste
 en sens inverse.
+
+`--promote` fait deux choses, et la seconde est la raison pour laquelle
+l'entraînement connaît la base. Il déplace l'alias, puis inscrit la version
+dans `modele` — `nom`, `version`, `mlflow_run_id`, la date du run et `actif` —
+et éteint du même coup les autres versions du même modèle, dans une seule
+transaction. C'est cette ligne que l'API EnerVision référence depuis
+`prediction.modele_id`, et sa colonne `actif` qui dit quel modèle sert
+aujourd'hui sans avoir à interroger MLflow.
+
+`DATABASE_URL` est donc obligatoire sous `--promote`, et vérifiée **avant**
+l'apprentissage : la découvrir absente au bout d'une heure de calcul laisserait
+le choix entre perdre le run et servir un modèle que rien ne référence. Sans
+cette option, l'entraînement ne touche jamais la base.
+
+`--promote-version` fait exactement le même geste sur une version déjà
+enregistrée, et c'est lui qui remplace le `mlflow models set-alias` d'avant.
+Celui-ci fonctionne toujours, mais il déplace l'alias sans rien savoir de
+`modele` : le miroir reste alors en arrière, et il dit qu'une autre version
+sert. Après une promotion faite ainsi, un `--promote-version` sur la version
+concernée remet tout d'aplomb — l'inscription est un `ON CONFLICT (nom,
+version) DO UPDATE`, donc rejouable autant de fois qu'on veut.
 
 C'est aussi le `loader` qui sait *comment* parler au modèle. Sa signature dit
 les colonnes, leur ordre et leurs types, et MLflow refuse une conversion qu'il
