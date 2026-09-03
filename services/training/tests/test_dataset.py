@@ -9,6 +9,7 @@ voit qu'une fois déployée.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -81,6 +82,38 @@ def test_read_features_skips_a_missing_day(tmp_path: Path) -> None:
     seed(tmp_path, days=2)
     frame = read_features(str(tmp_path), "v1", END - timedelta(days=5), END)
     assert len(frame) == 48
+
+
+def test_read_features_says_how_much_of_the_window_is_missing(
+    tmp_path: Path, caplog
+) -> None:
+    # `--history-days 90` sur une chaîne qui n'a qu'un mois produit un modèle
+    # appris sur un mois, et rien ne l'annonçait : les journées absentes sont
+    # journalisées en debug par la couche de stockage, sous le niveau que les
+    # services configurent.
+    seed(tmp_path, days=2)
+    with caplog.at_level(logging.WARNING):
+        read_features(str(tmp_path), "v1", END - timedelta(days=5), END)
+    assert "6 journée(s)" in caplog.text
+    assert "2 seulement" in caplog.text
+
+
+def test_read_features_stays_quiet_on_a_complete_window(
+    tmp_path: Path, caplog
+) -> None:
+    # Un avertissement à chaque run le rendrait illisible le jour où il compte.
+    seed(tmp_path, days=3)
+    with caplog.at_level(logging.WARNING):
+        read_features(str(tmp_path), "v1", END - timedelta(days=2), END)
+    assert caplog.text == ""
+
+
+def test_read_features_warns_when_the_whole_window_is_absent(
+    tmp_path: Path, caplog
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        assert read_features(str(tmp_path), "v1", END - timedelta(days=2), END).empty
+    assert "aucune" in caplog.text
 
 
 def test_read_features_returns_nothing_for_an_unknown_version(

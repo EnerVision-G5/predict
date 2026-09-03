@@ -13,7 +13,13 @@ import pandas as pd
 import pytest
 
 from predict_common.schemas import feature_columns
-from training.model import ModelParams, best_iteration, evaluate, fit
+from training.model import (
+    ModelParams,
+    best_iteration,
+    evaluate,
+    fit,
+    residual_std,
+)
 
 COLUMNS = feature_columns((1, 24), 2)
 ROWS = 300
@@ -89,3 +95,28 @@ def test_best_iteration_counts_the_trees_actually_kept() -> None:
     valid_features, valid_target = learnable(rows=80)
     model = fit(features, target, valid_features, valid_target, ModelParams(), 10)
     assert best_iteration(model) >= 1
+
+
+def test_residual_std_is_zero_on_a_perfect_prediction() -> None:
+    assert residual_std(pd.Series([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]) == 0.0
+
+
+def test_residual_std_measures_the_spread_not_the_bias() -> None:
+    # Une erreur constante ne disperse rien : le modèle se trompe, mais de
+    # façon prévisible, et l'intervalle servi n'a pas à s'en élargir.
+    observed = pd.Series([1.0, 2.0, 3.0, 4.0])
+    assert residual_std(observed, [2.0, 3.0, 4.0, 5.0]) == pytest.approx(0.0)
+    assert residual_std(observed, [2.0, 1.0, 4.0, 3.0]) > 0.0
+
+
+def test_residual_std_ignores_the_index_of_the_observations() -> None:
+    # Le bloc de test est une tranche d'un tableau plus grand : son index ne
+    # part pas de zéro, là où les prédictions sont une suite nue. Les aligner
+    # sur l'index soustrairait des NaN et rendrait un écart-type absurde.
+    observed = pd.Series([10.0, 12.0, 14.0], index=[907, 908, 909])
+    assert residual_std(observed, [10.0, 12.0, 14.0]) == 0.0
+
+
+def test_residual_std_refuses_a_single_point() -> None:
+    with pytest.raises(ValueError, match="au moins"):
+        residual_std(pd.Series([1.0]), [1.0])

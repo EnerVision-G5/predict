@@ -33,9 +33,14 @@ TODAY = date.today()
 class StubModel:
     """Modèle chargé qui prédit une constante, sans MLflow derrière."""
 
-    def __init__(self, version: str = "3") -> None:
+    def __init__(
+        self,
+        version: str = "3",
+        residual_std: float | None = None,
+    ) -> None:
         self.version = version
         self.columns = COLUMNS
+        self.residual_std = residual_std
 
     def predict(self, frame: pd.DataFrame):
         return [42.0] * len(frame)
@@ -95,9 +100,10 @@ def serving_root(tmp_path: Path) -> Path:
 def client(serving_root: Path, monkeypatch):
     """Client HTTP dont le démarrage résout un modèle factice."""
 
-    def build(served: bool = True):
+    def build(served: bool = True, model: StubModel | None = None):
         def configure() -> None:
-            api.state["registry"] = StubRegistry(StubModel() if served else None)
+            resolved = (model or StubModel()) if served else None
+            api.state["registry"] = StubRegistry(resolved)
             api.state["spec"] = ForecastSpec(
                 root=str(serving_root),
                 feature_version="v1",
@@ -146,14 +152,37 @@ def test_the_points_follow_one_another_in_time(client) -> None:
     assert stamps == sorted(stamps)
 
 
-def test_the_bounds_are_declared_null_rather_than_invented(client) -> None:
-    # Un intervalle de confiance sur une prévision récurrente demande une
-    # estimation de l'erreur qui s'accumule : le contrat prévoit leur nullité.
+def test_a_version_without_a_spread_serves_null_bounds(client) -> None:
+    # Le contrat les prévoit optionnelles : une version qui ne déclare pas la
+    # dispersion de son erreur sert une prévision nue, pas une bande inventée.
     with client() as http:
         response = http.post("/api/v1/predict", json={"site_id": "SITE001"})
     point = response.json()["points"][0]
     assert point["lower_bound_kw"] is None
     assert point["upper_bound_kw"] is None
+
+
+def test_the_bounds_frame_the_prediction(client) -> None:
+    with client(model=StubModel(residual_std=2.0)) as http:
+        response = http.post("/api/v1/predict", json={"site_id": "SITE001"})
+    point = response.json()["points"][0]
+    assert point["lower_bound_kw"] < point["predicted_consumption_kw"]
+    assert point["upper_bound_kw"] > point["predicted_consumption_kw"]
+
+
+def test_the_bounds_widen_with_the_horizon(client) -> None:
+    # L'erreur s'accumule à chaque pas de la récurrence : une bande constante
+    # sur 24 heures annoncerait la 24e aussi sûre que la première.
+    with client(model=StubModel(residual_std=2.0)) as http:
+        response = http.post(
+            "/api/v1/predict", json={"site_id": "SITE001", "horizon_hours": 6}
+        )
+    points = response.json()["points"]
+    widths = [
+        point["upper_bound_kw"] - point["lower_bound_kw"] for point in points
+    ]
+    assert widths == sorted(widths)
+    assert widths[-1] > widths[0]
 
 
 def test_an_unknown_site_is_a_404(client) -> None:

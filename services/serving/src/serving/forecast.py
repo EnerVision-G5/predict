@@ -39,7 +39,27 @@ from predict_common.schemas import (
 
 WEEKEND_FIRST_DAY = 5
 
+# Quantile normal bilatéral à 95 %. Nommé plutôt qu'écrit dans le calcul : la
+# largeur de l'intervalle servi est une décision, et une décision se relit.
+CONFIDENCE_Z = 1.96
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ForecastPoint:
+    """Une heure prédite, et l'intervalle qui dit ce qu'elle vaut.
+
+    Les bornes sont nulles quand la version servie ne déclare pas la
+    dispersion de son erreur : le contrat les décrit comme optionnelles, et un
+    intervalle inventé serait pire qu'un intervalle absent — un consommateur
+    ne saurait pas qu'il ne repose sur rien.
+    """
+
+    stamp: pd.Timestamp
+    value: float
+    lower: float | None
+    upper: float | None
 
 
 class NoHistory(LookupError):
@@ -114,6 +134,35 @@ def site_history(frame: pd.DataFrame, site_id: str, spec: ForecastSpec) -> pd.Se
     return series.reindex(grid)
 
 
+def confidence_band(
+    value: float,
+    step: int,
+    residual_std: float | None,
+) -> tuple[float | None, float | None]:
+    """Encadre une valeur prédite au pas `step` de la récurrence.
+
+    La largeur croît en racine du pas, et non linéairement : le service prédit
+    par récurrence, chaque heure repartant des heures qu'il vient lui-même de
+    prédire. Les erreurs de deux pas successifs s'additionnent en variance, pas
+    en écart-type — d'où le `sqrt`. Une croissance linéaire donnerait à
+    l'horizon 48 une bande quatre fois trop large, et personne ne la lirait.
+
+    C'est une approximation, et elle est optimiste sur deux points : elle
+    suppose les erreurs successives indépendantes, et elle ignore que le modèle
+    se trompe davantage sur ses propres prédictions que sur des mesures. Elle
+    dit un ordre de grandeur, pas une garantie.
+
+    La borne basse n'est pas ramenée à zéro. Le schéma de la couche brute
+    n'interdit pas une consommation négative — un site qui produit localement
+    peut afficher un soutirage net négatif — et rogner la borne masquerait un
+    modèle qui prédit une valeur aberrante au lieu de la laisser voir.
+    """
+    if residual_std is None or step < 1:
+        return None, None
+    margin = CONFIDENCE_Z * residual_std * (step**0.5)
+    return value - margin, value + margin
+
+
 def horizon_stamps(history: pd.Series, hours: int) -> list[pd.Timestamp]:
     """Retourne les heures prédites, à la suite de la dernière observée."""
     last = history.index.max()
@@ -134,14 +183,16 @@ def build_row(
     # Les variables calendaires sont entières, et pas seulement par élégance :
     # la signature du modèle les déclare `integer`, et MLflow refuse une
     # conversion float64 vers int32 qu'il ne peut pas garantir sans perte.
+    # La température n'est pas ici, et le modèle ne l'attend pas : elle a été
+    # sortie des variables explicatives dans `predict_common.schemas`. Le
+    # service ne connaît pas la météo des heures à venir, et un modèle entraîné
+    # sur une colonne toujours vide en production apprend un biais, pas un
+    # signal. La partition la porte toujours : le jour où une prévision météo
+    # alimentera l'inférence, elle est déjà là.
     row: dict[str, float | int] = {
         "hour": int(stamp.hour),
         "day_of_week": int(stamp.dayofweek),
         "is_weekend": int(stamp.dayofweek >= WEEKEND_FIRST_DAY),
-        # La température future n'est pas connue du service : elle relèverait
-        # d'une prévision météo, qui est une source de plus. Absente, XGBoost
-        # la traite comme une valeur manquante, ce qu'elle est.
-        "temperature_celsius": float("nan"),
     }
     for hours in spec.lag_hours:
         value = _at(history, stamp - timedelta(hours=hours))
@@ -161,7 +212,8 @@ def predict_series(
     hours: int,
     spec: ForecastSpec,
     columns: Sequence[str],
-) -> list[tuple[pd.Timestamp, float]]:
+    residual_std: float | None = None,
+) -> list[ForecastPoint]:
     """Prédit les `hours` heures suivantes, chacune nourrissant la suivante.
 
     La série d'historique grandit à chaque pas : la valeur prédite pour h+1 y
@@ -170,15 +222,16 @@ def predict_series(
     fait croître l'erreur avec l'horizon.
     """
     working = history.copy()
-    points: list[tuple[pd.Timestamp, float]] = []
-    for stamp in horizon_stamps(history, hours):
+    points: list[ForecastPoint] = []
+    for step, stamp in enumerate(horizon_stamps(history, hours), start=1):
         row = build_row(working, stamp, spec)
         if row is None:
             logger.warning("horizon interrompu à %s : décalage manquant", stamp)
             break
         value = float(predict(pd.DataFrame([row])[list(columns)])[0])
         working.loc[stamp] = value
-        points.append((stamp, value))
+        lower, upper = confidence_band(value, step, residual_std)
+        points.append(ForecastPoint(stamp=stamp, value=value, lower=lower, upper=upper))
     return points
 
 
