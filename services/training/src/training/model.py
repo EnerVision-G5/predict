@@ -19,6 +19,10 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
+# En deçà, un écart-type ne décrit rien : deux points suffisent à en produire
+# un, et le service en tirerait une bande dont la largeur serait un hasard.
+MINIMUM_RESIDUALS = 2
+
 
 @dataclass(frozen=True)
 class ModelParams:
@@ -90,6 +94,33 @@ def evaluate(observed: pd.Series, predicted: Sequence[float]) -> dict[str, float
         "rmse": float(mean_squared_error(observed, predicted) ** 0.5),
         "r2": float(r2_score(observed, predicted)),
     }
+
+
+def residual_std(observed: pd.Series, predicted: Sequence[float]) -> float:
+    """Écart-type des résidus sur le bloc de test, en kilowatts.
+
+    C'est la dispersion de l'erreur du modèle autour de zéro, et c'est ce qui
+    permet au service d'inférence d'assortir sa prévision d'un intervalle.
+    Mesurée sur le test et non sur la validation : la validation a décidé de
+    l'arrêt, le modèle s'y est donc ajusté et sa dispersion y est optimiste.
+
+    L'écart-type et non l'erreur absolue moyenne, parce que c'est lui qui se
+    compose : deux erreurs indépendantes s'additionnent en variance, ce dont
+    la récurrence du service a besoin pour élargir sa bande avec l'horizon.
+
+    Le degré de liberté est laissé à 1 (`ddof=1`) : la moyenne des résidus est
+    estimée sur ces mêmes points, et la retenir sans le dire sous-estimerait
+    la dispersion — d'autant plus que le bloc de test est court.
+    """
+    residuals = pd.Series(observed).reset_index(drop=True) - pd.Series(
+        list(predicted)
+    ).reset_index(drop=True)
+    if len(residuals) < MINIMUM_RESIDUALS:
+        raise ValueError(
+            "Un écart-type de résidus demande au moins"
+            f" {MINIMUM_RESIDUALS} points de test, {len(residuals)} fourni(s)."
+        )
+    return float(residuals.std(ddof=1))
 
 
 def best_iteration(model: XGBRegressor) -> int:

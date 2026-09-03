@@ -71,7 +71,24 @@ def loaded(model: FakeModel) -> LoadedModel:
     )
 
 
-def registry_serving(monkeypatch, model: FakeModel | None) -> ModelRegistry:
+class FakeVersion:
+    """Entrée de registre telle que MLflow la restitue pour un alias."""
+
+    def __init__(self, version: str = "3", tags: dict[str, str] | None = None) -> None:
+        self.version = version
+        self.tags = dict(tags or {})
+
+
+# Entrée par défaut des tests qui ne s'intéressent pas au registre : une
+# version résolue, avec sa dispersion, comme un entraînement en pose une.
+SERVED_ENTRY = FakeVersion("3", {"residual_std": "2.5"})
+
+
+def registry_serving(
+    monkeypatch,
+    model: FakeModel | None,
+    entry: FakeVersion | None = SERVED_ENTRY,
+) -> ModelRegistry:
     """Registre dont le chargement rend le modèle demandé, ou échoue."""
 
     def load_model(uri: str):
@@ -81,11 +98,7 @@ def registry_serving(monkeypatch, model: FakeModel | None) -> ModelRegistry:
 
     monkeypatch.setattr(loader.mlflow.pyfunc, "load_model", load_model)
     monkeypatch.setattr(loader.mlflow, "set_tracking_uri", lambda uri: None)
-    monkeypatch.setattr(
-        loader,
-        "_version_of",
-        lambda model, uri: "3",
-    )
+    monkeypatch.setattr(loader, "_registry_entry", lambda uri: entry)
     return ModelRegistry("http://mlflow.invalid", "models:/enervision_xgboost@champion")
 
 
@@ -169,4 +182,37 @@ class TestAliasParsing:
     def test_the_internal_identifier_takes_over_without_a_registry(self) -> None:
         # Moins précis qu'une version, mais c'est une trace, là où une chaîne
         # vide n'en serait pas une.
-        assert loader._version_of(FakeModel(), "runs:/abc/model") == "uuid-1"
+        assert loader._version_of(None, FakeModel(), "runs:/abc/model") == "uuid-1"
+
+    def test_the_registry_version_wins_over_the_identifier(self) -> None:
+        entry = FakeVersion(version="7")
+        assert loader._version_of(entry, FakeModel(), "models:/m@champion") == "7"
+
+
+class TestResidualStd:
+    """La dispersion servie vient du tag de la version, jamais d'un défaut."""
+
+    def test_the_tag_is_read(self, monkeypatch) -> None:
+        registry = registry_serving(
+            monkeypatch, FakeModel(), FakeVersion("3", {"residual_std": "4.25"})
+        )
+        assert registry.load().residual_std == 4.25
+
+    def test_a_version_without_the_tag_serves_without_bounds(self, monkeypatch) -> None:
+        # Un modèle enregistré avant cette mesure reste servable : il rend une
+        # prévision sans bornes, pas une bande inventée.
+        registry = registry_serving(monkeypatch, FakeModel(), FakeVersion("3", {}))
+        assert registry.load().residual_std is None
+
+    def test_an_unreadable_tag_serves_without_bounds(self, monkeypatch) -> None:
+        registry = registry_serving(
+            monkeypatch, FakeModel(), FakeVersion("3", {"residual_std": "large"})
+        )
+        assert registry.load().residual_std is None
+
+    def test_a_null_spread_is_refused(self, monkeypatch) -> None:
+        # Une bande de largeur nulle annoncerait une prévision certaine.
+        registry = registry_serving(
+            monkeypatch, FakeModel(), FakeVersion("3", {"residual_std": "0"})
+        )
+        assert registry.load().residual_std is None

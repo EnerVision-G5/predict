@@ -42,8 +42,8 @@ from predict_common.schemas import (
     SITE_COLUMN,
     TARGET_COLUMN,
     TIMESTAMP_COLUMN,
-    feature_columns,
     lag_column,
+    published_columns,
     rolling_column,
 )
 
@@ -74,8 +74,15 @@ class FeatureSpec:
 
     @property
     def columns(self) -> tuple[str, ...]:
-        """Variables explicatives, dans l'ordre de la signature du modèle."""
-        return feature_columns(self.lag_hours, self.rolling_window_h)
+        """Colonnes calculées écrites dans la partition, dans l'ordre du schéma.
+
+        Sur-ensemble des variables du modèle : l'ETL publie aussi ce que le
+        modèle ne consomme pas, la température au premier chef. Ce que le
+        modèle lit est décidé par `feature_columns`, pas ici — la couche des
+        variables décrit ce qu'elle sait, elle n'arbitre pas à la place de
+        l'entraînement.
+        """
+        return published_columns(self.lag_hours, self.rolling_window_h)
 
     @property
     def periods_per_hour(self) -> int:
