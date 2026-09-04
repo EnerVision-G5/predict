@@ -121,12 +121,18 @@ def test_the_shared_library_carries_only_its_declared_modules() -> None:
     # `db` a rejoint les quatre premiers le jour où la couche brute est
     # devenue une table : le collecteur et l'ETL écrivent tous deux `mesure`,
     # et deux définitions de cette table donneraient deux vérités sur elle.
+    #
+    # `source` les a rejoints le jour où un deuxième service a eu besoin de
+    # parler à l'API Mock : le collecteur en tire les mesures, le service
+    # d'inférence relaie le référentiel et la simulation de pic pour l'API
+    # métier, qui ne connaît pas la source. Deux clients auraient donné deux
+    # façons de lire la même API, et un service ne peut pas importer l'autre.
     modules = {
         path.stem
         for path in (ROOT / "libs" / SHARED / "src" / SHARED).glob("*.py")
         if path.stem != "__init__"
     }
-    assert modules == {"config", "paths", "schemas", "io", "db"}
+    assert modules == {"config", "paths", "schemas", "io", "db", "source"}
 
 
 def test_every_partition_path_is_built_by_the_shared_module() -> None:
