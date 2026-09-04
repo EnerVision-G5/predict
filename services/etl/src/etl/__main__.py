@@ -1,7 +1,19 @@
 """Point d'entrée de l'ETL : une journée de mesures, une partition de variables.
 
+    python -m etl
     python -m etl --date 2026-09-02
     python -m etl --date 2026-09-02 --feature-version v1
+    python -m etl --days 2
+
+Sans `--date`, la journée produite est celle du jour : c'est ce dont une
+boucle périodique a besoin, et lui faire calculer une date dans son shell
+mettrait la règle ailleurs que dans le service qui l'applique.
+
+`--days` produit plusieurs journées en remontant depuis `--date`, de la plus
+ancienne à la plus récente. Une journée en cours n'est complète qu'au
+lendemain : la rejouer une fois de plus est ce qui la termine, et comme
+l'écriture remplace la partition au lieu de l'allonger, la rejouer ne coûte
+que le calcul.
 
 Le service lit `mesure` dans TimescaleDB, y repose ce qu'il en a déduit, et
 publie `features/{version}/dt=.../` sur le stockage objet. Il ne connaît ni le
@@ -30,7 +42,7 @@ import argparse
 import logging
 import sys
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pandas as pd
 from sqlalchemy.engine import Engine
@@ -46,8 +58,18 @@ from etl.validate import ContractError, check_features, check_measures
 from predict_common import io
 from predict_common.config import Config, ConfigError, load_config
 from predict_common.db import DatabaseError, open_engine
-from predict_common.paths import PathError, features_partition, parse_date
+from predict_common.paths import (
+    PathError,
+    features_partition,
+    lookback_range,
+    parse_date,
+)
 from predict_common.schemas import TIMESTAMP_COLUMN, features_arrow_schema
+
+# Journées produites quand la ligne de commande n'en demande pas
+# davantage. Une seule : `--date 2026-09-02` reste ce qu'il était, et
+# demander une fenêtre est un geste explicite.
+DEFAULT_DAYS = 1
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -141,7 +163,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Transformation des mesures TimescaleDB en variables.",
     )
     parser.add_argument(
-        "--date", required=True, help="Journée produite, au format YYYY-MM-DD."
+        "--date",
+        default=None,
+        help=(
+            "Dernière journée produite, au format YYYY-MM-DD."
+            " Défaut : aujourd'hui."
+        ),
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAYS,
+        help=(
+            "Nombre de journées produites, en remontant depuis --date."
+            f" Défaut : {DEFAULT_DAYS}."
+        ),
     )
     parser.add_argument(
         "--feature-version",
@@ -177,9 +213,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     engine: Engine | None = None
     try:
         config = load_config()
-        day = parse_date(args.date)
+        end = parse_date(args.date) if args.date else datetime.now(UTC).date()
         engine = open_engine(config.get_optional_str("database.url"))
-        run(config, engine, day, args.feature_version)
+        # Le rejeu d'une journée déjà produite est sans effet de bord : la
+        # partition est remplacée et l'écriture en base repose les colonnes
+        # déduites. Une fenêtre n'a donc pas à savoir où la précédente s'est
+        # arrêtée.
+        for day in lookback_range(end, args.days):
+            run(config, engine, day, args.feature_version)
     except (ConfigError, DatabaseError, PathError, CleanError) as exc:
         logger.error("configuration invalide : %s", exc)
         return EXIT_FAILED
