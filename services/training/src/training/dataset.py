@@ -29,7 +29,12 @@ import pandas as pd
 
 from predict_common import io
 from predict_common.paths import date_range, features_partition
-from predict_common.schemas import SITE_COLUMN, TARGET_COLUMN, TIMESTAMP_COLUMN
+from predict_common.schemas import (
+    SITE_COLUMN,
+    TARGET_COLUMN,
+    TIMESTAMP_COLUMN,
+    add_derived_calendar,
+)
 
 IMPUTED_RATIO_COLUMN = "imputed_ratio"
 
@@ -201,11 +206,18 @@ def matrices(
     L'ordre des colonnes est celui de la signature MLflow, et il vient d'un
     unique appel partagé avec le service d'inférence. Le fixer ici à la main
     laisserait les deux diverger sans que rien ne le signale.
+
+    Les variables dérivées sont reconstruites ici, et ici seulement. C'est le
+    passage obligé de l'entraînement comme de la surveillance de dérive : les
+    dériver dans chacun des deux laisserait deux jeux de variables se former
+    sous le même nom, et la surveillance mesurerait alors un modèle qu'elle ne
+    nourrit pas comme l'entraînement l'a nourri.
     """
-    missing = [name for name in columns if name not in frame.columns]
+    enriched = add_derived_calendar(frame)
+    missing = [name for name in columns if name not in enriched.columns]
     if missing:
         raise DatasetError(f"Variables absentes de la partition : {missing}.")
-    return frame[list(columns)], frame[TARGET_COLUMN]
+    return enriched[list(columns)], enriched[TARGET_COLUMN]
 
 
 def _require_non_empty(split: Split) -> None:

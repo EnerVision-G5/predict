@@ -17,7 +17,11 @@ import pytest
 
 from predict_common import io
 from predict_common.paths import features_partition
-from predict_common.schemas import feature_columns, features_arrow_schema
+from predict_common.schemas import (
+    add_derived_calendar,
+    feature_columns,
+    features_arrow_schema,
+)
 from serving.forecast import (
     CONFIDENCE_Z,
     ForecastSpec,
@@ -159,6 +163,30 @@ class TestBuildRow:
         row = build_row(history, stamp, spec_for(tmp_path))
         assert row["lag_1h"] == history.loc[stamp - pd.Timedelta(hours=1)]
         assert row["lag_24h"] == history.loc[stamp - pd.Timedelta(hours=24)]
+
+    def test_the_derived_calendar_matches_what_training_computes(
+        self, tmp_path: Path
+    ) -> None:
+        # LE test de ce ticket. L'entraînement dérive ces colonnes d'une
+        # partition, le service les calcule pour une heure à venir : si les
+        # deux chemins divergeaient, le modèle recevrait en production autre
+        # chose que ce sur quoi il a appris, et rien ne le signalerait — ni la
+        # signature MLflow, qui ne voit que des noms, ni la surveillance de
+        # dérive, qui passe par le même chemin que l'entraînement.
+        stamp = horizon_stamps(series(), 1)[0]
+        row = build_row(series(), stamp, spec_for(tmp_path))
+        expected = add_derived_calendar(pd.DataFrame({"hour": [int(stamp.hour)]}))
+        assert row["hour_sin"] == pytest.approx(expected["hour_sin"].iloc[0])
+        assert row["hour_cos"] == pytest.approx(expected["hour_cos"].iloc[0])
+
+    def test_the_derived_calendar_is_presented_as_floats(
+        self, tmp_path: Path
+    ) -> None:
+        # À la différence des trois autres variables calendaires : la signature
+        # les déclare `double`, et un entier y serait converti en silence.
+        row = build_row(series(), horizon_stamps(series(), 1)[0], spec_for(tmp_path))
+        assert isinstance(row["hour_sin"], float)
+        assert isinstance(row["hour_cos"], float)
 
     def test_the_future_temperature_is_not_presented(self, tmp_path: Path) -> None:
         # Le modèle ne l'attend plus : elle a quitté les variables

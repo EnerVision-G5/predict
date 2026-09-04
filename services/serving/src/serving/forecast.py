@@ -33,6 +33,7 @@ from predict_common.schemas import (
     SITE_COLUMN,
     TARGET_COLUMN,
     TIMESTAMP_COLUMN,
+    cyclic_hour,
     lag_column,
     rolling_column,
 )
@@ -189,10 +190,17 @@ def build_row(
     # sur une colonne toujours vide en production apprend un biais, pas un
     # signal. La partition la porte toujours : le jour où une prévision météo
     # alimentera l'inférence, elle est déjà là.
+    #
+    # Les deux variables cycliques, elles, sont des flottants, et elles sont
+    # calculées par la même fonction que l'entraînement : c'est la seule chose
+    # qui garantisse que le modèle reçoive ici ce sur quoi il a appris.
+    hour_sin, hour_cos = cyclic_hour(int(stamp.hour))
     row: dict[str, float | int] = {
         "hour": int(stamp.hour),
         "day_of_week": int(stamp.dayofweek),
         "is_weekend": int(stamp.dayofweek >= WEEKEND_FIRST_DAY),
+        "hour_sin": float(hour_sin),
+        "hour_cos": float(hour_cos),
     }
     for hours in spec.lag_hours:
         value = _at(history, stamp - timedelta(hours=hours))

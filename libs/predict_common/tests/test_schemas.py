@@ -16,7 +16,10 @@ from pandera.errors import SchemaError, SchemaErrors
 
 from predict_common.schemas import (
     MEASURE_SCHEMA,
+    MODEL_DERIVED_COLUMNS,
     NUMERIC_COLUMNS,
+    add_derived_calendar,
+    cyclic_hour,
     feature_columns,
     features_arrow_schema,
     features_schema,
@@ -196,11 +199,14 @@ def test_features_schema_refuses_a_duplicated_hour() -> None:
 
 def test_feature_columns_puts_the_calendar_before_the_lags() -> None:
     # L'ordre est celui de la signature MLflow : le service d'inférence le
-    # déduit du même appel, ce qui empêche les deux côtés de diverger.
+    # déduit du même appel, ce qui empêche les deux côtés de diverger. Les
+    # variables dérivées suivent celle dont elles sortent.
     assert feature_columns(LAGS, WINDOW) == (
         "hour",
         "day_of_week",
         "is_weekend",
+        "hour_sin",
+        "hour_cos",
         "lag_1h",
         "lag_24h",
         "lag_168h",
@@ -221,7 +227,18 @@ def test_the_partition_keeps_the_temperature() -> None:
     # de la couche, donc imposerait une feature_version.
     published = published_columns(LAGS, WINDOW)
     assert "temperature_celsius" in published
-    assert set(feature_columns(LAGS, WINDOW)) < set(published)
+    assert "temperature_celsius" not in feature_columns(LAGS, WINDOW)
+
+
+def test_the_derived_columns_are_never_published() -> None:
+    # C'est ce qui dispense d'une feature_version : elles ne sont écrites dans
+    # aucune partition, elles sont reconstruites à chaque lecture depuis une
+    # colonne qui, elle, est publiée.
+    published = published_columns(LAGS, WINDOW)
+    for name in MODEL_DERIVED_COLUMNS:
+        assert name in feature_columns(LAGS, WINDOW)
+        assert name not in published
+    assert "hour" in published
 
 
 def test_published_columns_puts_the_calendar_before_the_lags() -> None:
@@ -240,6 +257,47 @@ def test_published_columns_puts_the_calendar_before_the_lags() -> None:
 def test_changing_the_lags_changes_the_columns() -> None:
     # C'est pour cela qu'un tel changement s'accompagne d'une feature_version.
     assert feature_columns((1,), WINDOW) != feature_columns(LAGS, WINDOW)
+
+
+def test_the_hour_encoding_closes_the_circle() -> None:
+    # La raison d'être de l'encodage : minuit est le tour suivant de la même
+    # heure, pas un point situé vingt-trois unités plus loin.
+    assert cyclic_hour(24) == pytest.approx(cyclic_hour(0))
+
+
+def test_midnight_is_the_near_neighbour_of_eleven_pm() -> None:
+    # Sur l'échelle entière, 23 et 0 sont les deux extrémités. Sur le cercle,
+    # ils sont aussi proches que 0 et 1 — c'est ce que le modèle doit voir.
+    def distance(left: int, right: int) -> float:
+        left_sin, left_cos = cyclic_hour(left)
+        right_sin, right_cos = cyclic_hour(right)
+        return float((left_sin - right_sin) ** 2 + (left_cos - right_cos) ** 2)
+
+    assert distance(23, 0) == pytest.approx(distance(0, 1))
+
+
+def test_the_two_components_tell_the_hours_apart() -> None:
+    # Le sinus seul confondrait deux heures symétriques de la journée : c'est
+    # la raison pour laquelle il en faut deux et non une.
+    hours = range(24)
+    assert len({cyclic_hour(hour) for hour in hours}) == len(hours)
+
+
+def test_add_derived_calendar_reads_the_published_hour() -> None:
+    frame = pd.DataFrame({"hour": [0, 6, 23]})
+    enriched = add_derived_calendar(frame)
+    expected_sin, expected_cos = cyclic_hour(frame["hour"])
+    assert list(enriched["hour_sin"]) == pytest.approx(list(expected_sin))
+    assert list(enriched["hour_cos"]) == pytest.approx(list(expected_cos))
+    # Le lot reçu n'est pas modifié : l'appelant garde ce qu'il a lu.
+    assert "hour_sin" not in frame.columns
+
+
+def test_add_derived_calendar_leaves_a_lot_without_the_hour_alone() -> None:
+    # Nommer la colonne manquante est le métier du contrôle en aval, qui sait
+    # quelles colonnes l'appelant a demandées.
+    frame = pd.DataFrame({"lag_1h": [1.0]})
+    assert list(add_derived_calendar(frame).columns) == ["lag_1h"]
 
 
 def test_the_arrow_schema_carries_every_declared_column() -> None:

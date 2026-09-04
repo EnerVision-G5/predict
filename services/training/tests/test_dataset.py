@@ -213,3 +213,22 @@ def test_matrices_follow_the_shared_column_order() -> None:
 def test_matrices_refuse_a_partition_missing_a_variable() -> None:
     with pytest.raises(DatasetError):
         matrices(features(END).drop(columns=["lag_24h"]), COLUMNS)
+
+
+def test_matrices_rebuild_the_derived_calendar() -> None:
+    # La partition ne porte pas ces colonnes et n'a pas à les porter : elles se
+    # déduisent de `hour`, qui y est. C'est ce qui dispense d'une nouvelle
+    # feature_version, et c'est ici que la reconstruction a lieu — pour
+    # l'entraînement comme pour la surveillance de dérive.
+    frame = features(END)
+    assert "hour_sin" not in frame.columns
+    explanatory, _ = matrices(frame, COLUMNS)
+    assert "hour_sin" in explanatory.columns
+    assert "hour_cos" in explanatory.columns
+
+
+def test_matrices_refuse_a_partition_without_the_hour() -> None:
+    # Sans `hour`, les colonnes dérivées ne peuvent pas l'être : la panne doit
+    # nommer une colonne demandée, pas échouer dans le calcul.
+    with pytest.raises(DatasetError):
+        matrices(features(END).drop(columns=["hour"]), COLUMNS)

@@ -300,12 +300,13 @@ rejoue le modèle sur des partitions où la température, elle, est présente.
 
 Deux listes tiennent donc la distinction, dans `predict_common.schemas` :
 `published_columns` dit ce que l'ETL écrit, `feature_columns` ce que le modèle
-consomme. La seconde est un sous-ensemble de la première.
+consomme. Elles se recouvrent sans que l'une contienne l'autre.
 
 | Colonne | Publiée | Apprise |
 |---|---|---|
 | `hour`, `day_of_week`, `is_weekend` | oui | oui |
 | `lag_1h`, `lag_24h`, `lag_168h`, `roll_mean_24h` | oui | oui |
+| `hour_sin`, `hour_cos` | **non** | oui — dérivées à la lecture |
 | `temperature_celsius` | oui | **non** |
 | `data_quality`, `imputed_ratio` | oui | non — elles décrivent la ligne |
 
@@ -314,6 +315,34 @@ donc impose une nouvelle `feature_version`. En retirer une de
 `feature_columns` ne change que le modèle, que MLflow versionne déjà : c'est
 pour cela que sortir la température n'a pas demandé de `v2`. Le jour où une
 prévision météo alimentera l'inférence, la colonne est déjà là.
+
+#### Les variables dérivées à la lecture
+
+`hour_sin` et `hour_cos` ne sont écrites nulle part, et c'est ce qui les rend
+gratuites. Elles sont une pure fonction de `hour`, que la partition porte déjà
+et que le service reconstruit seul depuis l'horodatage : les publier stockerait
+deux fois la même information et imposerait une `v2` pour un calcul de deux
+lignes.
+
+Elles existent parce qu'une heure notée de 0 à 23 ment sur une chose : elle
+place 23 h et 0 h aux deux extrémités d'une échelle alors qu'elles se suivent.
+Un modèle qui découpe cette échelle par seuils ne peut jamais poser une
+frontière qui réunit la fin d'une journée et le début de la suivante — il lui
+faut deux règles apprises séparément pour un seul phénomène. Les projeter sur
+un cercle rétablit la continuité, et il en faut deux composantes : le sinus
+seul confondrait deux heures symétriques de la journée.
+
+La dérivation a **un seul point d'entrée de chaque côté**, et ce n'est pas de
+la coquetterie : `dataset.matrices` pour l'entraînement et la surveillance,
+`forecast.build_row` pour l'inférence, tous deux appelant `cyclic_hour` de la
+bibliothèque partagée. Deux implémentations de la même formule finiraient par
+diverger, et l'écart ne se verrait ni dans la signature MLflow, qui ne voit que
+des noms, ni dans la surveillance, qui emprunte le même chemin que
+l'entraînement. Il ne se verrait que dans la qualité des prévisions servies.
+
+Un modèle promu avant leur arrivée continue d'être servi sans réentraînement :
+le service prend ses colonnes dans la signature du modèle chargé, et les clés
+qu'elle ne déclare pas sont simplement ignorées.
 
 ### Changer de version
 

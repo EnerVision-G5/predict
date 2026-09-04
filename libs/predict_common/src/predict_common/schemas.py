@@ -22,8 +22,10 @@ concaténation — panne fréquente, tardive, et dont la cause est invisible.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import numpy
+import pandas
 import pandera.pandas as pa
 import pyarrow
 
@@ -203,6 +205,14 @@ MEASURE_SCHEMA = pa.DataFrameSchema(
 # Les deux listes se recouvrent donc partiellement, et c'est voulu : les sortir
 # d'ici plutôt que de les écrire deux fois est ce qui empêche l'ETL et
 # l'entraînement de diverger sans que rien ne le dise.
+#
+# Une troisième catégorie s'y ajoute : les colonnes que le modèle consomme sans
+# qu'elles soient écrites nulle part, parce qu'elles se déduisent d'une colonne
+# déjà publiée. L'encodage cyclique de l'heure en est le cas : il est une pure
+# fonction de `hour`, que la partition porte et que le service d'inférence
+# reconstruit seul depuis l'horodatage. Les écrire en parquet stockerait deux
+# fois la même information et imposerait une nouvelle `feature_version` pour un
+# calcul de deux lignes.
 
 PUBLISHED_FIXED_COLUMNS = (
     "hour",
@@ -217,10 +227,22 @@ MODEL_FIXED_COLUMNS = (
     "is_weekend",
 )
 
+# Variables dérivées à la lecture, jamais écrites dans la partition. Voir
+# `add_derived_calendar` pour la raison d'être de cet encodage.
+MODEL_DERIVED_COLUMNS = (
+    "hour_sin",
+    "hour_cos",
+)
+
 # Bornes calendaires, écrites une fois pour que la contrainte du schéma et le
 # calcul qui la remplit ne puissent pas diverger.
 HOUR_RANGE = (0, 23)
 DAY_OF_WEEK_RANGE = (0, 6)
+
+# Période de l'encodage cyclique de l'heure. Vingt-quatre et non `HOUR_RANGE`
+# : c'est le nombre d'heures d'un tour de cadran, pas la borne haute de la
+# colonne. Les confondre décalerait tout l'encodage d'un vingt-quatrième.
+HOURS_PER_DAY = 24
 
 
 def lag_column(hours: int) -> str:
@@ -231,6 +253,52 @@ def lag_column(hours: int) -> str:
 def rolling_column(hours: int) -> str:
     """Nom de la colonne portant la moyenne glissante sur `hours` heures."""
     return f"roll_mean_{hours}h"
+
+
+def cyclic_hour(hour: int | pandas.Series) -> tuple[Any, Any]:
+    """Projette une heure sur le cercle des vingt-quatre heures.
+
+    Rend le couple (sinus, cosinus) de l'angle correspondant, de la même forme
+    que ce qu'elle reçoit : deux flottants pour une heure, deux séries pour une
+    colonne. C'est la même fonction qui sert à l'entraînement, qui la lit sur
+    une colonne, et au service d'inférence, qui la calcule pour une heure à la
+    fois.
+
+    Pourquoi cet encodage. `hour` va de 0 à 23, et cette échelle dit que 23 h
+    et 0 h sont séparées de vingt-trois unités alors qu'elles se suivent. Un
+    modèle qui découpe cette échelle par seuils ne peut jamais placer une
+    frontière qui réunit la fin d'une journée et le début de la suivante : il
+    lui faut deux règles séparées, apprises indépendamment, pour un seul
+    phénomène. Le couple sinus/cosinus rétablit cette continuité, et il en faut
+    deux : le sinus seul confondrait deux heures symétriques de la journée.
+
+    Écrite ici, dans la bibliothèque partagée, et non dans l'un des deux
+    services : deux implémentations de la même formule finiraient par diverger,
+    et l'écart ne se verrait que dans la qualité des prévisions servies.
+    """
+    angle = 2 * numpy.pi * hour / HOURS_PER_DAY
+    return numpy.sin(angle), numpy.cos(angle)
+
+
+def add_derived_calendar(frame: pandas.DataFrame) -> pandas.DataFrame:
+    """Ajoute au lot les variables calendaires dérivées de `hour`.
+
+    Rend le lot inchangé s'il ne porte pas `hour` : c'est au contrôle des
+    colonnes manquantes, en aval, de dire ce qui manque et de nommer la
+    colonne. Échouer ici donnerait la même panne sous un message qui parle
+    d'une colonne que l'appelant n'a jamais demandée.
+
+    Les colonnes ainsi produites ne sont dans aucune partition : elles sont
+    reconstruites à chaque lecture, ce qui est exactement ce qui dispense d'une
+    nouvelle `feature_version`.
+    """
+    if "hour" not in frame.columns:
+        return frame
+    enriched = frame.copy()
+    sin, cos = cyclic_hour(enriched["hour"])
+    enriched["hour_sin"] = sin
+    enriched["hour_cos"] = cos
+    return enriched
 
 
 def feature_columns(lag_hours: Sequence[int], rolling_window_h: int) -> tuple[str, ...]:
@@ -244,9 +312,14 @@ def feature_columns(lag_hours: Sequence[int], rolling_window_h: int) -> tuple[st
     La température n'en fait pas partie : voir `MODEL_FIXED_COLUMNS`. La
     surveillance de dérive lit cette même liste, si bien qu'elle mesure la
     tâche que le service rend vraiment, et non une tâche plus facile.
+
+    Les colonnes dérivées suivent immédiatement les colonnes calendaires dont
+    elles sortent, et précèdent les décalages : l'ordre suit la provenance, ce
+    qui rend la signature lisible pour qui ouvre le registre.
     """
     return (
         *MODEL_FIXED_COLUMNS,
+        *MODEL_DERIVED_COLUMNS,
         *(lag_column(hours) for hours in lag_hours),
         rolling_column(rolling_window_h),
     )
@@ -258,10 +331,15 @@ def published_columns(
 ) -> tuple[str, ...]:
     """Retourne les colonnes calculées que l'ETL écrit dans la partition.
 
-    Sur-ensemble de `feature_columns` : la partition porte en plus ce que le
-    modèle ne consomme pas encore. Retirer une colonne d'ici change le contrat
-    de la couche, donc impose une nouvelle `feature_version` ; en retirer une
-    de `feature_columns` ne change que le modèle, que MLflow versionne déjà.
+    Les deux listes se recouvrent sans que l'une contienne l'autre. La
+    partition porte en plus ce que le modèle ne consomme pas encore, la
+    température au premier chef ; le modèle consomme en plus ce qui se déduit
+    d'une colonne publiée sans être écrit, `MODEL_DERIVED_COLUMNS`.
+
+    Retirer une colonne d'ici change le contrat de la couche, donc impose une
+    nouvelle `feature_version` ; en retirer une de `feature_columns` ne change
+    que le modèle, que MLflow versionne déjà. C'est pour cela qu'une variable
+    dérivée à la lecture ne coûte pas de version : elle n'entre jamais ici.
     """
     return (
         *PUBLISHED_FIXED_COLUMNS,

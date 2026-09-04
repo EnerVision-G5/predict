@@ -327,6 +327,14 @@ def evaluate_window(
             f" {since} et {until}. Lancer l'ETL sur cette fenêtre."
         )
     model, version = load_served_model(settings)
+    # Les colonnes viennent de la configuration et non de la signature du
+    # modèle servi, si bien qu'un modèle promu avant l'ajout d'une variable en
+    # reçoit plus qu'il n'en déclare. MLflow les ignore et le journalise —
+    # « Found extra inputs [...] These inputs will be ignored » —, donc la
+    # mesure reste juste : elle porte sur les colonnes que ce modèle-là
+    # connaît. Le jour où une variable serait retirée plutôt qu'ajoutée, la
+    # tolérance ne joue plus dans ce sens et il faudra lire les colonnes dans
+    # `model.metadata.signature`, comme le fait déjà `serving.loader`.
     columns = feature_columns(
         config.get_int_list("etl.lag_hours"), config.get_int("etl.rolling_window_h")
     )
