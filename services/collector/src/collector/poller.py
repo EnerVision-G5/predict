@@ -55,11 +55,22 @@ import pandas as pd
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from collector.client import SourceClient, SourceError, SourceSettings
-from collector.sink import IngestionState, sync_sites, to_measures, write, write_state
+from collector.sink import (
+    IngestionState,
+    read_sensor_statuses,
+    sync_sites,
+    to_measures,
+    to_sensor_states,
+    write,
+    write_alerts,
+    write_sensor_episodes,
+    write_sensor_states,
+    write_state,
+)
 from predict_common.config import Config, ConfigError, load_config
 from predict_common.db import INGESTION_SOURCE_POLLER, DatabaseError, open_engine
 from predict_common.schemas import TIMESTAMP_COLUMN
+from predict_common.source import SourceClient, SourceError, SourceSettings
 
 # Le démarrage n'a pas le luxe d'attendre le tick suivant : sans référentiel
 # des sites, il n'y a rien à interroger. On insiste donc plus longuement
@@ -289,12 +300,52 @@ def poll_forever(
         _log_skew(started_at, schedule)
         report = run_tick(context, sites, started_at)
         record_tick(context, report)
+        collect_side_channels(context)
         finished_at = clock()
         _log_tick(report, len(sites), (finished_at - started_at).total_seconds())
         completed += 1
         schedule.advance(finished_at)
     logger.info("arrêt demandé : %d tick(s) exécuté(s)", completed)
     return completed
+
+
+def collect_side_channels(context: PollContext) -> None:
+    """Journalise les alertes et repose l'état des capteurs.
+
+    Deux routes que `mesure` ne remplace pas. Les alertes disent ce que la
+    source a jugé anormal, avec son seuil — information qu'aucune mesure ne
+    porte, et qui disparaît de la réponse dès que l'alerte se résout. L'état
+    des capteurs dit lequel est tombé et jusqu'à quand, là où `null_reasons`
+    ne dit que ce qui manquait sur une ligne.
+
+    Aucun échec ne remonte : ce sont des annexes du tick, pas le tick. Une
+    route d'alertes en panne ne doit pas arrêter la collecte des mesures, qui
+    est la seule chose dont la chaîne aval dépend.
+    """
+    batch_size = context.settings.batch_size
+    try:
+        write_alerts(context.engine, context.client.fetch_alerts(), batch_size)
+    except Exception as exc:  # noqa: BLE001 - annexe : rien ne doit remonter
+        logger.warning("alertes non collectées : %s", exc)
+    try:
+        _collect_sensors(context, batch_size)
+    except Exception as exc:  # noqa: BLE001 - annexe : rien ne doit remonter
+        logger.warning("état des capteurs non collecté : %s", exc)
+
+
+def _collect_sensors(context: PollContext, batch_size: int) -> None:
+    """Repose l'état des capteurs, et journalise les transitions au passage.
+
+    L'état précédent est lu AVANT d'être écrasé : c'est lui qui date les
+    débuts et les fins de panne, la source ne servant qu'un présent.
+    """
+    payload = context.client.fetch_sensors_status()
+    states = to_sensor_states(payload)
+    previous = read_sensor_statuses(context.engine)
+    write_sensor_states(context.engine, payload, batch_size)
+    write_sensor_episodes(
+        context.engine, previous, states, datetime.now(UTC), batch_size
+    )
 
 
 def install_signal_handlers(stop: threading.Event) -> None:

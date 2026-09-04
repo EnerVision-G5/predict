@@ -26,9 +26,13 @@
 # xgboost reste : le format pyfunc restitue le modèle par sa saveur d'origine,
 # qui a besoin de la bibliothèque qui l'a produit.
 #
-# Ni driver base ni httpx : le service ne parle ni à la source ni à
-# PostgreSQL. Il calcule une prévision et la rend ; l'archiver est le métier
-# de l'API EnerVision, qui sert ce contrat à ses consommateurs.
+# Pas de driver base : le service ne parle pas à PostgreSQL, et le test
+# d'architecture le vérifie. Il calcule une prévision et la rend ; l'archiver
+# est le métier de l'API EnerVision, qui sert ce contrat à ses consommateurs.
+#
+# httpx, en revanche, est entré : le service relaie le référentiel et la
+# simulation de pic de l'API Mock pour le compte de l'API métier, qui ne
+# connaît pas la source. Le client lui-même vit dans predict_common.
 
 [project]
 name = "serving"
@@ -41,6 +45,7 @@ dependencies = [
     "pydantic==2.12.4",
     "uvicorn[standard]==0.38.0",
     "mlflow==3.15.2",
+    "httpx==0.28.1",
     "xgboost==3.2.0",
 ]
 

@@ -41,6 +41,16 @@ source:
   # contrat de la source, qui expose une seule route d'historique.
   readings_path: /api/v1/readings
   current_path: /api/v1/sites/{site_id}/current
+  # Simulation de pic : la seule route en écriture de la source. Relayée par
+  # le service d'inférence pour le compte de l'API métier, qui doit pouvoir
+  # déclencher un pic depuis le dashboard sans connaître la source.
+  simulate_spike_path: /api/v1/simulate/spike/{site_id}
+  # Alertes actives de la source. Le collecteur les journalise : la source ne
+  # sert que les alertes en cours, une alerte résolue disparaît de sa réponse.
+  alerts_path: /api/v1/alerts
+  # État de santé des capteurs, par site. Dit quel capteur est tombé et
+  # jusqu'à quand, ce qu'aucune mesure ne porte.
+  sensors_status_path: /api/v1/sensors/status
   # Taille de page du rattrapage, plafonnée à 1000 par la source. La
   # pagination avance par le temps et non par un rang : une page pleine fait
   # repartir la requête du dernier horodatage reçu.

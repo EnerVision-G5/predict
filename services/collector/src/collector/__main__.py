@@ -42,12 +42,6 @@ from datetime import UTC, date, datetime, time, timedelta
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from collector.client import (
-    MAX_PAGE_SIZE,
-    SourceClient,
-    SourceError,
-    SourceSettings,
-)
 from collector.sink import (
     IngestionState,
     sync_sites,
@@ -58,6 +52,12 @@ from collector.sink import (
 from predict_common.config import ConfigError, load_config
 from predict_common.db import INGESTION_SOURCE_BACKFILL, DatabaseError, open_engine
 from predict_common.paths import PathError, date_range, parse_date
+from predict_common.source import (
+    MAX_PAGE_SIZE,
+    SourceClient,
+    SourceError,
+    SourceSettings,
+)
 
 DEFAULT_DAYS = 1
 

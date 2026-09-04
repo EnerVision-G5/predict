@@ -111,6 +111,9 @@ def client(serving_root: Path, monkeypatch):
                 rolling_window_h=WINDOW,
                 lookback_days=3,
             )
+            # Explicite : sans cela, l'état du processus garderait la source
+            # d'un autre fichier de tests, et l'arrêt la refermerait deux fois.
+            api.state["source"] = None
 
         monkeypatch.setattr(api, "configure", configure)
         return TestClient(api.app)

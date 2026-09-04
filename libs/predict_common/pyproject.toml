@@ -1,9 +1,15 @@
 # Bibliothèque partagée par les quatre services.
 #
 # Elle ne porte aucune logique métier : ni règle de qualité, ni calcul de
-# variable, ni appel à la source. Uniquement ce dont les quatre ont
-# strictement besoin pour se comprendre — la configuration, la construction
-# des chemins, les schémas de chaque couche et la lecture/écriture parquet.
+# variable. Uniquement ce dont les quatre ont strictement besoin pour se
+# comprendre — la configuration, la construction des chemins, les schémas de
+# chaque couche, la lecture/écriture parquet, la table de la couche brute et
+# l'accès à la source.
+#
+# L'accès à la source y est entré quand un deuxième service en a eu besoin :
+# le collecteur en tire les mesures, le service d'inférence relaie le
+# référentiel et la simulation de pic pour l'API métier. Il ne porte aucune
+# règle : il rend ce que la source sert, tel qu'elle le sert.
 #
 # Toute fonction qui n'aurait qu'un seul appelant n'a rien à faire ici : elle
 # appartient au service qui l'appelle. C'est ce qui empêche cette
@@ -21,6 +27,8 @@ dependencies = [
     "pandas==2.3.3",
     "pyarrow==22.0.0",
     "pandera[pandas]==0.28.1",
+    # Client de l'API Mock (predict_common/source.py).
+    "httpx==0.28.1",
 ]
 
 [build-system]
