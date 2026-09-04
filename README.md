@@ -399,6 +399,107 @@ sert. Après une promotion faite ainsi, un `--promote-version` sur la version
 concernée remet tout d'aplomb — l'inscription est un `ON CONFLICT (nom,
 version) DO UPDATE`, donc rejouable autant de fois qu'on veut.
 
+### Le banc d'arbitrage, et ce que promouvoir veut dire
+
+Le vocabulaire du challenge — `challenger`, `champion` — a longtemps été le
+seul morceau de challenge : `--promote` posait l'alias sur ce qui venait
+d'être appris sans jamais regarder ce que la version en place savait faire.
+Une semaine d'apprentissage dégradée pouvait remplacer un modèle meilleur
+qu'elle, et le seul garde-fou était l'attention de qui tapait la commande.
+
+Deux choses manquaient, et elles se tiennent.
+
+**Une fenêtre commune.** Chaque run mesurait sa qualité sur SON bloc de test,
+découpé dans SA fenêtre d'apprentissage : deux entraînements espacés d'une
+semaine produisaient deux MAE que rien n'autorisait à mettre côte à côte — ce
+qu'on faisait pourtant en les regardant dans l'interface. Le **banc
+d'arbitrage** est une fenêtre de journées retirée de l'apprentissage, sur
+laquelle tout candidat est réévalué : le modèle qu'on vient d'apprendre, les
+familles concurrentes, les baselines naïves. Ses mesures sont préfixées
+`arbitrage_` dans le run, et la fenêtre elle-même y est journalisée sous
+`arbitrage_window`.
+
+Il est glissant par défaut — les `training.arbitration.days` derniers jours de
+la fenêtre demandée — ce qui suffit à comparer entre eux les candidats d'un
+même run. Le figer rend les mesures comparables **d'un entraînement à
+l'autre** :
+
+```yaml
+training:
+  arbitration:
+    start: "2026-08-01"
+    end: "2026-08-14"
+```
+
+**Une référence gratuite.** ADR-010 décide que XGBoost est « comparé
+systématiquement à une baseline naïve » et que « la baseline est un livrable
+permanent, pas une étape jetable ». Les persistances — la consommation d'il y
+a 1 h, 24 h, 168 h — sont mesurées sur le même banc, et c'est la meilleure des
+trois, donc la plus dure à battre, qui sert de barre (`naif_mae`).
+
+`--promote` passe désormais par une règle, dans cet ordre :
+
+1. **battre la persistance** — un modèle qui ne bat pas la recopie de la
+   veille ne paie ni son entraînement, ni son registre, ni sa surveillance ;
+2. **être comparable** — deux mesures faites sur des bancs différents ne se
+   comparent pas, et le refus est franc plutôt que masqué par un classement
+   que personne ne pourrait défendre ;
+3. **ne pas dégrader** — `training.promotion.margin` dit ce qu'on tolère, et
+   vaut zéro par défaut : le candidat doit au moins égaler le champion.
+
+Un refus sort en **code 3**, distinct du 1 : le modèle a été appris et
+enregistré en challenger, seule sa mise en service a été refusée. Il n'y a
+rien à réparer, il y a quelque chose à lire.
+
+```bash
+# refusé si la version dégrade le service, ou ne bat pas la persistance
+python -m training --feature-version v1 --promote
+
+# passer outre : décision d'exploitation, journalisée comme telle
+python -m training --feature-version v1 --promote --force
+```
+
+`--force` existe parce qu'un exploitant peut avoir une raison que la règle n'a
+pas — un champion entraîné sur une période aberrante, un banc qu'on sait
+faussé. Il porte sur ce seul geste et n'assouplit rien pour les suivants. Une
+version enregistrée **avant** l'existence du banc n'en porte aucune mesure :
+la promouvoir demande `--force`, et c'est exactement ce qu'elle est, une
+décision prise sans comparaison.
+
+### Opposer les familles : `--challenge`
+
+Un seul algorithme était câblé. ADR-010 tranche entre trois options — baseline
+simple, XGBoost, réseau séquentiel — et la comparaison n'existait que dans le
+document.
+
+```bash
+make challenge HISTORY_DAYS=90
+# ou
+python -m training --challenge --feature-version v1 --history-days 90
+```
+
+Chaque famille déclarée dans `training.candidates`, plus XGBoost (qui tire ses
+hyperparamètres de `training.params`, pour qu'ils ne soient pas écrits deux
+fois), plus chaque persistance, est ajustée puis mesurée sur le banc. Chacune
+a son run dans MLflow, taguée `challenge`, et le classement sort dans le
+journal :
+
+```
+classement sur le banc 2026-08-21/2026-09-03 (14 journée(s), glissant, 672 heure(s)) :
+  1. foret-aleatoire    MAE     2.30 kW   RMSE     2.93   R2  1.000
+  2. xgboost            MAE     2.31 kW   RMSE     2.93   R2  1.000
+  3. ridge              MAE     3.16 kW   RMSE     3.97   R2  0.999
+  4. persistance-24h    MAE     4.57 kW   RMSE     5.84   R2  0.999
+```
+
+Le challenge **n'enregistre rien et ne promeut rien**, et ce n'est pas une
+limite : un classement dit quelle famille convient au problème, mettre en
+service est une autre décision, qui se prend après l'avoir lu et passe par
+`--promote-version`. Enregistrer chaque candidat remplirait le registre de
+versions qu'aucun alias ne désigne — et la version que `serving` résout porte
+le nom d'une famille, `enervision_xgboost` : y déposer une forêt serait un
+contresens de nommage avant d'être un contresens d'exploitation.
+
 C'est aussi le `loader` qui sait *comment* parler au modèle. Sa signature dit
 les colonnes, leur ordre et leurs types, et MLflow refuse une conversion qu'il
 ne peut pas garantir sans perte — un `hour` en `int64` présenté à un modèle
