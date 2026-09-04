@@ -57,7 +57,7 @@ from predict_common.paths import PathError, parse_date
 from predict_common.schemas import SITE_COLUMN, feature_columns
 from training import tracking
 from training.dataset import DatasetError, matrices, read_features
-from training.model import evaluate
+from training.model import DECISION_METRIC, evaluate
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -66,10 +66,6 @@ EXIT_FAILED = 1
 # simplement vieilli.
 EXIT_DRIFTED = 2
 
-# Métrique qui porte le verdict. La MAE plutôt que la RMSE : elle s'exprime en
-# kilowatts moyens, ce qui se discute avec un exploitant, là où la RMSE
-# amplifie les grands écarts et se compare mal d'un site à l'autre.
-DECISION_METRIC = "mae"
 
 # Les quatre conclusions possibles. Nommées parce qu'elles voyagent : le
 # journal les imprime, MLflow les pose en tag, et le code de sortie en dépend.

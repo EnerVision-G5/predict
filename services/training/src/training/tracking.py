@@ -98,6 +98,34 @@ def log_metrics(values: Mapping[str, float]) -> None:
     mlflow.log_metrics(dict(values))
 
 
+def set_tags(values: Mapping[str, Any]) -> None:
+    """Étiquette le run, pour ce qui se filtre plutôt que se trace.
+
+    Un tag et une métrique ne se lisent pas au même endroit : l'interface
+    trace les secondes et filtre sur les premiers. La famille d'un candidat ou
+    le fait qu'un run appartienne à un challenge sont des critères de tri, pas
+    des courbes.
+    """
+    mlflow.set_tags({key: str(value) for key, value in values.items()})
+
+
+def version_snapshot(name: str, version: str) -> AliasSnapshot:
+    """Retourne une version du registre, ses métriques et ses paramètres.
+
+    Le pendant de `alias_snapshot` pour une version désignée par son numéro :
+    c'est ce que `--promote-version` doit relire avant de mettre en service
+    une version qu'il n'a pas produite.
+    """
+    client = mlflow.MlflowClient()
+    run_id = client.get_model_version(name, version).run_id
+    data = client.get_run(run_id).data
+    return AliasSnapshot(
+        version=str(version),
+        metrics=dict(data.metrics),
+        params=dict(data.params),
+    )
+
+
 def log_model(
     model: Any,
     settings: TrackingSettings,
@@ -208,17 +236,44 @@ def _registered_version(info: Any) -> str:
     return str(version)
 
 
-def baseline_metrics(name: str, alias: str) -> dict[str, float]:
-    """Retourne les métriques du run qui a produit la version aliasée.
+@dataclass(frozen=True)
+class AliasSnapshot:
+    """Ce que la version aliasée a enregistré, relu d'un seul coup.
 
-    C'est la référence de la surveillance : un écart n'a de sens que rapporté
-    à ce que le modèle savait faire quand on l'a accepté. La chercher dans le
-    registre plutôt que dans un fichier garantit qu'elle suit le modèle —
-    promouvoir une autre version change la référence du même geste.
+    Les métriques disent ce que le modèle valait, les paramètres disent sur
+    quoi il a été mesuré. Les lire séparément coûterait deux interrogations du
+    registre pour un même run, et laisserait la possibilité d'en lire un
+    différent entre les deux appels — l'alias peut bouger.
+    """
+
+    version: str
+    metrics: dict[str, float]
+    params: dict[str, str]
+
+
+def alias_snapshot(name: str, alias: str) -> AliasSnapshot:
+    """Retourne la version aliasée, ses métriques et ses paramètres.
+
+    C'est la référence commune de la surveillance et de l'arbitrage : un écart
+    n'a de sens que rapporté à ce que le modèle savait faire quand on l'a
+    accepté, et une comparaison n'en a que si les deux mesures ont été faites
+    sur la même fenêtre. La chercher dans le registre plutôt que dans un
+    fichier garantit qu'elle suit le modèle — promouvoir une autre version
+    change la référence du même geste.
     """
     client = mlflow.MlflowClient()
     version = client.get_model_version_by_alias(name, alias)
-    return dict(client.get_run(version.run_id).data.metrics)
+    data = client.get_run(version.run_id).data
+    return AliasSnapshot(
+        version=str(version.version),
+        metrics=dict(data.metrics),
+        params=dict(data.params),
+    )
+
+
+def baseline_metrics(name: str, alias: str) -> dict[str, float]:
+    """Retourne les seules métriques du run qui a produit la version aliasée."""
+    return alias_snapshot(name, alias).metrics
 
 
 def served_version(name: str, alias: str) -> str:

@@ -55,6 +55,10 @@ train:  ## Entraîne un modèle : make train FV=v1 HISTORY_DAYS=90
 	uv run python -m training --feature-version $(FV) \
 		--history-days $(HISTORY_DAYS) --until $(DATE)
 
+challenge:  ## Oppose les familles et les baselines sur le banc, sans rien promouvoir
+	uv run python -m training --challenge --feature-version $(FV) \
+		--history-days $(HISTORY_DAYS) --until $(DATE)
+
 promote:  ## Met une version en service et l'inscrit dans `modele` : make promote V=7
 	uv run python -m training --promote-version $(V)
 
