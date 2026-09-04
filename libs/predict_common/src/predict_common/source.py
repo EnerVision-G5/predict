@@ -1,9 +1,15 @@
 """Client de l'API Mock IoT : pagination, reprises, débit borné.
 
-Le collecteur est le seul service qui parle à la source. Tout ce qui relève du
-réseau est donc ici, et rien d'autre : pas de conversion en tableau, pas de
-règle de qualité, pas d'écriture. Ce module rend des dictionnaires tels que la
-source les sert.
+Deux services parlent à la source : le collecteur, qui en tire les mesures, et
+le service d'inférence, qui relaie le référentiel et la simulation de pic pour
+le compte de l'API métier — laquelle ne connaît pas la source. D'où la place de
+ce module dans la bibliothèque partagée plutôt que dans l'un des deux : deux
+clients donneraient deux façons de lire la même API, et un service ne peut pas
+importer le code d'un autre.
+
+Tout ce qui relève du réseau est ici, et rien d'autre : pas de conversion en
+tableau, pas de règle de qualité, pas d'écriture. Ce module rend des
+dictionnaires tels que la source les sert.
 
 Trois mécanismes, et une raison pour chacun.
 
@@ -46,6 +52,12 @@ from predict_common.config import Config
 # refuser ici plutôt que de le découvrir en réponse évite de partir sur un
 # rattrapage de trois mois qui échouera à la première page.
 MAX_PAGE_SIZE = 1000
+
+# Bornes de `duration_minutes` déclarées par la source pour la simulation de
+# pic. Hors de cet intervalle elle répond 422.
+MIN_SPIKE_MINUTES = 1
+MAX_SPIKE_MINUTES = 240
+DEFAULT_SPIKE_MINUTES = 30
 
 # Nom de l'horodatage tel que la source le sert. Le collecteur le traduit à
 # l'écriture ; ici, il ne sert qu'à savoir où reprendre la pagination.
@@ -97,6 +109,9 @@ class SourceSettings:
     sites_path: str
     readings_path: str
     current_path: str
+    simulate_spike_path: str
+    alerts_path: str
+    sensors_status_path: str
     page_size: int
     timeout_s: float
     poll_timeout_s: float
@@ -126,6 +141,9 @@ class SourceSettings:
             sites_path=config.get_str("source.sites_path"),
             readings_path=config.get_str("source.readings_path"),
             current_path=config.get_str("source.current_path"),
+            simulate_spike_path=config.get_str("source.simulate_spike_path"),
+            alerts_path=config.get_str("source.alerts_path"),
+            sensors_status_path=config.get_str("source.sensors_status_path"),
             page_size=config.get_int("source.page_size"),
             timeout_s=config.get_float("source.timeout_s"),
             poll_timeout_s=config.get_float("collector.poll_timeout_s"),
@@ -249,6 +267,75 @@ class SourceClient:
         )
         return _as_readings(payload, path)
 
+    def fetch_alerts(
+        self,
+        site_id: str | None = None,
+        severity: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Retourne les alertes actives, filtrées à la demande.
+
+        La source ne sert que ce qui est en cours : une réponse vide est une
+        réponse valable, et non une panne. C'est l'appelant qui décide d'en
+        faire un journal, parce que c'est lui qui écrit.
+        """
+        params = {
+            name: value
+            for name, value in (("site_id", site_id), ("severity", severity))
+            if value is not None
+        }
+        payload = self._get_json(
+            self.settings.alerts_path,
+            params=params or None,
+            label="alertes actives",
+        )
+        if not isinstance(payload, list):
+            raise SourceError(f"{self.settings.alerts_path} devait renvoyer une liste.")
+        return [item for item in payload if isinstance(item, dict)]
+
+    def fetch_sensors_status(self) -> dict[str, Any]:
+        """Retourne l'état des capteurs, indexé par site tel que la source le sert.
+
+        Un objet et non une liste : la source indexe par identifiant de site,
+        et le remettre à plat ici obligerait l'appelant à refaire le lien.
+        """
+        path = self.settings.sensors_status_path
+        payload = self._get_json(path, label="état des capteurs")
+        if not isinstance(payload, dict):
+            raise SourceError(f"{path} devait renvoyer un objet.")
+        return payload
+
+    def simulate_spike(
+        self,
+        site_id: str,
+        duration_minutes: int,
+    ) -> dict[str, Any]:
+        """Demande à la source de simuler un pic de consommation sur un site.
+
+        Seule écriture de tout ce module, et la seule que la source expose.
+        Elle n'est pas retentée comme l'est une lecture : rejouer un POST
+        déclencherait un second pic, et deux pics qui se recouvrent ne sont
+        pas ce qu'on a demandé. Un échec remonte donc au premier essai.
+
+        La borne sur la durée est celle de la source : au-delà elle répond
+        422, et le dire ici évite d'aller le découvrir sur le réseau.
+        """
+        if not MIN_SPIKE_MINUTES <= duration_minutes <= MAX_SPIKE_MINUTES:
+            raise ValueError(
+                "duration_minutes doit être compris entre"
+                f" {MIN_SPIKE_MINUTES} et {MAX_SPIKE_MINUTES},"
+                f" reçu {duration_minutes}."
+            )
+        path = self.settings.simulate_spike_path.format(site_id=site_id)
+        payload = self._request(
+            path,
+            {"duration_minutes": duration_minutes},
+            None,
+            method="POST",
+        )
+        if not isinstance(payload, dict):
+            raise SourceError(f"{path} devait renvoyer un objet.")
+        return payload
+
     def _get_json(
         self,
         path: str,
@@ -285,17 +372,23 @@ class SourceClient:
         path: str,
         params: dict[str, Any] | None,
         timeout_s: float | None,
+        method: str = "GET",
     ) -> Any:
-        """Envoie une requête et rend son corps, un statut d'erreur exclu."""
+        """Envoie une requête et rend son corps, un statut d'erreur exclu.
+
+        Le débit reste borné quelle que soit la méthode : la limite protège la
+        source, et un POST la sollicite autant qu'un GET.
+        """
         self.limiter.wait()
-        response = self._client.get(
+        response = self._client.request(
+            method,
             path,
             params=params,
             timeout=timeout_s if timeout_s is not None else self.settings.timeout_s,
         )
         if response.status_code >= httpx.codes.BAD_REQUEST:
             raise SourceError(
-                f"GET {response.url} a répondu {response.status_code}."
+                f"{method} {response.url} a répondu {response.status_code}."
             )
         return response.json()
 

@@ -134,3 +134,100 @@ class ReadinessOut(BaseModel):
     detail: str = Field(
         description="Cause de l'indisponibilite, vide quand le service est pret.",
     )
+
+
+class SourceSiteOut(BaseModel):
+    """Site du référentiel de la source, relayé tel qu'elle le sert.
+
+    Ce n'est pas le référentiel de la base : c'est celui de l'API Mock, que
+    l'API métier vient chercher ici parce qu'elle ne connaît pas la source.
+    Les champs sont ceux du contrat de la source, sans traduction.
+
+    Tout est optionnel sauf l'identifiant, et ce n'est pas du laxisme : un
+    relais qui exigerait la forme complète rendrait 500 dès qu'un seul site
+    est mal décrit, emportant les six autres avec lui. Le consommateur écarte
+    ce qu'il ne peut pas exploiter ; le relais, lui, rend ce qu'il a reçu.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    site_id: str = Field(description="Identifiant du site.")
+    site_type: str | None = Field(
+        default=None, description="Type de site : office, factory, datacenter."
+    )
+    site_name: str | None = Field(default=None, description="Nom lisible du site.")
+    location: str | None = Field(
+        default=None,
+        description="Localisation du site, absente si la source ne la sert pas.",
+    )
+    capacity_kw: float | None = Field(
+        default=None, description="Puissance installée en kilowatts."
+    )
+    status: str | None = Field(
+        default=None, description="État déclaré : active ou inactive."
+    )
+
+
+class SpikeReadingOut(BaseModel):
+    """Mesure constatée sur le site juste après le déclenchement d'un pic.
+
+    Elle est lue et non calculée : la simulation agit sur la source, et c'est
+    la source qui dit ce qu'elle sert désormais. Les null et leurs motifs
+    traversent intacts, comme partout ailleurs dans la chaîne.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    timestamp: datetime = Field(description="Horodatage de la mesure, ISO 8601.")
+    site_id: str = Field(description="Identifiant du site mesuré.")
+    consumption_kw: float | None = Field(
+        default=None, description="Puissance instantanée en kilowatts."
+    )
+    consumption_kwh: float | None = Field(
+        default=None, description="Énergie sur la période en kilowattheures."
+    )
+    voltage_v: float | None = Field(default=None, description="Tension en volts.")
+    current_a: float | None = Field(default=None, description="Intensité en ampères.")
+    power_factor: float | None = Field(
+        default=None, description="Facteur de puissance, entre 0 et 1."
+    )
+    temperature_celsius: float | None = Field(
+        default=None, description="Température extérieure en degrés Celsius."
+    )
+    humidity_percent: float | None = Field(
+        default=None, description="Humidité relative en pourcentage."
+    )
+    null_reasons: list[str] = Field(
+        default_factory=list,
+        description="Causes des valeurs manquantes, telles que la source les donne.",
+    )
+    data_quality: str = Field(
+        description="Qualification de la source : good, partial, degraded, critical."
+    )
+
+
+class SpikeSimulationOut(BaseModel):
+    """Résultat d'une simulation de pic : ce qui a été demandé, et ce qui suit.
+
+    `reading` est la mesure relue immédiatement après le déclenchement. Elle
+    est optionnelle parce qu'une source qui accepte le pic puis se tait sur
+    `/current` a quand même déclenché le pic : rendre la simulation en échec
+    ferait croire le contraire, et un second appel doublerait le pic.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    site_id: str = Field(description="Site sur lequel le pic a été déclenché.")
+    status: str = Field(
+        description="Statut rendu par la source, simulated en cas de succès."
+    )
+    event: str = Field(description="Nature de l'événement, consumption_spike.")
+    duration_minutes: int = Field(description="Durée demandée du pic, en minutes.")
+    message: str = Field(description="Message rendu par la source, lisible tel quel.")
+    simulated_at: datetime = Field(
+        description="Horodatage du déclenchement, ISO 8601 UTC."
+    )
+    reading: SpikeReadingOut | None = Field(
+        default=None,
+        description="Mesure relue après le pic, absente si la source s'est tue.",
+    )

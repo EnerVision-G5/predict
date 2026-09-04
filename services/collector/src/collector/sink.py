@@ -53,14 +53,20 @@ from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 
 from predict_common.db import (
+    ALERTE_KEY,
+    CAPTEUR_ETAT_KEY,
     CONFLICT_KEY,
     INGESTION_KEY,
     SITE_COLUMNS,
     SOURCE_COLUMNS,
+    alerte,
+    capteur_etat,
+    capteur_panne,
     ingestion_etat,
     mesure,
     site,
@@ -353,6 +359,262 @@ def write_state(
         build_state_failure_upsert,
     )
     return rows
+
+
+# Colonnes sans lesquelles une alerte ne veut rien dire. La source les sert
+# toutes, mais une réponse tronquée ferait échouer le lot entier : l'alerte
+# incomplète est écartée seule.
+ALERTE_REQUIRED = ("alert_id", "site_id", "timestamp", "severity", "type", "message")
+
+# Capteurs décrits par la source. La liste est fermée à dessein : un capteur
+# inconnu apparaîtrait en base sans que personne ne sache l'interpréter, et le
+# journal est un meilleur endroit pour le signaler qu'une ligne muette.
+CAPTEURS = ("consumption", "electrical", "temperature", "humidity", "network")
+
+
+def to_alerts(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Traduit les alertes de la source vers les colonnes de `alerte`.
+
+    `type` devient `type_alerte` : le mot est trop générique pour une colonne,
+    et la traduction est portée ici une fois plutôt que dans chaque requête.
+    """
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        if any(record.get(name) in (None, "") for name in ALERTE_REQUIRED):
+            logger.warning(
+                "alerte %s ignorée : description incomplète",
+                record.get("alert_id", "?"),
+            )
+            continue
+        stamp = _parse_stamp(record["timestamp"])
+        if stamp is None:
+            logger.warning(
+                "alerte %s ignorée : horodatage illisible", record["alert_id"]
+            )
+            continue
+        rows.append(
+            {
+                "alert_id": str(record["alert_id"]),
+                "site_id": str(record["site_id"]).strip(),
+                "ts": stamp,
+                "severity": str(record["severity"]),
+                "type_alerte": str(record["type"]),
+                "message": str(record["message"]),
+                "valeur": record.get("value"),
+                "seuil": record.get("threshold"),
+            }
+        )
+    return rows
+
+
+def build_alerte_insert(records: list[dict[str, Any]]) -> Any:
+    """Construit l'insertion idempotente d'un lot d'alertes.
+
+    `DO NOTHING` : le poller repasse toutes les minutes sur des alertes encore
+    actives, et `alert_id` est stable côté source. Une alerte d'une heure
+    serait sinon enregistrée soixante fois. Et `DO NOTHING` plutôt que
+    `DO UPDATE` parce qu'une alerte ne change pas : elle est déclenchée, elle
+    ne se corrige pas.
+    """
+    return (
+        insert(alerte)
+        .values(records)
+        .on_conflict_do_nothing(index_elements=list(ALERTE_KEY))
+    )
+
+
+def write_alerts(
+    engine: Engine,
+    records: Iterable[dict[str, Any]],
+    batch_size: int,
+) -> int:
+    """Journalise les alertes actives et retourne le nombre de lignes neuves."""
+    rows = to_alerts(records)
+    written = write_batches(engine, rows, batch_size, build_alerte_insert)
+    logger.info("alertes : %d ligne(s) soumise(s)", written)
+    return written
+
+
+def to_sensor_states(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Met à plat l'état des capteurs, un enregistrement par couple site/capteur.
+
+    La source indexe par site et imbrique les capteurs. La table, elle, est
+    plate : c'est la seule forme qui permet de demander « quels capteurs sont
+    tombés » sans déplier un JSON en SQL.
+    """
+    rows: list[dict[str, Any]] = []
+    for site_id, description in payload.items():
+        if not isinstance(description, dict):
+            continue
+        overall = str(description.get("overall") or "ok")
+        sensors = description.get("sensors")
+        if not isinstance(sensors, dict):
+            continue
+        for capteur, etat in sensors.items():
+            if capteur not in CAPTEURS:
+                logger.warning("capteur inconnu ignoré : %s", capteur)
+                continue
+            if not isinstance(etat, dict):
+                continue
+            rows.append(
+                {
+                    "site_id": str(site_id).strip(),
+                    "capteur": str(capteur),
+                    "statut": str(etat.get("status") or "ok"),
+                    "failing_until": _parse_stamp(etat.get("failing_until")),
+                    "overall": overall,
+                }
+            )
+    return rows
+
+
+def build_capteur_etat_upsert(records: list[dict[str, Any]]) -> Any:
+    """Construit la mise à jour de l'état des capteurs.
+
+    `DO UPDATE`, contrairement aux alertes : cette table décrit le présent.
+    L'historique des pannes vit dans `mesure.null_reasons`, une ligne par
+    minute avec sa cause ; le rejouer ici en ferait une seconde vérité.
+    """
+    statement = insert(capteur_etat).values(records)
+    updated = {
+        name: getattr(statement.excluded, name)
+        for name in ("statut", "failing_until", "overall")
+    }
+    # `releve_le` est laissée au DEFAULT now() à l'insertion, mais une table du
+    # présent doit dire quand elle a été rafraîchie : sans ce repos explicite,
+    # la ligne garderait la date de son premier tick pour toujours, et un
+    # collecteur arrêté depuis trois jours paraîtrait à jour.
+    updated["releve_le"] = func.now()
+    return statement.on_conflict_do_update(
+        index_elements=list(CAPTEUR_ETAT_KEY),
+        set_=updated,
+    )
+
+
+def write_sensor_states(
+    engine: Engine,
+    payload: dict[str, Any],
+    batch_size: int,
+) -> int:
+    """Repose l'état des capteurs et retourne le nombre de lignes."""
+    rows = to_sensor_states(payload)
+    written = write_batches(engine, rows, batch_size, build_capteur_etat_upsert)
+    logger.info("capteurs : %d état(s) reposé(s)", written)
+    return written
+
+
+SENSOR_FAILING = "failing"
+
+
+def read_sensor_statuses(engine: Engine) -> dict[tuple[str, str], str]:
+    """Lit l'état des capteurs déjà en base, indexé par (site, capteur).
+
+    C'est la seule lecture de tout le collecteur, et elle a une raison : la
+    source dit `failing` ou `ok` au présent, jamais depuis quand. Sans l'état
+    précédent, aucune transition n'est détectable, et un capteur en panne
+    depuis trois jours ouvrirait un épisode à chaque tick.
+    """
+    statement = select(
+        capteur_etat.c.site_id, capteur_etat.c.capteur, capteur_etat.c.statut
+    )
+    with engine.begin() as connection:
+        rows = connection.execute(statement)
+        return {(row[0], row[1]): row[2] for row in rows}
+
+
+def to_sensor_episodes(
+    previous: dict[tuple[str, str], str],
+    states: list[dict[str, Any]],
+    now: datetime,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Retourne les épisodes à ouvrir et ceux à clore, sans toucher à la base.
+
+    Fonction pure, et c'est délibéré : toute la difficulté est ici, dans la
+    lecture des transitions, et elle s'éprouve sans moteur.
+
+    Quatre cas, trois conduites. Sain puis en panne ouvre un épisode. En panne
+    puis en panne le prolonge — seule `failing_until` bouge, la source pouvant
+    repousser sa date de rétablissement. En panne puis sain le clot. Sain puis
+    sain ne dit rien.
+
+    Un capteur inconnu de `capteur_etat` compte comme sain : c'est le premier
+    tick sur ce site, et sa panne éventuelle est bien un début.
+    """
+    opened: list[dict[str, Any]] = []
+    closed: list[dict[str, Any]] = []
+    for state in states:
+        key = (state["site_id"], state["capteur"])
+        was_failing = previous.get(key) == SENSOR_FAILING
+        is_failing = state["statut"] == SENSOR_FAILING
+        if is_failing and not was_failing:
+            opened.append(
+                {
+                    "site_id": state["site_id"],
+                    "capteur": state["capteur"],
+                    "debut_le": now,
+                    "fin_le": None,
+                    "failing_until": state.get("failing_until"),
+                }
+            )
+        elif was_failing and not is_failing:
+            closed.append({"site_id": state["site_id"], "capteur": state["capteur"]})
+    return opened, closed
+
+
+def build_panne_insert(records: list[dict[str, Any]]) -> Any:
+    """Construit l'ouverture idempotente d'un lot d'épisodes.
+
+    `DO NOTHING` sans cible : la clé naturelle n'est pas la seule contrainte à
+    protéger. Un épisode déjà ouvert sur le même capteur doit être ignoré lui
+    aussi, faute de quoi deux processus concurrents en créeraient deux.
+    """
+    return insert(capteur_panne).values(records).on_conflict_do_nothing()
+
+
+def write_sensor_episodes(
+    engine: Engine,
+    previous: dict[tuple[str, str], str],
+    states: list[dict[str, Any]],
+    now: datetime,
+    batch_size: int,
+) -> tuple[int, int]:
+    """Ouvre et clot les épisodes de panne, et retourne les deux comptes.
+
+    Les deux écritures partagent une transaction avec l'état courant, plus
+    haut dans le tick : un épisode ouvert sans que `capteur_etat` le suive
+    serait rouvert au tick suivant.
+    """
+    opened, closed = to_sensor_episodes(previous, states, now)
+    written = write_batches(engine, opened, batch_size, build_panne_insert)
+    if closed:
+        with engine.begin() as connection:
+            for episode in closed:
+                connection.execute(
+                    update(capteur_panne)
+                    .where(
+                        capteur_panne.c.site_id == episode["site_id"],
+                        capteur_panne.c.capteur == episode["capteur"],
+                        capteur_panne.c.fin_le.is_(None),
+                    )
+                    .values(fin_le=now)
+                )
+    if opened or closed:
+        logger.info(
+            "pannes capteur : %d ouverte(s), %d clos(es)", written, len(closed)
+        )
+    return written, len(closed)
+
+
+def _parse_stamp(value: Any) -> datetime | None:
+    """Lit un horodatage ISO de la source, ou rend None s'il est illisible."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def to_sites(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -21,17 +21,25 @@ from typing import Any
 import httpx
 import pytest
 
-from collector.client import SourceClient, SourceSettings
+from predict_common.source import SourceClient, SourceSettings
 
 
 class FakeConnection:
-    """Connexion factice qui mémorise les instructions exécutées."""
+    """Connexion factice qui mémorise les instructions exécutées.
 
-    def __init__(self, executed: list[Any]) -> None:
+    Elle rend aussi des lignes : le collecteur lit `capteur_etat` avant de
+    l'écraser, pour dater les débuts et les fins de panne. Les mêmes lignes
+    sont rendues à chaque appel — aucun test n'a besoin de plus, et un
+    séquenceur de résultats rendrait ces fixtures illisibles.
+    """
+
+    def __init__(self, executed: list[Any], rows: list[Any]) -> None:
         self._executed = executed
+        self._rows = rows
 
-    def execute(self, statement: Any) -> None:
+    def execute(self, statement: Any) -> list[Any]:
         self._executed.append(statement)
+        return list(self._rows)
 
     def __enter__(self) -> FakeConnection:
         return self
@@ -43,11 +51,12 @@ class FakeConnection:
 class FakeEngine:
     """Moteur factice : begin() rend une transaction sans base derrière."""
 
-    def __init__(self) -> None:
+    def __init__(self, rows: list[Any] | None = None) -> None:
         self.executed: list[Any] = []
+        self.rows: list[Any] = list(rows or ())
 
     def begin(self) -> FakeConnection:
-        return FakeConnection(self.executed)
+        return FakeConnection(self.executed, self.rows)
 
     def dispose(self) -> None:
         """Rien à rendre : il n'y a pas de connexion derrière."""
@@ -61,6 +70,9 @@ def settings() -> SourceSettings:
         sites_path="/api/v1/sites",
         readings_path="/api/v1/readings",
         current_path="/api/v1/sites/{site_id}/current",
+        simulate_spike_path="/api/v1/simulate/spike/{site_id}",
+        alerts_path="/api/v1/alerts",
+        sensors_status_path="/api/v1/sensors/status",
         page_size=2,
         timeout_s=1.0,
         poll_timeout_s=0.5,

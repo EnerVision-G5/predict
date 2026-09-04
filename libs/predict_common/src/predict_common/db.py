@@ -173,6 +173,96 @@ ingestion_etat = Table(
     Column("source", String(20), nullable=False),
 )
 
+# Alertes servies par `GET /api/v1/alerts` de la source. Un journal et non un
+# état : la source ne sert que les alertes ACTIVES, si bien qu'une alerte
+# résolue disparaît de sa réponse. Ne garder que le présent reviendrait à
+# perdre l'incident au moment même où il se termine, c'est-à-dire au moment où
+# on veut l'expliquer.
+#
+# `alert_id` est la clé : la source le construit stable (ALR-<site>-<epoch>),
+# et c'est lui qui rend la collecte rejouable. Le poller repasse toutes les
+# minutes sur des alertes encore actives ; sans cette clé, une alerte d'une
+# heure serait enregistrée soixante fois.
+#
+# `type` est un mot trop générique pour une colonne, d'où `type_alerte`.
+# `collecte_le` est laissée au DEFAULT now() : elle date le passage du
+# collecteur, là où `ts` date le déclenchement côté source. Les deux
+# diffèrent dès qu'un poller a été arrêté, et l'écart est l'information.
+alerte = Table(
+    "alerte",
+    metadata,
+    Column("alert_id", String(64), primary_key=True),
+    Column("site_id", String(20), nullable=False),
+    Column("ts", DateTime(timezone=True), nullable=False),
+    Column("severity", String(10), nullable=False),
+    Column("type_alerte", String(20), nullable=False),
+    Column("message", Text, nullable=False),
+    Column("valeur", Numeric(12, 2)),
+    Column("seuil", Numeric(12, 2)),
+)
+
+# Clé de `alerte`, et cible de son ON CONFLICT DO NOTHING.
+ALERTE_KEY = ("alert_id",)
+
+# État de santé des capteurs, servi par `GET /api/v1/sensors/status`. Une ligne
+# par couple (site, capteur), au présent : c'est l'équivalent d'ingestion_etat
+# pour la source, pas un journal.
+#
+# Le choix de ne pas historiser est délibéré. L'historique des pannes existe
+# déjà, dans `mesure.null_reasons` — une minute par ligne, avec la cause. Le
+# rejouer ici en ferait une seconde vérité à la même cadence, pour rien.
+#
+# Ce que `null_reasons` ne peut pas dire, en revanche, c'est QUEL capteur est
+# tombé quand la mesure passe quand même, et surtout JUSQU'À QUAND la source
+# annonce la panne : `failing_until` est une prévision de rétablissement, et
+# rien dans la couche brute ne la porte.
+capteur_etat = Table(
+    "capteur_etat",
+    metadata,
+    Column("site_id", String(20), primary_key=True),
+    Column("capteur", String(20), primary_key=True),
+    Column("statut", String(10), nullable=False),
+    Column("failing_until", DateTime(timezone=True)),
+    Column("overall", String(10), nullable=False),
+    # Déclarée bien qu'elle ne soit jamais dans les valeurs : le ON CONFLICT
+    # la repose à now(), sinon la ligne garderait la date de son premier tick.
+    Column("releve_le", DateTime(timezone=True)),
+)
+
+# Clé de `capteur_etat`, et cible du ON CONFLICT de son écriture.
+CAPTEUR_ETAT_KEY = ("site_id", "capteur")
+
+
+# Journal des pannes de capteur : un épisode par (site, capteur, début).
+#
+# Il ne double pas `capteur_etat`, il en est la dérivée : l'une dit l'état
+# présent, l'autre les épisodes passés. Et il ne double pas non plus
+# `mesure.null_reasons`, qui ne connaît que les pannes visibles SUR une mesure :
+# un capteur tombé puis rétabli entre deux relevés n'y laisse rien, et la date
+# de rétablissement annoncée n'y figure jamais.
+#
+# La source ne sert pas de date de début : elle dit `failing` ou `ok` au
+# présent. C'est donc le collecteur qui date la transition, en comparant ce
+# qu'il reçoit à ce que `capteur_etat` portait. `debut_le` est l'instant où il
+# a CONSTATÉ la panne, pas celui où elle a commencé — les confondre ferait
+# passer un collecteur arrêté pour un capteur en bonne santé.
+#
+# `panne_id` est laissé à l'IDENTITY de la base. La clé naturelle
+# (site_id, capteur, debut_le) est déclarée primaire ici parce que c'est elle
+# que vise le ON CONFLICT.
+capteur_panne = Table(
+    "capteur_panne",
+    metadata,
+    Column("site_id", String(20), primary_key=True),
+    Column("capteur", String(20), primary_key=True),
+    Column("debut_le", DateTime(timezone=True), primary_key=True),
+    Column("fin_le", DateTime(timezone=True)),
+    Column("failing_until", DateTime(timezone=True)),
+)
+
+# Clé naturelle d'un épisode, et cible de son ON CONFLICT DO NOTHING.
+CAPTEUR_PANNE_KEY = ("site_id", "capteur", "debut_le")
+
 # Clé de `ingestion_etat`, et cible du ON CONFLICT de l'écriture d'état.
 INGESTION_KEY = ("site_id",)
 
