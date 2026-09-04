@@ -13,7 +13,8 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from collector.client import (
+from predict_common.source import (
+    MAX_SPIKE_MINUTES,
     RateLimiter,
     RetryExhausted,
     SourceError,
@@ -219,6 +220,9 @@ def test_settings_read_the_configuration_blocks() -> None:
                 "sites_path": "/sites",
                 "readings_path": "/readings",
                 "current_path": "/sites/{site_id}/current",
+                "simulate_spike_path": "/simulate/spike/{site_id}",
+                "alerts_path": "/alerts",
+                "sensors_status_path": "/sensors/status",
                 "page_size": 500,
                 "timeout_s": 30,
                 "retries": 3,
@@ -257,3 +261,102 @@ class TestRateLimiter:
         limiter.wait()
         # Deux requêtes par seconde : une demi-seconde entre deux appels.
         assert delays == [0.5]
+
+
+class TestSimulateSpike:
+    """La seule route en écriture de la source, et la seule qu'on ne rejoue pas."""
+
+    def test_le_pic_est_demande_en_post_avec_la_duree(self, make_client) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return json_response({"status": "simulated", "site_id": "SITE002"})
+
+        client = make_client(handler)
+        payload = client.simulate_spike("SITE002", 60)
+
+        assert payload["status"] == "simulated"
+        assert seen[0].method == "POST"
+        assert seen[0].url.path == "/api/v1/simulate/spike/SITE002"
+        assert seen[0].url.params["duration_minutes"] == "60"
+
+    def test_une_duree_hors_bornes_ne_part_pas_sur_le_reseau(self, make_client) -> None:
+        # La source répondrait 422 : la refuser ici évite de la solliciter, et
+        # dit à l'appelant ce qu'elle attend sans qu'il ait à le découvrir.
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            return json_response({})
+
+        client = make_client(handler)
+        with pytest.raises(ValueError):
+            client.simulate_spike("SITE002", MAX_SPIKE_MINUTES + 1)
+        assert calls == []
+
+    def test_un_echec_n_est_jamais_rejoue(self, make_client) -> None:
+        """Rejouer un POST déclencherait un second pic par-dessus le premier."""
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            return httpx.Response(500, json={"detail": "source en carafe"})
+
+        client = make_client(handler)
+        with pytest.raises(SourceError):
+            client.simulate_spike("SITE002", 30)
+        # Une lecture aurait été retentée ; une écriture, jamais.
+        assert len(calls) == 1
+
+    def test_une_reponse_qui_n_est_pas_un_objet_est_refusee(self, make_client) -> None:
+        client = make_client(lambda _: json_response(["pas un objet"]))
+        with pytest.raises(SourceError):
+            client.simulate_spike("SITE002", 30)
+
+
+class TestAlertesEtCapteurs:
+    """Les deux lectures annexes : ce que `mesure` ne peut pas dire."""
+
+    def test_les_alertes_sont_rendues_telles_que_la_source_les_sert(
+        self, make_client
+    ) -> None:
+        payload = [{"alert_id": "ALR-1", "site_id": "SITE001"}]
+        client = make_client(lambda _: json_response(payload))
+        assert client.fetch_alerts() == payload
+
+    def test_les_filtres_partent_en_parametres(self, make_client) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return json_response([])
+
+        client = make_client(handler)
+        client.fetch_alerts(site_id="SITE002", severity="critical")
+
+        assert seen[0].url.params["site_id"] == "SITE002"
+        assert seen[0].url.params["severity"] == "critical"
+
+    def test_aucune_alerte_est_une_reponse_valable(self, make_client) -> None:
+        # La source ne sert que les alertes actives : une liste vide dit qu'il
+        # n'y en a aucune, pas que la route est en panne.
+        client = make_client(lambda _: json_response([]))
+        assert client.fetch_alerts() == []
+
+    def test_une_reponse_qui_n_est_pas_une_liste_est_refusee(self, make_client) -> None:
+        client = make_client(lambda _: json_response({"alert_id": "ALR-1"}))
+        with pytest.raises(SourceError):
+            client.fetch_alerts()
+
+    def test_l_etat_des_capteurs_reste_indexe_par_site(self, make_client) -> None:
+        # Un objet et non une liste : remettre à plat ici obligerait
+        # l'appelant à refaire le lien entre le site et ses capteurs.
+        payload = {"SITE001": {"sensors": {}, "overall": "ok"}}
+        client = make_client(lambda _: json_response(payload))
+        assert client.fetch_sensors_status() == payload
+
+    def test_un_etat_des_capteurs_en_liste_est_refuse(self, make_client) -> None:
+        client = make_client(lambda _: json_response([]))
+        with pytest.raises(SourceError):
+            client.fetch_sensors_status()

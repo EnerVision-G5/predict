@@ -28,8 +28,8 @@ from conftest import FakeEngine
 from sqlalchemy.dialects import postgresql
 
 from collector.__main__ import collect_day, parse_args, requested_days
-from collector.client import MAX_PAGE_SIZE, SourceError, SourceSettings
 from collector.sink import build_insert, to_measures, to_records, write
+from predict_common.source import MAX_PAGE_SIZE, SourceError, SourceSettings
 
 SITES = tuple(f"SITE{index:03d}" for index in range(1, 8))
 
@@ -204,6 +204,9 @@ def _settings() -> SourceSettings:
         sites_path="/api/v1/sites",
         readings_path="/api/v1/readings",
         current_path="/api/v1/sites/{site_id}/current",
+        simulate_spike_path="/api/v1/simulate/spike/{site_id}",
+        alerts_path="/api/v1/alerts",
+        sensors_status_path="/api/v1/sensors/status",
         page_size=1000,
         timeout_s=30.0,
         poll_timeout_s=10.0,

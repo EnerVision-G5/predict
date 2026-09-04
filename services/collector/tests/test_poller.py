@@ -18,7 +18,6 @@ import pytest
 from conftest import FakeEngine
 from sqlalchemy.exc import SQLAlchemyError
 
-from collector.client import SourceClient, SourceError
 from collector.poller import (
     SCHEDULE_SKEW_WARNING_S,
     PollContext,
@@ -34,6 +33,7 @@ from collector.poller import (
     run_tick,
 )
 from collector.sink import IngestionState, to_measures
+from predict_common.source import SourceClient, SourceError
 
 NOW = datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
 
