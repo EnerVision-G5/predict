@@ -145,3 +145,66 @@ def test_resolve_makes_a_relative_path_absolute() -> None:
 def test_resolve_refuses_an_unknown_scheme() -> None:
     with pytest.raises(io.StorageError):
         io.resolve("carrier-pigeon://bucket/features")
+
+
+class RefusesGroupedDelete:
+    """Stockage qui refuse la suppression groupée, comme Garage.
+
+    Le protocole S3 a deux suppressions : `DeleteObject`, qui porte une clé, et
+    `DeleteObjects`, qui en porte un lot. Garage n'accepte que la première, et
+    `delete_dir` émet la seconde — l'ETL échouait donc au moment de remplacer
+    la partition, après avoir tout calculé.
+
+    Le double ne dérive pas de `pyarrow.fs.FileSystem` : la fonction testée
+    n'appelle que ces trois méthodes, et hériter d'une classe C++ pour en
+    redéfinir une seule ferait porter au test le poids d'une liaison native
+    qu'il ne vérifie pas.
+    """
+
+    def __init__(self, filesystem) -> None:
+        self._inner = filesystem
+        self.grouped_attempts = 0
+        self.deleted: list[str] = []
+
+    def get_file_info(self, target):
+        return self._inner.get_file_info(target)
+
+    def delete_dir(self, path: str) -> None:
+        self.grouped_attempts += 1
+        raise OSError("AWS Error [code 134] : Invalid delete XML query")
+
+    def delete_file(self, path: str) -> None:
+        self.deleted.append(path)
+        self._inner.delete_file(path)
+
+
+def test_a_storage_without_grouped_delete_still_empties_the_partition(
+    tmp_path: Path,
+) -> None:
+    target = partition(tmp_path)
+    io.write_frame(frame(1.0), target, schema=SCHEMA)
+    filesystem, path = io.resolve(target)
+    storage = RefusesGroupedDelete(filesystem)
+
+    io._delete_directory(storage, path)
+
+    assert storage.grouped_attempts == 1
+    assert storage.deleted
+    # Vidée de ses fichiers, la partition doit être vue comme absente : c'est
+    # ce que `_replace` attend avant d'y déposer la nouvelle.
+    assert not io.exists(target)
+
+
+def test_a_storage_with_grouped_delete_keeps_the_single_call(
+    tmp_path: Path,
+) -> None:
+    # Le repli est une détection de capacité, pas un remplacement : un
+    # stockage qui sait supprimer un lot ne doit pas se mettre à émettre une
+    # requête par fichier.
+    target = partition(tmp_path)
+    io.write_frame(frame(1.0), target, schema=SCHEMA)
+    filesystem, path = io.resolve(target)
+
+    io._delete_directory(filesystem, path)
+
+    assert not Path(path).exists()

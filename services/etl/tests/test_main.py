@@ -18,7 +18,15 @@ import pandas as pd
 import pytest
 from conftest import FakeEngine
 
-from etl.__main__ import feature_spec, of_day, parse_args, publish, run, transform
+from etl.__main__ import (
+    DEFAULT_DAYS,
+    feature_spec,
+    of_day,
+    parse_args,
+    publish,
+    run,
+    transform,
+)
 from etl.extract import window
 from predict_common import io
 from predict_common.config import Config
@@ -259,9 +267,17 @@ def test_the_features_carry_no_excluded_measure(
 class TestParseArgs:
     """La ligne de commande dit ce que le run produit."""
 
-    def test_the_date_is_required(self) -> None:
-        with pytest.raises(SystemExit):
-            parse_args([])
+    def test_the_date_defaults_to_today(self) -> None:
+        # La boucle du conteneur appelle `python -m etl` sans argument : une
+        # date obligatoire la faisait sortir en erreur à chaque cycle, donc
+        # ne publiait jamais rien.
+        assert parse_args([]).date is None
+
+    def test_a_single_day_is_produced_by_default(self) -> None:
+        assert parse_args([]).days == DEFAULT_DAYS
+
+    def test_the_window_can_be_widened(self) -> None:
+        assert parse_args(["--days", "2"]).days == 2
 
     def test_the_version_can_be_forced(self) -> None:
         args = parse_args(["--date", "2026-09-10", "--feature-version", "v2"])

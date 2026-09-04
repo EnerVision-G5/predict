@@ -216,10 +216,42 @@ def _replace(filesystem: pyarrow.fs.FileSystem, staging: str, target: str) -> No
 
 
 def _delete_directory(filesystem: pyarrow.fs.FileSystem, path: str) -> None:
-    """Supprime un répertoire s'il existe, sans échouer s'il est absent."""
+    """Supprime un répertoire s'il existe, sans échouer s'il est absent.
+
+    Le repli sur la suppression une par une n'est pas un rattrapage d'erreur
+    mais une détection de capacité : tous les stockages objet n'implémentent
+    pas la suppression groupée du protocole S3, et la seule façon de le savoir
+    est de l'essayer. Voir `_delete_files` pour ce que le repli coûte.
+    """
     info = filesystem.get_file_info(path)
-    if info.type == pyarrow.fs.FileType.Directory:
+    if info.type != pyarrow.fs.FileType.Directory:
+        return
+    try:
         filesystem.delete_dir(path)
+    except OSError as exc:
+        logger.debug("suppression groupée refusée sur %s (%s)", path, exc)
+        _delete_files(filesystem, path)
+
+
+def _delete_files(filesystem: pyarrow.fs.FileSystem, path: str) -> None:
+    """Supprime les fichiers d'un répertoire un par un.
+
+    `delete_dir` émet un `DeleteObjects`, la suppression groupée du protocole
+    S3. Garage la refuse (`Invalid delete XML query`), et l'ETL échouait alors
+    au moment de remplacer la partition — après avoir tout calculé. Le
+    protocole a une seconde forme, `DeleteObject`, qui ne porte qu'une clé et
+    que `delete_file` émet : une requête par fichier au lieu d'une par lot,
+    pour des partitions qui en comptent une poignée.
+
+    Ce que le repli laisse derrière lui, ce sont les objets vides qui figurent
+    les répertoires. Ils ne portent aucune donnée, `_data_files` les ignore et
+    `exists` ne les compte pas : une partition ainsi vidée est bien vue comme
+    absente.
+    """
+    selector = pyarrow.fs.FileSelector(path, recursive=True, allow_not_found=True)
+    for entry in filesystem.get_file_info(selector):
+        if entry.type == pyarrow.fs.FileType.File:
+            filesystem.delete_file(entry.path)
 
 
 def _discard(filesystem: pyarrow.fs.FileSystem, staging: str) -> None:
