@@ -5,7 +5,9 @@ registre MLflow, lit la dernière partition de variables publiée par l'ETL, et
 enchaîne les deux. Il n'importe le code d'aucun autre service : ses entrées
 sont un alias et un chemin.
 
-Il n'écrit rien. L'archivage des prévisions dans `prediction` appartient à
+Il n'écrit dans aucune base. La seule écriture qu'il déclenche est celle du
+pic simulé, qui agit sur la source et non sur un stockage. L'archivage des
+prévisions dans `prediction` appartient à
 l'API EnerVision, qui sert ce contrat à ses consommateurs et tient sa propre
 base ; le référencement du modèle dans `modele` appartient à l'entraînement,
 qui est le seul à savoir quelle version il vient de mettre en service. Ce
@@ -14,7 +16,13 @@ service calcule et répond ; ce qu'on fait de sa réponse ne le regarde pas.
 Source de vérité du contrat. Toute modification exige une PR sur
 enervision/docs/contracts et la relecture des trois consommateurs.
 
-Attention : `CONTRACT_VERSION` est passée en 1.2.0. Trois changements
+Attention : `CONTRACT_VERSION` est passée en 1.3.0. Deux routes additives
+l'imposent, `GET /api/v1/sites` et `POST /api/v1/simulate/spike/{site_id}`.
+Elles relaient la source vers l'API métier, qui ne la connaît pas et ne doit
+pas la connaître. Le service continue de ne rien écrire : le pic agit sur la
+source, et l'historique des pics appartient à l'API, qui tient la base.
+
+Note précédente : `CONTRACT_VERSION` était passée en 1.2.0. Trois changements
 l'imposent, tous additifs — `history_end` et `feature_lag_hours` sur
 `PredictionOut`, et la route `/ready`. Les deux champs disent sur quelles
 variables la prévision s'appuie, information que personne d'autre ne détient :
@@ -33,15 +41,23 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
 from predict_common.config import load_config
 from predict_common.schemas import TIMESTAMP_COLUMN
+from predict_common.source import (
+    DEFAULT_SPIKE_MINUTES,
+    MAX_SPIKE_MINUTES,
+    MIN_SPIKE_MINUTES,
+    SourceClient,
+    SourceError,
+    SourceSettings,
+)
 from serving.forecast import (
     ForecastSpec,
     NoHistory,
@@ -57,12 +73,15 @@ from serving.schemas import (
     PredictionPoint,
     PredictionRequest,
     ReadinessOut,
+    SourceSiteOut,
+    SpikeReadingOut,
+    SpikeSimulationOut,
 )
 
 # Version du contrat gelé dans enervision/docs/contracts/openapi-predict.json.
 # Incrémentée en semver : patch pour une description, minor pour un champ
 # optionnel ajouté, major pour un champ retiré ou renommé.
-CONTRACT_VERSION = "1.2.0"
+CONTRACT_VERSION = "1.3.0"
 
 API_PREFIX = "/api/v1"
 
@@ -74,7 +93,7 @@ logger = logging.getLogger(__name__)
 # joint un registre au moment où on l'importe rend le service intestable et
 # fait échouer la génération de la spécification OpenAPI en CI, où aucun
 # MLflow ne tourne.
-state: dict[str, Any] = {"registry": None, "spec": None}
+state: dict[str, Any] = {"registry": None, "spec": None, "source": None}
 
 
 @asynccontextmanager
@@ -88,7 +107,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """
     configure()
     yield
+    source = state.get("source")
+    if source is not None:
+        source.close()
     state["registry"] = None
+    state["source"] = None
 
 
 def configure() -> None:
@@ -105,6 +128,10 @@ def configure() -> None:
         rolling_window_h=config.get_int("etl.rolling_window_h"),
         lookback_days=config.get_int("serving.feature_lookback_days"),
     )
+    # Le client de la source est construit ici, pas à chaque requête : il tient
+    # sa connexion ouverte, et le relais du référentiel est appelé à chaque
+    # démarrage de l'API métier.
+    state["source"] = SourceClient(SourceSettings.from_config(config))
     state["registry"].load()
 
 
@@ -238,6 +265,134 @@ def feature_lag_hours(generated_at: datetime, history_end: datetime) -> float:
     ferait passer un problème de fuseau pour une prévision fraîche.
     """
     return (generated_at - history_end).total_seconds() / SECONDS_PER_HOUR
+
+
+SOURCE_UNAVAILABLE = {
+    "model": ErrorResponse,
+    "description": "La source n'a pas répondu.",
+}
+
+
+@app.get(
+    f"{API_PREFIX}/sites",
+    response_model=list[SourceSiteOut],
+    tags=["sites"],
+    summary="Relayer le référentiel des sites servi par la source",
+    responses={
+        status.HTTP_502_BAD_GATEWAY: SOURCE_UNAVAILABLE,
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": "Le service n'a pas terminé son démarrage.",
+        },
+    },
+)
+def list_source_sites() -> list[SourceSiteOut]:
+    """Rend le référentiel de la source, sans le traduire ni le stocker.
+
+    Le service relaie, il n'entretient rien : c'est l'API métier qui décide
+    d'en faire un référentiel en base, parce que c'est elle qui tient la base.
+    Le relais existe parce qu'elle ne connaît pas la source, et ne doit pas la
+    connaître : une adresse d'API Mock dans sa configuration ferait d'elle un
+    second client de la source, avec sa propre façon de la lire.
+
+    502 et non 503 : la panne est en amont du service, pas en lui. Les
+    distinguer permet à l'appelant de dire lequel des deux est tombé.
+    """
+    client = _source()
+    try:
+        payload = client.fetch_sites()
+    except SourceError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    # Une entrée sans identifiant n'est pas un site : la relayer ferait
+    # échouer la validation et emporterait tout le référentiel avec elle.
+    return [
+        SourceSiteOut.model_validate(site)
+        for site in payload
+        if isinstance(site, dict) and site.get("site_id")
+    ]
+
+
+@app.post(
+    f"{API_PREFIX}/simulate/spike/{{site_id}}",
+    response_model=SpikeSimulationOut,
+    tags=["simulate"],
+    summary="Déclencher un pic de consommation sur la source",
+    responses={
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ErrorResponse,
+            "description": "Paramètres de requête invalides.",
+        },
+        status.HTTP_502_BAD_GATEWAY: SOURCE_UNAVAILABLE,
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": "Le service n'a pas terminé son démarrage.",
+        },
+    },
+)
+def simulate_spike(
+    site_id: str,
+    duration_minutes: Annotated[
+        int,
+        Query(
+            ge=MIN_SPIKE_MINUTES,
+            le=MAX_SPIKE_MINUTES,
+            description="Durée du pic simulé, en minutes.",
+        ),
+    ] = DEFAULT_SPIKE_MINUTES,
+) -> SpikeSimulationOut:
+    """Déclenche un pic sur la source et rend la mesure qui suit.
+
+    Deux appels et non un seul : la source confirme la simulation sans dire ce
+    qu'elle sert désormais, et une confirmation nue ne prouve rien à qui
+    regarde un dashboard. La relecture de `/current` donne la valeur constatée.
+
+    Son échec ne fait pas échouer la réponse : le pic est déclenché, le dire
+    en erreur inviterait à rejouer l'appel et à superposer deux pics.
+    """
+    client = _source()
+    try:
+        payload = client.simulate_spike(site_id, duration_minutes)
+    except SourceError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    return SpikeSimulationOut(
+        site_id=str(payload.get("site_id", site_id)),
+        status=str(payload.get("status", "simulated")),
+        event=str(payload.get("event", "consumption_spike")),
+        duration_minutes=int(payload.get("duration_minutes", duration_minutes)),
+        message=str(payload.get("message", "")),
+        simulated_at=datetime.now(UTC),
+        reading=_reading_after_spike(client, site_id),
+    )
+
+
+def _reading_after_spike(
+    client: SourceClient,
+    site_id: str,
+) -> SpikeReadingOut | None:
+    """Relit la mesure courante, ou rend None sans faire échouer l'appelant."""
+    try:
+        readings = client.fetch_current(site_id)
+    except SourceError as exc:
+        logger.warning("pic déclenché sur %s, mesure illisible : %s", site_id, exc)
+        return None
+    if not readings:
+        logger.warning(
+            "pic déclenché sur %s, la source n'a servi aucune mesure", site_id
+        )
+        return None
+    return SpikeReadingOut.model_validate(readings[0])
+
+
+def _source() -> SourceClient:
+    """Rend le client de la source, en refusant de servir sans lui."""
+    client = state.get("source")
+    if client is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Le service n'a pas terminé son démarrage.",
+        )
+    return client
 
 
 @app.get(
