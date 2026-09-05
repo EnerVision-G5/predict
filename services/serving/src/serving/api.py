@@ -1,4 +1,5 @@
-"""Service FastAPI d'inférence EnerVision déployé sur Azure.
+"""Service FastAPI d'inférence EnerVision, déployé on-premise aux côtés de l'API
+métier, qui seule l'appelle.
 
 Le service ne rejoue aucun calcul de l'amont. Il résout un modèle dans le
 registre MLflow, lit la dernière partition de variables publiée par l'ETL, et
@@ -16,7 +17,11 @@ service calcule et répond ; ce qu'on fait de sa réponse ne le regarde pas.
 Source de vérité du contrat. Toute modification exige une PR sur
 enervision/docs/contracts et la relecture des trois consommateurs.
 
-Attention : `CONTRACT_VERSION` est passée en 1.3.0. Deux routes additives
+Note : `CONTRACT_VERSION` est passée en 1.3.1. La description du service
+annonçait un déploiement sur Azure, abandonné par la décision d'architecture
+V2 ; aucune forme de donnée ne change.
+
+Note précédente : `CONTRACT_VERSION` était passée en 1.3.0. Deux routes additives
 l'imposent, `GET /api/v1/sites` et `POST /api/v1/simulate/spike/{site_id}`.
 Elles relaient la source vers l'API métier, qui ne la connaît pas et ne doit
 pas la connaître. Le service continue de ne rien écrire : le pic agit sur la
@@ -81,7 +86,7 @@ from serving.schemas import (
 # Version du contrat gelé dans enervision/docs/contracts/openapi-predict.json.
 # Incrémentée en semver : patch pour une description, minor pour un champ
 # optionnel ajouté, major pour un champ retiré ou renommé.
-CONTRACT_VERSION = "1.3.0"
+CONTRACT_VERSION = "1.3.1"
 
 API_PREFIX = "/api/v1"
 
@@ -139,9 +144,10 @@ app = FastAPI(
     title="EnerVision service d'inférence",
     version=CONTRACT_VERSION,
     description=(
-        "Contrat du service de prédiction déployé sur Azure. La prévision est"
-        " servie par le modèle que le registre MLflow désigne, et renvoie 503"
-        " tant qu'aucun modèle n'est résolu."
+        "Contrat du service de prédiction, déployé on-premise et appelé par la"
+        " seule API métier. La prévision est servie par le modèle que le"
+        " registre MLflow désigne, et renvoie 503 tant qu'aucun modèle n'est"
+        " résolu."
     ),
     lifespan=lifespan,
 )
