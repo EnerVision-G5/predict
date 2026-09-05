@@ -55,6 +55,11 @@ import pandas as pd
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from collector.__main__ import (
+    DEFAULT_CATCH_UP_DAYS,
+    catch_up_days,
+    collect_day,
+)
 from collector.sink import (
     IngestionState,
     read_sensor_statuses,
@@ -68,7 +73,18 @@ from collector.sink import (
     write_state,
 )
 from predict_common.config import Config, ConfigError, load_config
-from predict_common.db import INGESTION_SOURCE_POLLER, DatabaseError, open_engine
+from predict_common.db import (
+    INGESTION_SOURCE_POLLER,
+    DatabaseError,
+    alerte,
+    capteur_etat,
+    capteur_panne,
+    ingestion_etat,
+    mesure,
+    open_engine,
+    site,
+    verify_schema,
+)
 from predict_common.schemas import TIMESTAMP_COLUMN
 from predict_common.source import SourceClient, SourceError, SourceSettings
 
@@ -348,6 +364,53 @@ def _collect_sensors(context: PollContext, batch_size: int) -> None:
     )
 
 
+def catch_up(
+    context: PollContext,
+    sites: Sequence[str],
+    config: Config,
+    depth_days: int | None,
+) -> None:
+    """Comble ce qui manque en base avant d'entrer dans la boucle.
+
+    Sans lui, un poller qui redémarre reprend AU PRÉSENT : tout ce que la
+    coupure a laissé passer reste un trou, et rien ne le signale — `mesure`
+    n'a pas de ligne à montrer pour une minute qui n'a jamais été collectée.
+    Le trou ne se voyait qu'au moment où l'ETL produisait une journée creuse,
+    ou pas du tout.
+
+    Le rattrapage passe par `/api/v1/readings`, la seule route qui serve du
+    passé — `/current` ne connaît que l'instant présent. Sa profondeur est
+    déduite de la dernière mesure de chaque site, donc de la durée réelle de
+    la coupure : cinq minutes d'arrêt coûtent une journée relue, une semaine
+    en coûte sept. Voir `collector.__main__.catch_up_days`.
+
+    Son échec n'empêche pas la boucle de démarrer, et c'est délibéré : la
+    collecte du présent a plus de valeur que celle du passé, et un rattrapage
+    qui échoue peut être relancé à la main (`python -m collector --catch-up`)
+    sans arrêter le service.
+    """
+    depth = depth_days or config.get_int(
+        "collector.catch_up_days", DEFAULT_CATCH_UP_DAYS
+    )
+    batch_size = context.settings.batch_size
+    try:
+        days = catch_up_days(context.engine, sites, depth)
+        logger.info(
+            "rattrapage de %s à %s avant la boucle", days[0], days[-1]
+        )
+        rows = sum(
+            collect_day(context.client, context.engine, batch_size, day, sites)
+            for day in days
+        )
+        logger.info("rattrapage terminé : %d mesure(s) soumise(s)", rows)
+    except (SourceError, SQLAlchemyError, OSError) as exc:
+        logger.error(
+            "rattrapage abandonné (%s) : la boucle démarre quand même, le"
+            " trou reste à combler avec `python -m collector --catch-up`",
+            exc,
+        )
+
+
 def install_signal_handlers(stop: threading.Event) -> None:
     """Arme l'arrêt propre sur SIGTERM et SIGINT.
 
@@ -432,6 +495,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="sites",
         help="Site à interroger. Répétable. Par défaut : tout le référentiel.",
     )
+    parser.add_argument(
+        "--no-catch-up",
+        action="store_true",
+        help=(
+            "Démarre la boucle sans rattraper ce qui manque en base. Le"
+            " rattrapage est fait par défaut : un poller qui redémarre après"
+            " une coupure reprendrait sinon au présent, en laissant le trou."
+        ),
+    )
+    parser.add_argument(
+        "--catch-up-days",
+        type=int,
+        default=None,
+        help=(
+            "Profondeur maximale du rattrapage de démarrage, en journées."
+            " Défaut : collector.catch_up_days."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -468,6 +549,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         engine = open_engine(
             config.get_optional_str("database.url"), pool_pre_ping=True
         )
+        # Le poller est un processus long : une base en retard de migration
+        # doit l'empêcher de démarrer, pas le laisser journaliser le même
+        # échec toutes les minutes pendant des jours.
+        verify_schema(
+            engine,
+            (mesure, site, ingestion_etat, alerte, capteur_etat, capteur_panne),
+        )
     except (ConfigError, DatabaseError) as exc:
         logger.error("configuration invalide : %s", exc)
         return EXIT_STARTUP_FAILED
@@ -486,6 +574,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             except SourceError as exc:
                 logger.error("démarrage impossible : %s", exc)
                 return EXIT_STARTUP_FAILED
+            if not args.no_catch_up:
+                catch_up(context, sites, config, args.catch_up_days)
             logger.info(
                 "collecte de %d site(s) toutes les %.0f s : %s",
                 len(sites),

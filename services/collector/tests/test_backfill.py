@@ -21,13 +21,19 @@ déduit depuis.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from conftest import FakeEngine
 from sqlalchemy.dialects import postgresql
 
-from collector.__main__ import collect_day, parse_args, requested_days
+from collector.__main__ import (
+    catch_up_days,
+    check_period_arguments,
+    collect_day,
+    parse_args,
+    requested_days,
+)
 from collector.sink import build_insert, to_measures, to_records, write
 from predict_common.source import MAX_PAGE_SIZE, SourceError, SourceSettings
 
@@ -278,3 +284,136 @@ class TestBackfillState:
         params = _state_params(engine)
         # Un succès et un échec : deux formes, donc deux instructions.
         assert len(params) == 2
+
+
+# --- Rattrapage déduit des trous de la base ---------------------------------
+#
+# Le mode du redéploiement : personne ne sait ce qui manque, et demander une
+# période reviendrait à le faire deviner à l'exploitant.
+#
+# La détection porte sur les TROUS et non sur la dernière mesure. C'est la
+# seule chose qui compte sur un serveur où le poller tourne déjà : sa dernière
+# mesure est « maintenant » quelle que soit l'ampleur de ce qui manque
+# derrière, et un repère de reprise ne verrait rien à combler.
+
+TODAY = date(2026, 9, 5)
+
+
+def covered(site_id: str, day: str, first: str = "00:00", last: str = "23:30"):
+    """Ligne d'agrégation telle que `day_coverage` la lit dans `mesure`."""
+    stamp = date.fromisoformat(day)
+    return (
+        site_id,
+        datetime.combine(stamp, datetime.min.time(), tzinfo=UTC),
+        datetime.fromisoformat(f"{day}T{first}:00+00:00"),
+        datetime.fromisoformat(f"{day}T{last}:00+00:00"),
+    )
+
+
+def engine_covering(*rows) -> FakeEngine:
+    """Moteur rendant la couverture par site et par journée."""
+    return FakeEngine(rows=list(rows))
+
+
+def test_une_base_vide_est_entierement_rattrapee() -> None:
+    """Premier démarrage : aucune journée n'est couverte, toutes sont prises."""
+    days = catch_up_days(engine_covering(), ["SITE001"], depth_days=35, today=TODAY)
+
+    assert days[0] == date(2026, 8, 2)
+    assert days[-1] == TODAY
+    assert len(days) == 35
+
+
+def test_un_trou_ancien_est_vu_alors_que_le_poller_tourne() -> None:
+    """LE cas du redéploiement, et celui qu'un repère de reprise manquait.
+
+    Le poller tourne depuis le 4 : la dernière mesure est « aujourd'hui », et
+    pourtant tout août manque. Une reprise calée sur `max(ts)` ne collecterait
+    que la journée courante et laisserait le trou intact.
+    """
+    engine = engine_covering(
+        covered("SITE001", "2026-09-04"),
+        covered("SITE001", "2026-09-05"),
+    )
+
+    days = catch_up_days(engine, ["SITE001"], depth_days=35, today=TODAY)
+
+    assert date(2026, 8, 2) in days
+    assert date(2026, 9, 3) in days
+    # Le 4 est couvert de bout en bout : il n'a pas à être redemandé.
+    assert date(2026, 9, 4) not in days
+
+
+def test_la_journee_courante_est_toujours_reprise() -> None:
+    """Elle est incomplète par construction : elle n'est pas finie."""
+    engine = engine_covering(covered("SITE001", "2026-09-05", last="23:30"))
+
+    assert TODAY in catch_up_days(engine, ["SITE001"], depth_days=1, today=TODAY)
+
+
+def test_une_journee_commencee_en_retard_est_reprise() -> None:
+    """Le poller a démarré à 14 h : la matinée manque.
+
+    Un simple comptage la croirait collectée — c'est l'étendue qui la trahit.
+    """
+    engine = engine_covering(covered("SITE001", "2026-09-04", first="14:00"))
+
+    assert date(2026, 9, 4) in catch_up_days(
+        engine, ["SITE001"], depth_days=2, today=TODAY
+    )
+
+
+def test_une_journee_interrompue_est_reprise() -> None:
+    """Le poller s'est arrêté à 09 h : le reste de la journée manque."""
+    engine = engine_covering(covered("SITE001", "2026-09-04", last="09:00"))
+
+    assert date(2026, 9, 4) in catch_up_days(
+        engine, ["SITE001"], depth_days=2, today=TODAY
+    )
+
+
+def test_une_journee_venue_du_seul_rattrapage_est_tenue_pour_complete() -> None:
+    """`/readings` s'arrête à 23:30, pas à 23:59.
+
+    Sans tolérance, toute journée rattrapée serait reprise indéfiniment.
+    """
+    engine = engine_covering(covered("SITE001", "2026-09-04", last="23:30"))
+
+    assert date(2026, 9, 4) not in catch_up_days(
+        engine, ["SITE001"], depth_days=2, today=TODAY
+    )
+
+
+def test_un_seul_site_decouvert_suffit_a_reprendre_la_journee() -> None:
+    """La fenêtre est commune : `ON CONFLICT DO NOTHING` rend le recouvrement
+    gratuit en base, et découper par site rendrait le journal illisible."""
+    engine = engine_covering(covered("SITE001", "2026-09-04"))
+
+    days = catch_up_days(engine, ["SITE001", "SITE002"], depth_days=2, today=TODAY)
+
+    assert date(2026, 9, 4) in days
+
+
+def test_la_profondeur_borne_la_fenetre_cherchee() -> None:
+    """Une base vide ne fait pas remonter à l'origine des temps."""
+    days = catch_up_days(engine_covering(), ["SITE001"], depth_days=7, today=TODAY)
+
+    assert days[0] == date(2026, 8, 30)
+    assert len(days) == 7
+
+
+def test_le_rattrapage_refuse_une_periode_donnee_en_plus() -> None:
+    """`--catch-up --start` : l'un des deux serait ignoré en silence."""
+    args = parse_args(["--catch-up", "--start", "2026-08-01"])
+
+    with pytest.raises(ValueError, match="--start"):
+        check_period_arguments(args)
+
+
+def test_le_rattrapage_seul_est_accepte() -> None:
+    check_period_arguments(parse_args(["--catch-up"]))
+
+
+def test_une_periode_explicite_reste_acceptee() -> None:
+    """Le mode existant n'est pas touché."""
+    check_period_arguments(parse_args(["--start", "2026-08-01"]))
