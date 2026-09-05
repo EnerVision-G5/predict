@@ -77,6 +77,20 @@ collector:
   # Trois cadences manquées : en deçà, un à-coup de la source alerterait sans
   # qu'aucune donnée ne soit perdue.
   lag_warning_s: 180
+  # Fenêtre dans laquelle le rattrapage automatique (`--catch-up`) cherche les
+  # trous, en journées.
+  #
+  # Ce n'est pas la quantité recollectée : une fenêtre sans trou ne coûte
+  # qu'une requête d'agrégation, et seules les journées incomplètes sont
+  # redemandées à la source. Un redémarrage à chaud collecte donc la journée
+  # courante, pas trente-cinq.
+  #
+  # 35 et non 30 : « il y a un mois » doit tomber DANS la fenêtre et non sur
+  # son bord. Une profondeur de 30 partant du 5 septembre ne remonte qu'au
+  # 7 août, et laisserait dehors les deux premières journées d'un trou qui
+  # commence le 5. La marge couvre aussi le décalage de 168 h du jeu de
+  # variables, que l'ETL exige avant de publier sa première journée.
+  catch_up_days: ${COLLECTOR_CATCH_UP_DAYS:-35}
 
 etl:
   # Version du jeu de variables. Elle est dans le chemin des partitions, donc

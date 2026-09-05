@@ -637,6 +637,70 @@ La clé n'est pas déclarée dans le contrat gelé : l'y ajouter ferait échouer
 `contract-drift` sur une PR qui n'a rien changé au contrat métier. C'est la
 bonne cible, en patch semver, par une PR sur `enervision/docs/contracts`.
 
+## La grille à la minute
+
+`mesure` est une grille : **au plus une ligne par site et par minute**, et
+`(site_id, ts)` en est la clé. La minute est la résolution la plus fine que la
+chaîne produise — c'est la cadence du poller.
+
+Les deux points d'entrée n'apportent pas la même granularité, et c'est la
+source qui le décide :
+
+| Route | Ce qu'elle sert | Horodatage |
+| --- | --- | --- |
+| `.../{id}/current` | l'instantané | l'instant de l'appel, sub-seconde |
+| `/api/v1/readings` | l'historique, par pas de 30 min | aligné à la minute |
+
+La cadence à la minute vient donc du **poller**, pas du rattrapage :
+l'historique de la source n'existe qu'à 30 minutes, et aucune option de
+`/readings` ne le raffine. Rattraper un mois donne 48 points par jour et par
+site ; les 1440 ne s'obtiennent qu'en polling, à partir du moment où il tourne.
+
+## Le rattrapage au démarrage
+
+Un poller qui redémarre reprenait **au présent** : tout ce que la coupure
+avait laissé passer restait un trou, et rien ne le signalait — `mesure` n'a
+pas de ligne à montrer pour une minute jamais collectée. Le trou ne se voyait
+qu'au moment où l'ETL produisait une journée creuse.
+
+Le poller comble donc ce qui manque avant d'entrer dans sa boucle, par
+`/api/v1/readings` — la seule route qui serve du passé. La profondeur n'est
+pas fixée : elle est **déduite de la dernière mesure de chaque site**, donc de
+la durée réelle de la coupure.
+
+```bash
+python -m collector.poller                  # rattrape puis boucle (défaut)
+python -m collector.poller --no-catch-up    # boucle seule
+python -m collector --catch-up              # rattrapage seul, à la main
+```
+
+| État de la base | Ce qui est collecté |
+| --- | --- |
+| vide | `collector.catch_up_days` journées (30 par défaut) |
+| arrêt de 5 jours | les 5 journées, et celle de la reprise |
+| redémarrage à chaud | la journée courante seulement |
+| un site jamais collecté | retour au plancher, pour tous les sites |
+
+La journée de la dernière mesure est **incluse** : c'est celle où le
+collecteur s'est arrêté, elle est donc presque toujours incomplète. Et la
+fenêtre est commune à tous les sites plutôt que découpée par site —
+`ON CONFLICT DO NOTHING` rend le recouvrement gratuit en base, et une journée
+coûte une requête par site à la source.
+
+L'échec du rattrapage n'empêche pas la boucle de démarrer : collecter le
+présent a plus de valeur que le passé, et le passé se relance à la main.
+
+`collector.sink.snap_to_grid` ramène l'horodatage sur la grille au moment de
+l'écriture, et **seulement là** : le retard d'ingestion se mesure sur
+l'horodatage brut, sans quoi il serait quantifié à la minute et ferait
+paraître en retard un site à l'heure.
+
+Sans ce calage, une minute couverte par les deux routes entrait en base sous
+deux clés — le poller à `14:30:14.620789`, le rattrapage à `14:30:00` — et
+`ON CONFLICT DO NOTHING` n'avait aucun conflit à arbitrer. Cela se produit sur
+les minutes `:00` et `:30` de chaque heure, soit 48 doublons par jour et par
+site.
+
 ## Pile Docker
 
 ```bash
