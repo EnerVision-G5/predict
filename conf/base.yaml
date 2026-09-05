@@ -193,10 +193,30 @@ monitoring:
   min_rows_per_site: 24
 
 serving:
+  # Clé de service exigée sur les routes du contrat. Le service relaie la
+  # simulation de pic, qui ÉCRIT sur la source : l'API métier protège la même
+  # opération derrière le rôle `writer`, et un service ouvert rendait ce
+  # contrôle contournable. Voir services/serving/src/serving/auth.py pour ce
+  # qui reste servi sans clé — la sonde de vivacité et la spécification.
+  #
+  # Sans repli, et volontairement : le service refuse de démarrer sans elle,
+  # comme l'API métier refuse de démarrer sans JWT_SECRET. Générer avec
+  #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+  api_key: ${SERVING_API_KEY:-}
+  # false ouvre les routes. C'est le mode du poste de développement et de la
+  # CI, où aucun secret n'est distribué ; il est journalisé en avertissement à
+  # chaque démarrage et ne doit jamais être déployé.
+  auth_enabled: ${SERVING_AUTH_ENABLED:-true}
   # Alias et non version figée : promouvoir un modèle se fait en déplaçant
   # l'alias dans MLflow, sans redéployer le service, et le retour arrière est
   # le même geste en sens inverse.
   model_uri: ${SERVING_MODEL_URI:-models:/enervision_xgboost@champion}
+  # Durée de conservation des partitions de variables en mémoire, en secondes.
+  # Le service relisait le stockage objet à CHAQUE prévision : une fenêtre de
+  # dix journées, décompressée et triée, pour en extraire un seul site. L'ETL
+  # ne publie qu'une fois par cycle, la relire plus souvent ne peut rien
+  # apprendre de neuf. 0 désactive le cache.
+  feature_cache_ttl_s: ${SERVING_FEATURE_CACHE_TTL_S:-300}
   # Le service reconstruit les décalages depuis la dernière partition de
   # variables produite par l'ETL. Nombre de jours remontés pour la trouver.
   feature_lookback_days: 10

@@ -213,6 +213,7 @@ make run-day DATE=2026-09-02 FV=v1
 | `services/serving/loader.py` | Résolution du modèle par alias |
 | `services/serving/forecast.py` | Historique lu, prévision par récurrence |
 | `services/serving/api.py` | FastAPI, `CONTRACT_VERSION` |
+| `services/serving/auth.py` | Clé de service exigée sur les routes du contrat |
 | `services/serving/schemas.py` | DTO : source de vérité du contrat |
 | `tests/test_architecture.py` | Vérifie qu'aucun service n'en importe un autre |
 | `data/` | Partitions de variables, jamais commitées — ou un seau Garage |
@@ -606,6 +607,35 @@ qu'une infrastructure de plus à exploiter. Le jour où il faudra des reprises
 partielles, des dépendances entre journées ou un calendrier, ces trois cibles
 se transposeront telles quelles — parce qu'elles sont déjà des processus
 indépendants, datés et idempotents.
+
+## Accès au service d'inférence
+
+Le service est routé publiquement et relaie `POST /api/v1/simulate/spike`, qui
+**écrit sur la source**. L'API métier protège la même opération derrière le
+rôle `writer` : un service ouvert rendait ce contrôle contournable, il
+suffisait de l'appeler directement.
+
+Les routes du contrat exigent donc une clé de service, présentée en en-tête
+`X-API-Key`. Restent servies sans clé : `/health`, la sonde de vivacité de
+l'hébergeur, et `/openapi.json` / `/docs`, dont part le scan DAST de la CI.
+`/ready` est fermée — elle nomme la version servie et l'âge des variables.
+
+```bash
+# Générer la clé, puis la poser des deux côtés : ici, et dans le .env de
+# l'API métier, qui la présente à chaque appel.
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Sans `SERVING_API_KEY`, le service **refuse de démarrer**, comme l'API métier
+refuse de démarrer sans `JWT_SECRET` : un service qui partirait ouvert
+servirait la simulation de pic à qui la demande, et il aurait l'air sain.
+Poser `SERVING_AUTH_ENABLED=false` ouvre les routes pour le poste de
+développement — le service le journalise en avertissement à chaque démarrage,
+et cela ne doit jamais être déployé.
+
+La clé n'est pas déclarée dans le contrat gelé : l'y ajouter ferait échouer
+`contract-drift` sur une PR qui n'a rien changé au contrat métier. C'est la
+bonne cible, en patch semver, par une PR sur `enervision/docs/contracts`.
 
 ## Pile Docker
 

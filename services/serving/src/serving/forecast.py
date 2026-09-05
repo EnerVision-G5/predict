@@ -21,6 +21,8 @@ l'horizon à quarante-huit heures.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -99,6 +101,79 @@ def read_history(spec: ForecastSpec, today: date | None = None) -> pd.DataFrame:
     if frame.empty:
         return frame
     return frame.sort_values([SITE_COLUMN, TIMESTAMP_COLUMN]).reset_index(drop=True)
+
+
+@dataclass
+class _HistoryCache:
+    """Dernière fenêtre de variables lue, et l'instant où elle l'a été.
+
+    Le service relisait le stockage à chaque prévision : `lookback_days`
+    partitions journalières téléchargées, décompressées, concaténées et
+    triées, pour n'en extraire ensuite qu'un seul site. Le job de
+    rafraîchissement boucle sur les sept sites, donc sept lectures complètes
+    de la même fenêtre par cycle — et, le service étant ouvert avant
+    `serving.auth`, autant d'amplification offerte à qui voulait le saturer.
+
+    L'ETL ne publie qu'une fois par cycle : relire plus souvent ne peut rien
+    apprendre de neuf. Le cache est donc une fenêtre de temps, pas une
+    invalidation fine — une partition republiée entre deux expirations sera
+    vue au plus tard au bout du TTL, ce qui est exactement la fraîcheur que
+    `PredictionOut.feature_lag_hours` publie déjà par ailleurs.
+    """
+
+    key: tuple[str, str, int, date] | None = None
+    frame: pd.DataFrame | None = None
+    read_at: float = 0.0
+
+
+_cache = _HistoryCache()
+# uvicorn sert plusieurs requêtes de front et `predict` est un `def` synchrone,
+# donc exécuté dans un fil du pool : deux requêtes peuvent entrer ici ensemble.
+_cache_lock = threading.Lock()
+
+
+def cached_history(
+    spec: ForecastSpec,
+    ttl_s: float,
+    today: date | None = None,
+) -> pd.DataFrame:
+    """Rend la fenêtre de variables, relue seulement si elle a vieilli.
+
+    Un TTL nul ou négatif désactive le cache et rend le comportement d'avant :
+    c'est ce que règle `serving.feature_cache_ttl_s`, et ce que les tests qui
+    éprouvent la lecture elle-même utilisent.
+
+    Le tableau rendu est partagé entre appelants et ne doit jamais être muté.
+    Aucun consommateur ne le fait — `site_history` filtre puis trie, ce qui
+    copie — mais la règle vaut d'être écrite.
+    """
+    if ttl_s <= 0:
+        return read_history(spec, today)
+    day = today or datetime.now(UTC).date()
+    key = (spec.root, spec.feature_version, spec.lookback_days, day)
+    now = time.monotonic()
+    with _cache_lock:
+        fresh = (
+            _cache.frame is not None
+            and _cache.key == key
+            and (now - _cache.read_at) < ttl_s
+        )
+        if fresh:
+            return _cache.frame
+    # La lecture se fait HORS du verrou : elle peut durer des secondes sur un
+    # stockage objet, et la tenir bloquerait toutes les requêtes du service.
+    # Deux lectures concurrentes au même instant sont possibles et sans
+    # conséquence — elles produisent le même tableau, la dernière gagne.
+    frame = read_history(spec, day)
+    with _cache_lock:
+        _cache.key, _cache.frame, _cache.read_at = key, frame, time.monotonic()
+    return frame
+
+
+def reset_history_cache() -> None:
+    """Vide le cache. Point de reprise des tests, et rien d'autre."""
+    with _cache_lock:
+        _cache.key, _cache.frame, _cache.read_at = None, None, 0.0
 
 
 def site_history(frame: pd.DataFrame, site_id: str, spec: ForecastSpec) -> pd.Series:

@@ -167,3 +167,37 @@ def test_section_refuses_a_leaf(conf_dir: Path) -> None:
 
 def test_config_directory_honours_the_override(tmp_path: Path) -> None:
     assert config_directory({"PREDICT_CONF_DIR": str(tmp_path)}) == tmp_path
+
+
+# --- Booléens venus de l'environnement --------------------------------------
+#
+# `_expand_text` rend TOUJOURS une chaîne : `${SERVING_AUTH_ENABLED:-true}`
+# produit `"true"`, jamais `True`. Un `if config.get(...)` serait donc vrai
+# pour `"false"` comme pour `"true"` — l'inversion silencieuse qui ouvre un
+# contrôle d'accès en croyant le fermer.
+
+
+@pytest.mark.parametrize("word", ["true", "TRUE", "1", "yes", "on"])
+def test_get_bool_lit_les_ecritures_vraies(word: str) -> None:
+    assert Config(values={"a": {"b": word}}).get_bool("a.b") is True
+
+
+@pytest.mark.parametrize("word", ["false", "False", "0", "no", "off"])
+def test_get_bool_lit_les_ecritures_fausses(word: str) -> None:
+    """La chaîne "false" doit valoir False, pas "non vide donc vrai"."""
+    assert Config(values={"a": {"b": word}}).get_bool("a.b") is False
+
+
+def test_get_bool_accepte_un_booleen_deja_type() -> None:
+    """Une valeur écrite en dur dans le YAML arrive déjà en booléen."""
+    assert Config(values={"a": {"b": False}}).get_bool("a.b") is False
+
+
+def test_get_bool_refuse_ce_qu_il_ne_sait_pas_lire() -> None:
+    """`SERVING_AUTH_ENABLED=oui` doit se voir, pas se deviner."""
+    with pytest.raises(ConfigError, match="booléen"):
+        Config(values={"a": {"b": "oui"}}).get_bool("a.b")
+
+
+def test_get_bool_rend_le_defaut_quand_la_cle_manque() -> None:
+    assert Config(values={}).get_bool("serving.auth_enabled", True) is True

@@ -208,6 +208,23 @@ services:
     environment:
       <<: *artifacts
       SERVING_MODEL_URI: ${SERVING_MODEL_URI:-models:/enervision_xgboost@champion}
+      # Clé de service exigée par le contrôle d'accès. Le `:?` fait échouer le
+      # démarrage en nommant la variable : le service relaie la simulation de
+      # pic, qui écrit sur la source, et un conteneur qui partirait ouvert le
+      # servirait à qui le demande.
+      #
+      # Sur un poste où l'on ne veut pas gérer de clé, poser
+      # SERVING_AUTH_ENABLED=false dans .env — jamais en déploiement, le
+      # service le journalise en avertissement à chaque démarrage.
+      SERVING_API_KEY: ${SERVING_API_KEY:-}
+      SERVING_AUTH_ENABLED: ${SERVING_AUTH_ENABLED:-true}
+      SERVING_FEATURE_CACHE_TTL_S: ${SERVING_FEATURE_CACHE_TTL_S:-300}
+      # La source, que le service relaie pour le compte de l'API métier. Sans
+      # elle, GET /api/v1/sites et POST /api/v1/simulate/spike répondent 502 —
+      # elle manquait à ce service alors que ses deux routes en dépendent.
+      MOCK_API_URL: ${MOCK_API_URL_CONTAINER:?definir MOCK_API_URL_CONTAINER dans .env}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${SERVING_PORT:-8000}:8000"
     volumes:
