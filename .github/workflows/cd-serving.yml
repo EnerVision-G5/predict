@@ -77,6 +77,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      # Le digest, et non le tag : c'est lui qui désigne sans ambiguïté l'image
+      # que ce job vient de pousser. Le job `dast` scanne exactement celle-là,
+      # là où `latest` pourrait avoir bougé entre les deux.
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -150,10 +155,17 @@ jobs:
       - name: Smoke test de l'image publiée
         env:
           REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          # Le service refuse de démarrer sans clé, comme l'API métier refuse
+          # de démarrer sans JWT_SECRET. Le smoke test doit donc lui en donner
+          # une — et c'est ce qui le rend fidèle : l'image est démarrée dans sa
+          # configuration de PRODUCTION, pas dans un mode ouvert que personne
+          # ne déploiera. La valeur n'a aucune portée hors de ce job.
+          SMOKE_KEY: cle-de-fumee-sans-portee-hors-de-ce-job
         run: |
           docker run -d --name serving-smoke -p 127.0.0.1:8000:8000 \
             -e MLFLOW_HTTP_REQUEST_MAX_RETRIES=0 \
             -e MLFLOW_HTTP_REQUEST_TIMEOUT=2 \
+            -e SERVING_API_KEY="$SMOKE_KEY" \
             "$REF"
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:8000/health > /dev/null && break
@@ -173,6 +185,28 @@ jobs:
             echo "::error::le service publié ne sert pas sa spécification"
             exit 1
           }
+          # Le contrôle d'accès, éprouvé sur l'IMAGE et non sur le code. Le
+          # service relaie la simulation de pic, qui écrit sur la source :
+          # livrer une image qui aurait perdu ce contrôle rendrait de nouveau
+          # contournable le rôle `writer` que l'API métier exige pour la même
+          # opération. Les tests unitaires couvrent la règle ; ceci couvre le
+          # fait qu'elle est bien embarquée dans ce qu'on publie.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:8000/api/v1/predict \
+            -H 'Content-Type: application/json' \
+            -d '{"site_id":"SITE001","horizon_hours":1}')
+          [ "$code" = "401" ] || {
+            docker logs serving-smoke
+            echo "::error::l'image publiée sert /predict sans clé (reçu $code)"
+            exit 1
+          }
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "X-API-Key: $SMOKE_KEY" http://127.0.0.1:8000/ready)
+          [ "$code" = "200" ] || {
+            docker logs serving-smoke
+            echo "::error::l'image publiée refuse une clé valide (reçu $code)"
+            exit 1
+          }
 
       - name: Arrêter le conteneur de fumée
         if: always()
@@ -189,3 +223,113 @@ jobs:
             echo
             echo "digest : \`${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Scan dynamique de l'IMAGE PUBLIÉE, et non plus d'un uvicorn lancé depuis
+  # les sources en CI.
+  #
+  # Le déplacement n'est pas cosmétique. Un scan sur les sources éprouve ce que
+  # la branche contient ; celui-ci éprouve ce qui part en déploiement — le même
+  # digest que l'exploitant tirera, avec l'utilisateur, le point d'entrée, les
+  # variables et la pile de l'image. C'est là que se voient les écarts entre
+  # « le code est correct » et « ce qu'on livre l'est ».
+  #
+  # Il est aussi hors du chemin des PR : le scan actif dure plusieurs minutes,
+  # et le mettre sur chaque PR le faisait payer à chaque relecture pour une
+  # surface qui ne change qu'à la livraison.
+  dast:
+    name: Surface HTTP de l'image publiée (ZAP)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Par digest et non par tag : c'est l'image que `build` vient de pousser,
+      # et non ce que `latest` désignera au moment où ce job démarre.
+      - name: Démarrer l'image publiée
+        env:
+          REF: ghcr.io/${{ github.repository }}/serving@${{ needs.build.outputs.digest }}
+          # Contrôle d'accès coupé pour ce scan, et seulement pour lui : un
+          # service qui répondrait 401 partout ne laisserait rien à attaquer,
+          # et le scan passerait au vert en n'atteignant aucune route.
+          #
+          # Que le contrôle EXISTE dans l'image est vérifié par le smoke test
+          # du job `build`, qui démarre la même image avec une clé et exige un
+          # 401 sur /predict sans elle. Ce scan-ci éprouve autre chose : le
+          # traitement des entrées, les en-têtes et les codes d'erreur des
+          # routes elles-mêmes.
+          AUTH: "false"
+        run: |
+          IMAGE_REF=$(echo "$REF" | tr '[:upper:]' '[:lower:]')
+          docker run -d --name serving-dast -p 127.0.0.1:8000:8000 \
+            -e MLFLOW_HTTP_REQUEST_MAX_RETRIES=0 \
+            -e MLFLOW_HTTP_REQUEST_TIMEOUT=2 \
+            -e SERVING_AUTH_ENABLED="$AUTH" \
+            "$IMAGE_REF"
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health > /dev/null && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8000/openapi.json > /dev/null || {
+            docker logs serving-dast
+            echo "::error::l'image publiée n'a pas servi sa spécification"
+            exit 1
+          }
+
+      # `zap-api-scan.py` et non le scan de base : la ligne de base explore un
+      # site en suivant ses liens, et une API JSON n'en a aucun. Le scan d'API
+      # part de la spécification, lue sur le service lui-même — ce qui garantit
+      # qu'il attaque les routes servies, et non une spécification qui aurait
+      # dérivé de l'image.
+      #
+      # `-I` : un avertissement ne fait pas échouer le job. Les règles par
+      # défaut de ZAP alertent sur des en-têtes que le reverse proxy pose, et
+      # une porte rouge dès le premier run serait ignorée dès le deuxième. Une
+      # règle passée en FAIL dans .zap/rules.tsv, elle, bloquera la livraison.
+      - name: Scan actif de l'image
+        run: |
+          mkdir -p zap && chmod 777 zap
+          cp .zap/rules.tsv zap/rules.tsv
+          docker run --rm --network host \
+            -v "$PWD/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-api-scan.py \
+              -t http://127.0.0.1:8000/openapi.json \
+              -f openapi \
+              -c rules.tsv \
+              -I \
+              -r zap-report.html \
+              -w zap-report.md \
+              -J zap-report.json
+
+      - name: Arrêter le conteneur scanné
+        if: always()
+        run: docker rm -f serving-dast 2>/dev/null || true
+
+      - name: Publier le résumé
+        if: always()
+        run: |
+          {
+            echo "## ZAP — surface HTTP de l'image publiée"
+            echo
+            echo "digest scanné : \`${{ needs.build.outputs.digest }}\`"
+            echo
+            cat zap/zap-report.md 2>/dev/null || echo "Aucun rapport produit."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Conserver les rapports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap
+          path: zap/
+          retention-days: 7
