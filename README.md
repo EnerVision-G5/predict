@@ -4,7 +4,8 @@ Repo Data d'EnerVision. Il porte quatre exécutables indépendants qui ne
 communiquent que par des artefacts — une table, des partitions, un registre de
 modèles : la collecte des mesures depuis l'API Mock IoT vers TimescaleDB, leur
 transformation en variables d'apprentissage, l'entraînement des modèles suivi
-par MLflow, et le service d'inférence FastAPI déployé sur Azure.
+par MLflow, et le service d'inférence FastAPI, déployé on-premise et appelé par
+la seule API métier.
 
 La règle centrale tient en une phrase. **Aucun service n'importe le code d'un
 autre.** Si `etl` faisait `from collector.client import fetch`, il n'y aurait
