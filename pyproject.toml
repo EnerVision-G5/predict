@@ -30,11 +30,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest==9.1.1",
-    # La couverture n'est pas une métrique de confort : c'est SonarQube Cloud
-    # qui la lit, et sa porte qualité en fait une condition de fusion. Épinglée
-    # comme les autres : une montée de version qui changerait le format de
-    # coverage.xml ferait chuter la couverture mesurée sans qu'une seule ligne
-    # de test ait bougé.
+    # La couverture n'est pas une métrique de confort : son seuil
+    # (tool.coverage.report.fail_under) est une condition de fusion. Épinglée
+    # comme les autres : une montée de version qui changerait la mesure
+    # ferait bouger la couverture sans qu'une seule ligne de test ait changé.
     "pytest-cov==7.0.0",
     "ruff==0.16.5",
     "httpx==0.28.1",
@@ -99,10 +98,8 @@ addopts = "-q"
 [tool.coverage.run]
 branch = true
 source = ["libs", "services"]
-# Chemins relatifs à la racine du repo, et non absolus. Le rapport est écrit
-# sur le runner et lu par un scanner qui, lui, voit l'arborescence depuis un
-# autre chemin : des chemins absolus feraient perdre à SonarQube Cloud le lien
-# entre la mesure et le fichier, et la couverture s'afficherait à zéro.
+# Chemins relatifs à la racine du repo : un rapport produit sur le runner reste
+# lisible depuis un poste dont l'arborescence diffère.
 relative_files = true
 omit = ["*/tests/*", "*/__main__.py"]
 

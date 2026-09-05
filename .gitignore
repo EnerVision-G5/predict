@@ -28,9 +28,7 @@ datasets/
 # Secrets d'exécution. Seul .env.example est versionné.
 .env
 
-# Rapports de couverture. Ils sont produits à chaque run et lus par SonarQube
-# Cloud dans le job qui vient de les écrire : les versionner ferait scanner la
-# couverture d'un autre commit que celui qu'on analyse.
+# Rapports de couverture, produits à chaque exécution de pytest --cov.
 .coverage
 coverage.xml
 
