@@ -104,6 +104,9 @@ relative_files = true
 omit = ["*/tests/*", "*/__main__.py"]
 
 [tool.coverage.report]
+# Seuil de la Definition of Done sur le cœur ETL : en dessous, pytest échoue et
+# la CI avec lui. Aucun outil externe ne porte plus cette porte.
+fail_under = 70
 # `if TYPE_CHECKING:` et les gardes `__main__` ne s'exécutent jamais sous
 # pytest, et les compter en manquant ferait baisser la mesure sans qu'aucun
 # test ne puisse les couvrir.
