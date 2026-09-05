@@ -1,4 +1,4 @@
-"""DTO du service d'inférence EnerVision déployé sur Azure.
+"""DTO du service d'inférence EnerVision, déployé on-premise.
 
 Source de vérité du contrat. Toute modification exige une PR sur
 enervision/docs/contracts et la relecture des trois consommateurs.
