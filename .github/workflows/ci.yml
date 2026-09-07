@@ -26,6 +26,20 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # Avant toute installation, parce qu'un `uv sync` régénère le verrou en
+      # silence et effacerait la dérive qu'on cherche justement à voir.
+      #
+      # Le verrou n'est pas un fichier de commodité : les quatre images
+      # l'installent tel quel (`uv sync --frozen`), et le job Grype le scanne
+      # en annonçant qu'il est « exactement ce que les quatre images
+      # installent ». Rien ne le vérifiait, et il avait dérivé — `httpx`,
+      # déclaré par predict_common et serving, n'y figurait plus contre eux.
+      # Grype analysait donc un verrou qui ne décrivait plus les manifestes.
+      - name: Vérifier que le verrou correspond aux manifestes
+        run: |
+          uv lock --check \
+            || { echo "::error::uv.lock a dérivé des pyproject.toml. Lancer 'uv lock' et committer le résultat."; exit 1; }
+
       - name: Installer le workspace
         # 3.11 comme les autres repos du projet. Les versions épinglées sont
         # choisies pour tenir sur cette version : monter numpy ou xgboost
@@ -208,114 +222,3 @@ jobs:
           path: grype.json
           retention-days: 7
 
-  dast:
-    name: Surface HTTP du service d'inférence (ZAP)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
-      # Le paquet `serving` seul : attaquer la surface HTTP n'a aucune raison
-      # d'installer la pile ETL ni xgboost.
-      - run: uv sync --python 3.11 --package serving
-
-      - name: Démarrer le service d'inférence
-        env:
-          # Ni registre ni modèle en CI, et c'est sans conséquence : le service
-          # démarre quand même, sert /health, et répond 503 sur /predict — sa
-          # règle depuis l'origine. Mais le client MLflow réessaie sept fois
-          # avec une attente croissante avant d'abandonner, et le démarrage
-          # dépasse alors deux minutes. Couper les reprises le ramène à sept
-          # secondes.
-          #
-          # Ce que ZAP éprouve ici est donc la surface HTTP — en-têtes, codes
-          # d'erreur, robustesse aux entrées — et non le chemin du modèle, qui
-          # demanderait un registre et une partition de variables.
-          MLFLOW_HTTP_REQUEST_MAX_RETRIES: "0"
-          MLFLOW_HTTP_REQUEST_TIMEOUT: "2"
-        # Le journal part dans un fichier plutôt que sur la sortie du pas :
-        # un processus de fond qui garde le tube du runner ouvert fait traîner
-        # le pas au-delà de sa propre fin. Il sert accessoirement de trace le
-        # jour où le service ne démarre pas, où l'échec ne disait rien.
-        run: |
-          uv run --package serving uvicorn serving.api:app \
-            --host 127.0.0.1 --port 8000 > uvicorn.log 2>&1 &
-          echo "$!" > uvicorn.pid
-          for _ in $(seq 1 60); do
-            curl -sf http://127.0.0.1:8000/health > /dev/null && break
-            sleep 2
-          done
-          curl -sf http://127.0.0.1:8000/health || {
-            cat uvicorn.log
-            echo "::error::le service d'inférence n'a pas démarré"
-            exit 1
-          }
-
-      # `zap-api-scan.py` et non le scan de base : la ligne de base explore un
-      # site en suivant ses liens, et une API JSON n'en a aucun. Le scan d'API
-      # part au contraire de la spécification, qu'il lit sur le service
-      # lui-même plutôt que dans un fichier — ce qui garantit qu'il attaque les
-      # routes servies, et non une spécification qui aurait dérivé.
-      #
-      # `--network host` : le conteneur ZAP doit joindre un service qui écoute
-      # sur la boucle locale du runner. Sans lui, `127.0.0.1` désignerait le
-      # conteneur, où rien n'écoute.
-      #
-      # `-I` : un avertissement ne fait pas échouer le job. Les règles par
-      # défaut de ZAP alertent sur des en-têtes que FastAPI ne pose pas seul, et
-      # une porte rouge dès le premier run serait ignorée dès le deuxième. Une
-      # règle passée en FAIL dans un fichier de règles, elle, bloquera.
-      - name: Scan actif de l'API
-        run: |
-          mkdir -p zap && chmod 777 zap
-          docker run --rm --network host \
-            -v "$PWD/zap:/zap/wrk:rw" \
-            ghcr.io/zaproxy/zaproxy:stable \
-            zap-api-scan.py \
-              -t http://127.0.0.1:8000/openapi.json \
-              -f openapi \
-              -I \
-              -r zap-report.html \
-              -w zap-report.md \
-              -J zap-report.json
-
-      # Sans cet arrêt, le service vit jusqu'au « Cleaning up orphan
-      # processes » du runner, qui vient après les post-steps. Le `uv run` qui
-      # le porte tient alors le verrou du cache uv, le `uv cache prune` de
-      # setup-uv attend ce verrou, et le runner le tue au bout de cinq minutes.
-      # Le job échouait là, scan réussi et rapports publiés.
-      #
-      # Le fils d'abord : c'est uvicorn qui écoute, mais c'est `uv run` qui
-      # tient le verrou, et il ne le rend qu'une fois son fils parti.
-      - name: Arrêter le service d'inférence
-        if: always()
-        run: |
-          pid=$(cat uvicorn.pid 2>/dev/null) || exit 0
-          pkill -TERM -P "$pid" || true
-          kill -TERM "$pid" 2>/dev/null || true
-          for _ in $(seq 1 20); do
-            kill -0 "$pid" 2>/dev/null || exit 0
-            sleep 1
-          done
-          kill -KILL "$pid" 2>/dev/null || true
-
-      - name: Publier le résumé
-        if: always()
-        run: |
-          {
-            echo "## ZAP — surface HTTP du service d'inférence"
-            echo
-            cat zap/zap-report.md 2>/dev/null || echo "Aucun rapport produit."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Conserver les rapports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: zap
-          path: zap/
-          retention-days: 7

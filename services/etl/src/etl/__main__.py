@@ -57,7 +57,13 @@ from etl.load import LoadError, load
 from etl.validate import ContractError, check_features, check_measures
 from predict_common import io
 from predict_common.config import Config, ConfigError, load_config
-from predict_common.db import DatabaseError, open_engine
+from predict_common.db import (
+    DatabaseError,
+    mesure,
+    mesure_exclu,
+    open_engine,
+    verify_schema,
+)
 from predict_common.paths import (
     PathError,
     features_partition,
@@ -215,6 +221,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config()
         end = parse_date(args.date) if args.date else datetime.now(UTC).date()
         engine = open_engine(config.get_optional_str("database.url"))
+        # Avant tout calcul : une base en retard de migration ferait
+        # échouer le chargement APRÈS avoir produit la journée entière,
+        # sous la forme brute que remonte le driver.
+        verify_schema(engine, (mesure, mesure_exclu))
         # Le rejeu d'une journée déjà produite est sans effet de bord : la
         # partition est remplacée et l'écriture en base repose les colonnes
         # déduites. Une fenêtre n'a donc pas à savoir où la précédente s'est
