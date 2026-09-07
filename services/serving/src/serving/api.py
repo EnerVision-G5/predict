@@ -17,9 +17,19 @@ service calcule et répond ; ce qu'on fait de sa réponse ne le regarde pas.
 Source de vérité du contrat. Toute modification exige une PR sur
 enervision/docs/contracts et la relecture des trois consommateurs.
 
-Note : `CONTRACT_VERSION` est passée en 1.3.1. La description du service
-annonçait un déploiement sur Azure, abandonné par la décision d'architecture
-V2 ; aucune forme de donnée ne change.
+Note : `CONTRACT_VERSION` est passée en 1.4.0. Deux champs OPTIONNELS s'ajoutent
+à `PredictionOut`, `history_source` et `history_origin`. Ils disent d'où
+viennent les observations qui ont nourri les décalages du modèle : de la
+fenêtre courante, ou — faute d'heures récentes continues — de l'historique de
+référence rejoué. Sans eux le repli serait muet, et un consommateur afficherait
+un profil de l'an dernier comme s'il mesurait cette semaine.
+
+Minor et non major : rien n'est retiré ni renommé, `required` ne bouge pas, et
+un consommateur qui ignore ces deux champs lit la réponse comme avant.
+
+Note précédente : `CONTRACT_VERSION` était passée en 1.3.1. La description du
+service annonçait un déploiement sur Azure, abandonné par la décision
+d'architecture V2 ; aucune forme de donnée ne change.
 
 Note précédente : `CONTRACT_VERSION` était passée en 1.3.0. Deux routes additives
 l'imposent, `GET /api/v1/sites` et `POST /api/v1/simulate/spike/{site_id}`.
@@ -91,7 +101,7 @@ from serving.schemas import (
 # Version du contrat gelé dans enervision/docs/contracts/openapi-predict.json.
 # Incrémentée en semver : patch pour une description, minor pour un champ
 # optionnel ajouté, major pour un champ retiré ou renommé.
-CONTRACT_VERSION = "1.3.1"
+CONTRACT_VERSION = "1.4.0"
 
 API_PREFIX = "/api/v1"
 
