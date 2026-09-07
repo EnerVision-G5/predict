@@ -17,7 +17,12 @@ import pytest
 
 from predict_common import io
 from predict_common.paths import features_partition
-from predict_common.schemas import feature_columns, features_arrow_schema
+from predict_common.schemas import (
+    SITE_COLUMN,
+    feature_columns,
+    features_arrow_schema,
+)
+from serving import forecast
 from serving.forecast import (
     CONFIDENCE_Z,
     ForecastSpec,
@@ -258,3 +263,86 @@ class TestConfidenceBand:
         # rogner la borne masquerait un modèle qui prédit une aberration.
         lower, _ = confidence_band(1.0, 1, 10.0)
         assert lower < 0.0
+
+
+# --- Cache de la fenêtre de variables ---------------------------------------
+#
+# Le service relisait le stockage à chaque prévision : `lookback_days`
+# partitions journalières téléchargées, décompressées, concaténées et triées
+# pour n'en extraire qu'un seul site. Le job de rafraîchissement boucle sur
+# les sept sites, donc sept lectures complètes de la même fenêtre par cycle.
+
+
+def test_la_fenetre_n_est_lue_qu_une_fois_dans_le_ttl(monkeypatch) -> None:
+    """Deux prévisions rapprochées ne relisent pas le stockage.
+
+    L'ETL ne publie qu'une fois par cycle : relire plus souvent ne peut rien
+    apprendre de neuf.
+    """
+    forecast.reset_history_cache()
+    reads = []
+
+    def counting(spec, today=None):
+        reads.append(today)
+        return pd.DataFrame({SITE_COLUMN: ["SITE001"]})
+
+    monkeypatch.setattr(forecast, "read_history", counting)
+    spec = ForecastSpec(
+        root="data", feature_version="v1", lag_hours=(1,),
+        rolling_window_h=24, lookback_days=10,
+    )
+
+    first = forecast.cached_history(spec, ttl_s=300.0, today=date(2026, 9, 4))
+    second = forecast.cached_history(spec, ttl_s=300.0, today=date(2026, 9, 4))
+
+    assert len(reads) == 1
+    assert first is second
+    forecast.reset_history_cache()
+
+
+def test_un_ttl_nul_relit_a_chaque_fois(monkeypatch) -> None:
+    """Le cache se désactive par configuration, sans changer le reste."""
+    forecast.reset_history_cache()
+    reads = []
+
+    def counting(spec, today=None):
+        reads.append(today)
+        return pd.DataFrame({SITE_COLUMN: ["SITE001"]})
+
+    monkeypatch.setattr(forecast, "read_history", counting)
+    spec = ForecastSpec(
+        root="data", feature_version="v1", lag_hours=(1,),
+        rolling_window_h=24, lookback_days=10,
+    )
+
+    forecast.cached_history(spec, ttl_s=0.0, today=date(2026, 9, 4))
+    forecast.cached_history(spec, ttl_s=0.0, today=date(2026, 9, 4))
+
+    assert len(reads) == 2
+
+
+def test_un_changement_de_journee_invalide_le_cache(monkeypatch) -> None:
+    """La clé porte la journée : minuit passé, la fenêtre a bougé.
+
+    Sans elle, un service démarré la veille servirait indéfiniment les
+    partitions de la veille, et `feature_lag_hours` grandirait sans que rien
+    ne relise.
+    """
+    forecast.reset_history_cache()
+    reads = []
+
+    def counting(spec, today=None):
+        reads.append(today)
+        return pd.DataFrame({SITE_COLUMN: ["SITE001"]})
+
+    monkeypatch.setattr(forecast, "read_history", counting)
+    spec = ForecastSpec(
+        root="data", feature_version="v1", lag_hours=(1,),
+        rolling_window_h=24, lookback_days=10,
+    )
+
+    forecast.cached_history(spec, ttl_s=300.0, today=date(2026, 9, 4))
+    forecast.cached_history(spec, ttl_s=300.0, today=date(2026, 9, 5))
+
+    assert reads == [date(2026, 9, 4), date(2026, 9, 5)]
+    forecast.reset_history_cache()

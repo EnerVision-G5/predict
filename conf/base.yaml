@@ -77,6 +77,20 @@ collector:
   # Trois cadences manquées : en deçà, un à-coup de la source alerterait sans
   # qu'aucune donnée ne soit perdue.
   lag_warning_s: 180
+  # Fenêtre dans laquelle le rattrapage automatique (`--catch-up`) cherche les
+  # trous, en journées.
+  #
+  # Ce n'est pas la quantité recollectée : une fenêtre sans trou ne coûte
+  # qu'une requête d'agrégation, et seules les journées incomplètes sont
+  # redemandées à la source. Un redémarrage à chaud collecte donc la journée
+  # courante, pas trente-cinq.
+  #
+  # 35 et non 30 : « il y a un mois » doit tomber DANS la fenêtre et non sur
+  # son bord. Une profondeur de 30 partant du 5 septembre ne remonte qu'au
+  # 7 août, et laisserait dehors les deux premières journées d'un trou qui
+  # commence le 5. La marge couvre aussi le décalage de 168 h du jeu de
+  # variables, que l'ETL exige avant de publier sa première journée.
+  catch_up_days: ${COLLECTOR_CATCH_UP_DAYS:-35}
 
 etl:
   # Version du jeu de variables. Elle est dans le chemin des partitions, donc
@@ -193,10 +207,30 @@ monitoring:
   min_rows_per_site: 24
 
 serving:
+  # Clé de service exigée sur les routes du contrat. Le service relaie la
+  # simulation de pic, qui ÉCRIT sur la source : l'API métier protège la même
+  # opération derrière le rôle `writer`, et un service ouvert rendait ce
+  # contrôle contournable. Voir services/serving/src/serving/auth.py pour ce
+  # qui reste servi sans clé — la sonde de vivacité et la spécification.
+  #
+  # Sans repli, et volontairement : le service refuse de démarrer sans elle,
+  # comme l'API métier refuse de démarrer sans JWT_SECRET. Générer avec
+  #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+  api_key: ${SERVING_API_KEY:-}
+  # false ouvre les routes. C'est le mode du poste de développement et de la
+  # CI, où aucun secret n'est distribué ; il est journalisé en avertissement à
+  # chaque démarrage et ne doit jamais être déployé.
+  auth_enabled: ${SERVING_AUTH_ENABLED:-true}
   # Alias et non version figée : promouvoir un modèle se fait en déplaçant
   # l'alias dans MLflow, sans redéployer le service, et le retour arrière est
   # le même geste en sens inverse.
   model_uri: ${SERVING_MODEL_URI:-models:/enervision_xgboost@champion}
+  # Durée de conservation des partitions de variables en mémoire, en secondes.
+  # Le service relisait le stockage objet à CHAQUE prévision : une fenêtre de
+  # dix journées, décompressée et triée, pour en extraire un seul site. L'ETL
+  # ne publie qu'une fois par cycle, la relire plus souvent ne peut rien
+  # apprendre de neuf. 0 désactive le cache.
+  feature_cache_ttl_s: ${SERVING_FEATURE_CACHE_TTL_S:-300}
   # Le service reconstruit les décalages depuis la dernière partition de
   # variables produite par l'ETL. Nombre de jours remontés pour la trouver.
   feature_lookback_days: 10
