@@ -14,7 +14,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
-from conftest import FakeEngine
+from collector_fakes import FakeEngine
 from sqlalchemy.dialects import postgresql
 
 from collector.sink import (

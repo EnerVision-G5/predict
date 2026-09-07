@@ -89,6 +89,29 @@ class PredictionOut(BaseModel):
             " aveugle : ce champ est la seule chose qui le dise."
         ),
     )
+    history_source: str = Field(
+        default="recent",
+        description=(
+            "Origine des observations qui ont nourri les decalages du modele."
+            " 'recent' : les variables publiees par l'ETL sur la fenetre"
+            " courante, cas normal. 'reference' : faute d'heures recentes"
+            " continues, la prevision rejoue l'historique de reference decale"
+            " d'un nombre entier d'annees de 52 semaines. Les heures predites"
+            " restent celles qui viennent, mais la serie observee sur laquelle"
+            " elles s'appuient ne decrit pas cette semaine-ci. Un consommateur"
+            " qui affiche une prevision de repli sans le dire ferait passer"
+            " pour une mesure du site ce qui est un profil de l'an dernier."
+        ),
+    )
+    history_origin: datetime | None = Field(
+        default=None,
+        description=(
+            "Derniere heure REELLEMENT observee dont la prevision descend,"
+            " ISO 8601 UTC. Renseignee seulement quand history_source vaut"
+            " 'reference' : history_end porte alors la date decalee, et ce"
+            " champ est le seul a dire d'ou vient la serie."
+        ),
+    )
     points: list[PredictionPoint] = Field(
         description="Série prédite, triée par horodatage croissant.",
     )

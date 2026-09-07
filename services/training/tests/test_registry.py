@@ -21,8 +21,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from conftest import FakeEngine
 from sqlalchemy.dialects import postgresql
+from training_fakes import FakeEngine
 
 from training.registry import (
     build_demotion,

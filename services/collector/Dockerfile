@@ -61,6 +61,12 @@ WORKDIR /app
 COPY --from=builder --chown=predict:predict /app/.venv /app/.venv
 COPY --chown=predict:predict conf/ conf/
 
+# Historique de référence, chargé par `python -m collector.datasets`. Il entre
+# dans l'image plutôt que d'être monté : c'est une donnée de référence figée,
+# versionnée avec le code qui la lit, et un déploiement n'a alors aucun
+# fichier à transporter pour poser deux ans d'historique.
+COPY --chown=predict:predict datasets/ datasets/
+
 USER predict
 
 # ENTRYPOINT et non CMD : les arguments passés à `docker compose run` viennent

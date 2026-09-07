@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from conftest import FakeEngine
+from etl_fakes import FakeEngine
 
 from etl.__main__ import (
     DEFAULT_DAYS,

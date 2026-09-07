@@ -41,9 +41,10 @@ import logging
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from typing import Annotated, Any
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
@@ -66,6 +67,7 @@ from serving.forecast import (
     cached_history,
     predict_series,
     read_history,
+    reference_history,
     site_history,
 )
 from serving.loader import ModelRegistry, ModelUnavailable
@@ -130,6 +132,12 @@ def ensure_site_id(site_id: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+# Valeurs du champ `history_source` du contrat. Nommées ici plutôt qu'écrites
+# en clair aux deux endroits qui les posent : une faute de frappe sur l'une
+# des deux ferait passer une prévision de repli pour une prévision ordinaire.
+HISTORY_RECENT = "recent"
+HISTORY_REFERENCE = "reference"
+
 # Ni le modèle ni la configuration ne sont chargés à l'import : un module qui
 # joint un registre au moment où on l'importe rend le service intestable et
 # fait échouer la génération de la spécification OpenAPI en CI, où aucun
@@ -183,6 +191,7 @@ def configure() -> None:
         lag_hours=tuple(config.get_int_list("etl.lag_hours")),
         rolling_window_h=config.get_int("etl.rolling_window_h"),
         lookback_days=config.get_int("serving.feature_lookback_days"),
+        reference_years=config.get_int("serving.reference_years", 0),
     )
     # Le client de la source est construit ici, pas à chaque requête : il tient
     # sa connexion ouverte, et le relais du référentiel est appelé à chaque
@@ -284,28 +293,57 @@ def predict(payload: PredictionRequest) -> PredictionOut:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
+    # Deux tentatives, dans cet ordre, et jamais l'inverse : les heures
+    # réellement observées cette semaine priment toujours sur un profil de
+    # l'an dernier. Le repli ne se déclenche que là où le service se taisait.
+    history_source = HISTORY_RECENT
+    history_origin: datetime | None = None
+    history: pd.Series | None = None
+    points: list = []
     try:
         history = site_history(
             cached_history(spec, _feature_cache_ttl_s()),
             payload.site_id,
             spec,
         )
-    except NoHistory as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    points = predict_series(
-        model.predict,
-        history,
-        payload.horizon_hours,
-        spec,
-        columns,
-        residual_std=model.residual_std,
-    )
+    except NoHistory:
+        history = None
+    if history is not None:
+        points = predict_series(
+            model.predict,
+            history,
+            payload.horizon_hours,
+            spec,
+            columns,
+            residual_std=model.residual_std,
+        )
+    # `not points` autant que `history is None` : un site peut avoir des heures
+    # récentes sans avoir les 168 h continues que réclame le décalage le plus
+    # profond. C'est même le cas ordinaire au démarrage de la collecte, et le
+    # refus était alors identique à celui d'un site totalement absent.
+    if not points and spec.reference_years > 0:
+        try:
+            history, origin = reference_history(spec, payload.site_id)
+        except NoHistory:
+            history = None
+        else:
+            history_source = HISTORY_REFERENCE
+            history_origin = datetime.combine(origin, time.min, tzinfo=UTC)
+            points = predict_series(
+                model.predict,
+                history,
+                payload.horizon_hours,
+                spec,
+                columns,
+                residual_std=model.residual_std,
+            )
     if not points:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             detail=(
                 f"Historique insuffisant pour {payload.site_id} : les décalages"
-                " demandés par le modèle ne sont pas tous disponibles."
+                " demandés par le modèle ne sont pas tous disponibles, et"
+                " l'historique de référence n'a pas pu les fournir non plus."
             ),
         )
     generated_at = datetime.now(UTC)
@@ -320,6 +358,8 @@ def predict(payload: PredictionRequest) -> PredictionOut:
         # service est le seul à savoir sur quoi il vient de s'appuyer.
         history_end=history_end,
         feature_lag_hours=feature_lag_hours(generated_at, history_end),
+        history_source=history_source,
+        history_origin=history_origin,
         points=[
             PredictionPoint(
                 timestamp=point.stamp.to_pydatetime(),

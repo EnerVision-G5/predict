@@ -1,4 +1,4 @@
-"""Client de la source : pagination, reprises, débit borné.
+"""Client de la source : découpage des fenêtres, reprises, débit borné.
 
 Aucun test ne sort sur le réseau. Ce qui compte ici est le comportement du
 client face à ce que la source lui répond — une page pleine, une page vide,
@@ -21,7 +21,16 @@ from predict_common.source import (
     SourceSettings,
 )
 
-WINDOW = (datetime(2026, 9, 2, tzinfo=UTC), datetime(2026, 9, 3, tzinfo=UTC))
+# Fenêtres courtes : le découpage se lit au nombre de tranches, et une journée
+# entière en ferait 720 avec le `page_size` de deux minutes des réglages.
+FIVE_MINUTES = (
+    datetime(2026, 9, 2, tzinfo=UTC),
+    datetime(2026, 9, 2, 0, 5, tzinfo=UTC),
+)
+ONE_HOUR = (
+    datetime(2026, 9, 2, tzinfo=UTC),
+    datetime(2026, 9, 2, 1, 0, tzinfo=UTC),
+)
 
 
 def json_response(payload) -> httpx.Response:
@@ -48,56 +57,104 @@ def test_fetch_sites_refuses_a_payload_that_is_not_a_list(make_client) -> None:
         client.fetch_sites()
 
 
-def test_iter_readings_walks_every_page(make_client, make_reading) -> None:
-    # `page_size` vaut 2 : une page pleine annonce que la source a tronqué.
-    pages = [
-        [make_reading("2026-09-02T00:00:00Z"), make_reading("2026-09-02T01:00:00Z")],
-        [make_reading("2026-09-02T02:00:00Z")],
-    ]
-    seen: list[str] = []
+def test_iter_readings_cuts_the_window_into_slices(make_client, make_reading) -> None:
+    # `page_size` vaut 2 : des tranches de deux minutes. Cinq minutes en font
+    # donc trois — deux pleines, et un reliquat d'une minute.
+    seen: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request.url.params["start_time"])
-        return json_response(pages[len(seen) - 1])
-
-    client = make_client(handler)
-    assert len(list(client.iter_readings("SITE001", *WINDOW))) == 3
-    # La page suivante repart du dernier horodatage reçu, à une microseconde
-    # près : la source borne inclusivement.
-    assert seen[0].startswith("2026-09-02T00:00:00")
-    assert seen[1].startswith("2026-09-02T01:00:00.000001")
-
-
-def test_iter_readings_stops_on_an_incomplete_page(make_client, make_reading) -> None:
-    # Moins que `limit`, c'est qu'il n'y a plus rien : une requête de plus ne
-    # ferait que confirmer le vide.
-    calls: list[int] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(1)
+        params = request.url.params
+        seen.append((params["start_time"], params["limit"]))
         return json_response([make_reading("2026-09-02T00:00:00Z")])
 
     client = make_client(handler)
-    assert len(list(client.iter_readings("SITE001", *WINDOW))) == 1
-    assert len(calls) == 1
+    list(client.iter_readings("SITE001", *FIVE_MINUTES))
+    assert [limit for _, limit in seen] == ["2", "2", "1"]
 
 
-def test_iter_readings_gives_up_when_the_source_stops_progressing(
-    make_client, make_reading
-) -> None:
-    # Une source qui rendrait toujours la même page pleine ferait tourner la
-    # boucle sans fin. Mieux vaut une journée incomplète, et le dire.
-    calls: list[int] = []
+def test_iter_readings_asks_one_result_per_minute(make_client) -> None:
+    # Le coeur du contrat de la source : `limit` est un NOMBRE DE RESULTATS
+    # reparti sur la fenetre, donc une resolution. Autant de resultats que de
+    # minutes, et pas un de plus, sinon deux points tombent dans la meme
+    # minute et la serie n'est plus a la minute.
+    seen: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(1)
+        seen.update(dict(request.url.params))
+        return json_response([])
+
+    client = make_client(handler, {"page_size": 60})
+    list(client.iter_readings("SITE001", *ONE_HOUR))
+    assert seen["limit"] == "60"
+    assert seen["start_time"].startswith("2026-09-02T00:00:00")
+    assert seen["end_time"].startswith("2026-09-02T01:00:00")
+
+
+def test_iter_readings_tiles_the_window_without_overlap(make_client) -> None:
+    # La source pose son premier point sur `start_time` : une tranche qui
+    # repartirait de la fin de la precedente moins une minute redemanderait
+    # cette minute-la, et une qui sauterait une minute la perdrait.
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        seen.append((params["start_time"], params["end_time"]))
+        return json_response([])
+
+    client = make_client(handler)
+    list(client.iter_readings("SITE001", *FIVE_MINUTES))
+    for (_, fin), (debut, _) in zip(seen, seen[1:], strict=False):
+        assert fin == debut
+
+
+def test_iter_readings_never_reasks_the_same_window(make_client, make_reading) -> None:
+    # La source rend TOUJOURS `limit` resultats : « page pleine, donc il en
+    # reste » ne devient jamais faux. Une pagination par curseur redemandait
+    # ici la meme fenetre sans fin. Le decoupage borne le nombre d'appels a
+    # celui des tranches, quoi que la source reponde.
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.params["start_time"])
         stamp = "2026-09-02T00:00:00Z"
         return json_response([make_reading(stamp), make_reading(stamp)])
 
     client = make_client(handler)
-    assert len(list(client.iter_readings("SITE001", *WINDOW))) == 4
-    # Deux appels : le second constate l'absence de progrès et s'arrête.
-    assert len(calls) == 2
+    list(client.iter_readings("SITE001", *FIVE_MINUTES))
+    assert len(calls) == 3
+    assert len(set(calls)) == 3
+
+
+def test_iter_readings_reports_a_short_answer(
+    make_client, make_reading, caplog
+) -> None:
+    # Moins de resultats que de minutes demandees laisse un trou. Ce n'est pas
+    # fatal, mais le taire ferait passer une serie amputee pour complete.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response([make_reading("2026-09-02T00:00:00Z")])
+
+    client = make_client(handler)
+    with caplog.at_level("WARNING"):
+        list(client.iter_readings("SITE001", *ONE_HOUR))
+    assert "1 mesure(s) recue(s)" in caplog.text.replace("ç", "c")
+
+
+def test_iter_readings_drops_a_trailing_partial_minute(make_client) -> None:
+    # Une source qui ne sert que des minutes ne sait rien faire de trente
+    # secondes, et `limit=0` lui vaudrait un 422.
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return json_response([])
+
+    client = make_client(handler)
+    window = (
+        datetime(2026, 9, 2, tzinfo=UTC),
+        datetime(2026, 9, 2, 0, 0, 30, tzinfo=UTC),
+    )
+    assert list(client.iter_readings("SITE001", *window)) == []
+    assert calls == []
 
 
 def test_iter_readings_passes_the_site_as_a_query_parameter(
@@ -112,33 +169,15 @@ def test_iter_readings_passes_the_site_as_a_query_parameter(
         return json_response([])
 
     client = make_client(handler)
-    list(client.iter_readings("SITE009", *WINDOW))
+    list(client.iter_readings("SITE009", *FIVE_MINUTES))
     assert seen["site_id"] == "SITE009"
 
 
-def test_iter_readings_stops_on_the_first_empty_page(make_client) -> None:
-    calls: list[int] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(1)
-        return json_response([])
-
-    client = make_client(handler)
-    assert list(client.iter_readings("SITE001", *WINDOW)) == []
-    assert len(calls) == 1
-
-
-def test_iter_readings_passes_the_window_to_the_source(make_client) -> None:
-    seen: dict[str, str] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.update(dict(request.url.params))
-        return json_response([])
-
-    client = make_client(handler)
-    list(client.iter_readings("SITE001", *WINDOW))
-    assert seen["start_time"].startswith("2026-09-02")
-    assert seen["limit"] == "2"
+def test_iter_readings_yields_an_empty_answer_without_failing(make_client) -> None:
+    # Une fenetre sans donnee est un cas normal au demarrage de la chaine, pas
+    # une panne : elle ne rend rien et laisse les tranches suivantes essayer.
+    client = make_client(lambda _: json_response([]))
+    assert list(client.iter_readings("SITE001", *FIVE_MINUTES)) == []
 
 
 def test_fetch_current_wraps_a_lone_measure_in_a_list(

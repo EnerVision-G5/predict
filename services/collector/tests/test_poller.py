@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
-from conftest import FakeEngine
+from collector_fakes import FakeEngine
 from sqlalchemy.exc import SQLAlchemyError
 
 from collector.poller import (

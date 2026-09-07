@@ -51,9 +51,19 @@ source:
   # État de santé des capteurs, par site. Dit quel capteur est tombé et
   # jusqu'à quand, ce qu'aucune mesure ne porte.
   sensors_status_path: /api/v1/sensors/status
-  # Taille de page du rattrapage, plafonnée à 1000 par la source. La
-  # pagination avance par le temps et non par un rang : une page pleine fait
-  # repartir la requête du dernier horodatage reçu.
+  # Largeur maximale d'une fenêtre de rattrapage, EN MINUTES, plafonnée à
+  # 1000 par la source.
+  #
+  # C'est la même valeur que le `limit` envoyé, et ce n'est pas un hasard :
+  # `/api/v1/readings` définit `limit` comme le nombre de résultats rendus,
+  # répartis uniformément sur la fenêtre demandée. Un résultat par minute
+  # exige donc autant de résultats que de minutes, et la fenêtre ne peut pas
+  # être plus large que le plafond de la source.
+  #
+  # Une journée fait 1440 minutes : elle est demandée en deux fenêtres, jamais
+  # en une. La demander d'un bloc avec limit=1000 rendrait mille points étalés
+  # sur 1440 minutes — un point toutes les 86 secondes, sans qu'aucune erreur
+  # ne le signale.
   page_size: 1000
   timeout_s: 30
   # Reprises immédiates d'un appel avant abandon, et attente entre deux
@@ -80,17 +90,16 @@ collector:
   # Fenêtre dans laquelle le rattrapage automatique (`--catch-up`) cherche les
   # trous, en journées.
   #
-  # Ce n'est pas la quantité recollectée : une fenêtre sans trou ne coûte
-  # qu'une requête d'agrégation, et seules les journées incomplètes sont
-  # redemandées à la source. Un redémarrage à chaud collecte donc la journée
-  # courante, pas trente-cinq.
+  # 2 et non 35, parce que la source ne sert pas d'historique : son
+  # `/api/v1/readings` ne remonte qu'à 48 heures, et au-delà elle répond des
+  # mesures nulles plutôt qu'une erreur. Une fenêtre plus large ne collectait
+  # donc rien, mais interrogeait quand même la source pour chaque journée et
+  # chaque site, et écrivait des nuls que le `ON CONFLICT DO NOTHING` fige
+  # ensuite définitivement.
   #
-  # 35 et non 30 : « il y a un mois » doit tomber DANS la fenêtre et non sur
-  # son bord. Une profondeur de 30 partant du 5 septembre ne remonte qu'au
-  # 7 août, et laisserait dehors les deux premières journées d'un trou qui
-  # commence le 5. La marge couvre aussi le décalage de 168 h du jeu de
-  # variables, que l'ETL exige avant de publier sa première journée.
-  catch_up_days: ${COLLECTOR_CATCH_UP_DAYS:-35}
+  # 2 journées couvrent les 48 heures utiles. L'historique d'apprentissage ne
+  # vient pas de là : il est chargé depuis les jeux de données de référence.
+  catch_up_days: ${COLLECTOR_CATCH_UP_DAYS:-2}
 
 etl:
   # Version du jeu de variables. Elle est dans le chemin des partitions, donc
@@ -234,6 +243,28 @@ serving:
   # Le service reconstruit les décalages depuis la dernière partition de
   # variables produite par l'ETL. Nombre de jours remontés pour la trouver.
   feature_lookback_days: 10
+
+  # Repli sur l'historique de référence, en nombre d'années remontées.
+  #
+  # Le modèle réclame 168 heures CONTINUES avant l'heure prédite. La source ne
+  # remontant qu'à 48 heures, aucun site ne les a avant une semaine pleine de
+  # collecte : le service refusait alors toute prévision, le dashboard restait
+  # vide, et les recommandations n'avaient aucune série à lire. Un démarrage
+  # de chaîne ressemblait à une panne.
+  #
+  # Faute d'heures récentes, le service rejoue donc celles de l'historique de
+  # référence, décalées d'un nombre entier d'années de 52 SEMAINES — 364 jours,
+  # ni 365 ni 366. C'est ce qui fait retomber sur le même jour de la semaine,
+  # que le modèle lit par `day_of_week`, `is_weekend` et son décalage de 168 h.
+  #
+  # Ce repli ne se déclenche JAMAIS quand des heures récentes suffisent, et la
+  # réponse le déclare en clair : `history_source: reference` et la date
+  # d'origine dans `history_origin`. Un consommateur qui l'ignore afficherait
+  # un profil de l'an dernier comme une mesure de cette semaine.
+  #
+  # 0 désactive le repli, et le service se tait à nouveau tant que la collecte
+  # récente ne suffit pas. 2 couvre les deux années du jeu de référence.
+  reference_years: ${SERVING_REFERENCE_YEARS:-2}
 
 mlflow:
   tracking_uri: ${MLFLOW_TRACKING_URI:-http://localhost:5000}

@@ -56,6 +56,22 @@ ENV PYTHONDONTWRITEBYTECODE=1     PYTHONUNBUFFERED=1     PREDICT_CONF_DIR=/app/c
 # couche entière de plus : l'image porterait deux fois son environnement.
 RUN useradd --create-home --uid 10001 predict
 
+# /app/data est créé et donné à predict AVANT tout montage, exactement comme
+# /mlruns dans l'image de training, et pour la même raison.
+#
+# Le commentaire ci-dessus dit que la racine des artefacts est « montée ou
+# distante, jamais dans l'image ». C'est l'intention, ce n'est pas le défaut :
+# storage.root vaut `data` dans conf/base.yaml, soit /app/data une fois rendu
+# absolu depuis WORKDIR. Or /app appartient à root, et l'uid 10001 ne peut rien
+# y créer. L'ETL échouait donc APRÈS avoir transformé la journée, au moment de
+# publier la partition, sur un Errno 13 qui ne nommait que pyarrow.
+#
+# Et si un volume est bien monté là, docker l'initialise avec les droits du
+# répertoire présent dans l'image : sans cette ligne, un volume nommé neuf
+# arrive en root:root et le même Errno 13 revient. Les deux cas tiennent à
+# cette ligne.
+RUN mkdir -p /app/data && chown predict:predict /app/data
+
 # /mlruns est créé et donné à predict AVANT tout montage : docker initialise un
 # volume nommé vide avec les droits du répertoire présent dans l'image, et un
 # /mlruns appartenant à root rendrait le serveur MLflow incapable d'écrire son

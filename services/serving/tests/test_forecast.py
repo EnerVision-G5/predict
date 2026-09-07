@@ -346,3 +346,91 @@ def test_un_changement_de_journee_invalide_le_cache(monkeypatch) -> None:
 
     assert reads == [date(2026, 9, 4), date(2026, 9, 5)]
     forecast.reset_history_cache()
+
+
+# --- Repli sur l'historique de référence -----------------------------------
+#
+# La source ne remonte qu'à 48 heures : au démarrage de la chaîne, aucun site
+# n'a les heures continues que réclame le décalage le plus profond, et le
+# service refusait alors toute prévision. Ces tests fixent à quelles
+# conditions il rejoue l'historique de référence, et surtout à quelles
+# conditions il ne le fait pas.
+
+
+def spec_with_fallback(root: Path, years: int = 2) -> ForecastSpec:
+    """Mêmes réglages, avec le repli activé."""
+    return ForecastSpec(
+        root=str(root),
+        feature_version="v1",
+        lag_hours=LAGS,
+        rolling_window_h=WINDOW,
+        lookback_days=3,
+        reference_years=years,
+    )
+
+
+def seed_reference(root: Path, years: int, days: int = 3) -> date:
+    """Publie des partitions décalées de `years` années de 52 semaines."""
+    origin = date.today() - timedelta(
+        days=forecast.REFERENCE_SHIFT_DAYS * years
+    )
+    for offset in range(days):
+        day = origin - timedelta(days=offset)
+        io.write_frame(
+            features(day),
+            features_partition(str(root), "v1", day),
+            schema=features_arrow_schema(LAGS, WINDOW),
+        )
+    return origin
+
+
+def test_le_repli_decale_de_semaines_entieres(tmp_path) -> None:
+    # 364 jours, ni 365 ni 366 : le modèle lit day_of_week, is_weekend et un
+    # décalage de 168 h. Une année civile ferait glisser les jours de la
+    # semaine, et un lundi de bureau nourrirait la prévision d'un samedi.
+    assert forecast.REFERENCE_SHIFT_DAYS % 7 == 0
+    origin = seed_reference(tmp_path, years=1)
+    history, returned = forecast.reference_history(
+        spec_with_fallback(tmp_path), "SITE001"
+    )
+    assert returned == origin
+    assert not history.empty
+    # Les heures rendues sont ramenées au présent, pas laissées dans le passé.
+    assert history.index.max().date() >= date.today() - timedelta(days=1)
+
+
+def test_le_repli_ne_deborde_pas_dans_le_futur(tmp_path) -> None:
+    # La journée de référence est rejouée entière : ses heures du soir
+    # atterriraient après maintenant, la prévision démarrerait après elles, et
+    # feature_lag_hours deviendrait négatif — un âge de variables négatif ne
+    # veut rien dire.
+    seed_reference(tmp_path, years=1)
+    history, _ = forecast.reference_history(
+        spec_with_fallback(tmp_path), "SITE001"
+    )
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    assert history.index.max() <= now
+
+
+def test_le_repli_essaie_les_annees_dans_l_ordre(tmp_path) -> None:
+    # La deuxième année n'est tentée que si la première ne porte rien : plus
+    # on remonte, moins la série ressemble au site d'aujourd'hui.
+    origin = seed_reference(tmp_path, years=2)
+    _, returned = forecast.reference_history(
+        spec_with_fallback(tmp_path, years=2), "SITE001"
+    )
+    assert returned == origin
+
+
+def test_le_repli_desactive_refuse(tmp_path) -> None:
+    # reference_years = 0 : le service se tait comme avant. Le repli est un
+    # choix d'exploitation, pas un comportement imposé.
+    seed_reference(tmp_path, years=1)
+    with pytest.raises(NoHistory):
+        forecast.reference_history(spec_with_fallback(tmp_path, years=0), "SITE001")
+
+
+def test_le_repli_ignore_un_site_absent_de_la_reference(tmp_path) -> None:
+    seed_reference(tmp_path, years=1)
+    with pytest.raises(NoHistory):
+        forecast.reference_history(spec_with_fallback(tmp_path), "SITE404")

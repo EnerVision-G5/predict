@@ -91,15 +91,27 @@ EXIT_FAILED = 1
 logger = logging.getLogger(__name__)
 
 
-def day_window(day: date) -> tuple[datetime, datetime]:
-    """Retourne la fenêtre UTC `[minuit, minuit du lendemain[` d'une journée.
+def day_window(day: date, now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Retourne la fenêtre UTC d'une journée, JAMAIS au-delà de maintenant.
 
     Les mesures rendues par la source sont ensuite filtrées sur le jour
     demandé : une source qui déborderait d'une seconde ne serait pas comptée
     dans une journée qu'elle ne concerne pas.
+
+    La borne haute est ramenée à l'instant courant, et ce n'est pas un détail
+    d'exactitude : sans elle, rattraper la journée EN COURS demande à la
+    source les heures qui n'ont pas encore eu lieu. Elle ne répond pas une
+    erreur — elle répond des mesures nulles, que le collecteur écrit, et que
+    son `ON CONFLICT DO NOTHING` rend alors DÉFINITIVES.
+
+    Le poller collecte ensuite ces minutes-là pour de vrai, une par une, et
+    ses valeurs sont silencieusement rejetées : la ligne existe déjà, vide. Un
+    rattrapage lancé à 02:30 stérilisait ainsi les vingt et une heures
+    suivantes, chaque jour, sans qu'aucun journal ne le dise.
     """
     start = datetime.combine(day, time.min, tzinfo=UTC)
-    return start, start + timedelta(days=1)
+    end = start + timedelta(days=1)
+    return start, min(end, now or datetime.now(UTC))
 
 
 def collect_day(
