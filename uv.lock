@@ -2207,6 +2207,7 @@ name = "predict-common"
 version = "0.1.0"
 source = { editable = "libs/predict_common" }
 dependencies = [
+    { name = "httpx" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pandera", extra = ["pandas"] },
@@ -2216,6 +2217,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "numpy", specifier = "==2.4.6" },
     { name = "pandas", specifier = "==2.3.3" },
     { name = "pandera", extras = ["pandas"], specifier = "==0.28.1" },
@@ -3018,6 +3020,7 @@ version = "0.1.0"
 source = { editable = "services/serving" }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "mlflow" },
     { name = "predict-common" },
     { name = "pydantic" },
@@ -3028,6 +3031,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = "==0.121.2" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "mlflow", specifier = "==3.15.2" },
     { name = "predict-common", editable = "libs/predict_common" },
     { name = "pydantic", specifier = "==2.12.4" },

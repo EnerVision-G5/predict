@@ -47,9 +47,9 @@ qu'elle décrit le présent et non un historique. Voir `write_state`.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import pandas as pd
@@ -98,6 +98,18 @@ SITE_REQUIRED = ("site_id", "site_type", "site_name", "capacity_kw")
 
 DEFAULT_SITE_STATUS = "active"
 
+# Pas de la grille de `mesure` : au plus une ligne par site et par minute.
+#
+# La minute est la résolution la plus fine que la chaîne produise — c'est la
+# cadence du poller, que `collector.poll_interval_s` fixe à 60 s. Elle n'est
+# pas celle de l'historique : `GET /api/v1/readings` sert la source par pas de
+# 30 minutes (voir sa documentation), donc sur des horodatages déjà alignés à
+# la minute. Les deux points d'entrée tiennent ainsi dans la même grille sans
+# qu'aucun n'ait à connaître le pas de l'autre.
+#
+# Voir `snap_to_grid` pour ce que cette constante fait respecter.
+GRID_RESOLUTION = "1min"
+
 
 @dataclass(frozen=True)
 class WriteReport:
@@ -127,6 +139,38 @@ def to_measures(records: Iterable[dict[str, Any]]) -> pd.DataFrame:
     frame["null_reasons"] = frame["null_reasons"].map(_as_list)
     frame["data_quality"] = frame["data_quality"].map(_admitted_quality)
     return frame[list(SOURCE_COLUMNS)]
+
+
+def snap_to_grid(stamps: pd.Series) -> pd.Series:
+    """Ramène les horodatages sur la grille à la minute de `mesure`.
+
+    La table est une grille : une ligne par site et par minute, et
+    `(site_id, ts)` en est la clé. Les deux points d'entrée du collecteur y
+    écrivent, et ils ne datent pas de la même façon :
+
+    - le rattrapage lit `/readings`, que la source sert par pas de 30 minutes,
+      donc sur des horodatages déjà alignés — `13:30:00` ;
+    - le poller lit `/current`, que la source date de l'instant de l'appel —
+      `13:53:31.587801`, et l'offset change à chaque tick comme à chaque
+      redémarrage du processus.
+
+    Sans cette normalisation, une minute couverte par les DEUX routes entre en
+    base sous deux clés différentes, et `ON CONFLICT DO NOTHING` n'a alors
+    rien à arbitrer puisqu'il n'y a pas de conflit. Le recouvrement porte sur
+    les minutes `:00` et `:30` de chaque heure — les seules que `/readings`
+    sert — soit 48 doublons par jour et par site sur une journée collectée au
+    fil de l'eau puis rattrapée. Un poller redémarré deux fois dans la même
+    minute produisait de même deux lignes au lieu d'une.
+
+    Ce n'est pas réécrire une mesure. La valeur, sa qualité et ses motifs
+    d'absence traversent intacts ; seul l'instant est ramené sur la grille où
+    la table le range. L'écart absorbé est borné par la cadence du poller, que
+    `collector.poll_interval_s` fixe à la minute.
+
+    L'arrondi est vers le bas : une mesure appartient à la minute qui a
+    commencé, jamais à celle qui n'a pas encore eu lieu.
+    """
+    return stamps.dt.floor(GRID_RESOLUTION)
 
 
 def drop_unplaceable(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -203,8 +247,21 @@ def write(
     batch_size: int,
     day: date | None = None,
 ) -> WriteReport:
-    """Soumet un lot de mesures brutes et retourne ce qu'il a déposé."""
+    """Soumet un lot de mesures brutes et retourne ce qu'il a déposé.
+
+    Le calage sur la grille se fait ICI et pas dans `to_measures`, et la
+    distinction n'est pas cosmétique : la grille est une propriété de la
+    TABLE, pas de la mesure. Le poller lit l'âge de ce que la source vient de
+    servir sur l'horodatage brut — caler avant de le mesurer quantifierait ce
+    retard à la minute et ferait paraître en retard de cinquante secondes un
+    site parfaitement à l'heure.
+    """
     placeable, dropped = drop_unplaceable(frame)
+    placeable = placeable.assign(
+        **{TIMESTAMP_COLUMN: snap_to_grid(placeable[TIMESTAMP_COLUMN])}
+    )
+    # Après le calage, et pas avant : deux relevés de la même minute ne
+    # deviennent des doublons qu'une fois ramenés sur la grille.
     selected = deduplicate(placeable)
     if day is not None:
         selected = select_day(selected, day)
@@ -520,6 +577,65 @@ def read_sensor_statuses(engine: Engine) -> dict[tuple[str, str], str]:
     with engine.begin() as connection:
         rows = connection.execute(statement)
         return {(row[0], row[1]): row[2] for row in rows}
+
+
+@dataclass(frozen=True)
+class DayCoverage:
+    """Ce que la base porte pour un site et une journée."""
+
+    site_id: str
+    day: date
+    first_at: datetime
+    last_at: datetime
+
+
+def day_coverage(
+    engine: Engine,
+    site_ids: Sequence[str],
+    start: date,
+    end: date,
+) -> list[DayCoverage]:
+    """Retourne, par site et par journée, l'étendue de ce qui est déjà en base.
+
+    Le rattrapage a besoin de savoir où sont les TROUS, et non où s'arrête la
+    donnée. La différence décide de tout quand un poller tourne déjà : la
+    dernière mesure est alors « maintenant » quelle que soit l'ampleur de ce
+    qui manque derrière, et un repère de reprise ne verrait rien à combler.
+
+    Les journées sans aucune ligne n'apparaissent pas dans le résultat — c'est
+    leur absence qui les signale, et la demander à SQL coûterait une jointure
+    sur une série générée pour n'apprendre que ce que l'appelant sait déjà.
+
+    Une seule agrégation sur la fenêtre, faite au démarrage. Elle balaie les
+    journées demandées et rien d'autre : c'est `mesure.ts` qui porte le
+    partitionnement de l'hypertable.
+    """
+    day = func.date_trunc("day", mesure.c.ts)
+    statement = (
+        select(
+            mesure.c.site_id,
+            day.label("day"),
+            func.min(mesure.c.ts),
+            func.max(mesure.c.ts),
+        )
+        .where(
+            mesure.c.site_id.in_(list(site_ids)),
+            mesure.c.ts >= datetime.combine(start, time.min, tzinfo=UTC),
+            mesure.c.ts < datetime.combine(end, time.min, tzinfo=UTC)
+            + timedelta(days=1),
+        )
+        .group_by(mesure.c.site_id, day)
+    )
+    with engine.begin() as connection:
+        return [
+            DayCoverage(
+                site_id=row[0],
+                day=row[1].date() if hasattr(row[1], "date") else row[1],
+                first_at=row[2],
+                last_at=row[3],
+            )
+            for row in connection.execute(statement)
+        ]
 
 
 def to_sensor_episodes(
