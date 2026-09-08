@@ -127,14 +127,28 @@ etl:
   # deux versions coexistent sans se recouvrir et un modèle entraîné sur v1
   # reste reproductible après la sortie de v2. La changer est un acte
   # délibéré : voir services/etl/src/etl/features.py.
-  feature_version: v1
+  #
+  # Surchargeable parce que `lag_hours` l'est, et que les deux ne se
+  # dissocient pas : changer les décalages change les COLONNES publiées.
+  # Les poser sous la même version mêlerait deux schémas dans un seul
+  # chemin, et l'entraînement lirait un jeu dont la moitié des lignes n'a
+  # pas les colonnes qu'il demande — sans qu'aucune erreur ne le dise.
+  feature_version: ${ETL_FEATURE_VERSION:-v1}
   # Pas de rééchantillonnage de la série. La source produit à la minute, le
   # modèle prédit à l'heure.
   resample_rule: 1h
   # Décalages retenus comme variables explicatives : l'heure précédente porte
   # l'inertie thermique, 24 h et 168 h les saisonnalités journalière et
   # hebdomadaire des sites tertiaires.
-  lag_hours: [1, 24, 168]
+  #
+  # Surchargeable pour l'amorçage d'un déploiement neuf, et pour lui seul.
+  # Une heure n'est publiée que si TOUS ses décalages existent : tant que la
+  # collecte est plus jeune que 168 h, `lag_168h` n'a rien à désigner et la
+  # journée sort entièrement vide — la chaîne aval n'a alors rien à lire.
+  # Retirer 168 le temps que la fenêtre se remplisse produit des variables
+  # tout de suite, au prix de la saisonnalité hebdomadaire. À rétablir dès
+  # que la collecte couvre sept jours, avec un réentraînement.
+  lag_hours: ${ETL_LAG_HOURS:-1,24,168}
   # Fenêtre de la moyenne glissante, en heures.
   rolling_window_h: 24
 

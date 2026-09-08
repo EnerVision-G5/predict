@@ -128,9 +128,20 @@ class Config:
         """Retourne une liste d'entiers, en refusant une valeur seule.
 
         Une valeur seule là où une liste est attendue est presque toujours une
-        faute de frappe dans le YAML, pas une intention.
+        faute de frappe dans le YAML, pas une intention. Un entier nu reste
+        donc refusé.
+
+        Une chaîne séparée par des virgules, elle, est acceptée et découpée :
+        une valeur venue de l'environnement est TOUJOURS une chaîne, et
+        `${ETL_LAG_HOURS:-1,24,168}` ne peut pas produire une liste YAML. Sans
+        ce découpage, la liste serait la seule valeur de la configuration
+        qu'un déploiement ne pourrait pas surcharger.
         """
         value = self.get(path, default)
+        if isinstance(value, str):
+            value = [item.strip() for item in value.split(",") if item.strip()]
+            if not value:
+                raise ConfigError(f"{path} est vide : au moins un entier.")
         if not isinstance(value, Sequence) or isinstance(value, str):
             raise ConfigError(f"{path} doit porter une liste d'entiers.")
         return [_parse_number(path, item, int) for item in value]
