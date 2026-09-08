@@ -1,15 +1,3 @@
-"""Test de fumée du contrat du service d'inférence.
-
-Il vérifie que l'application se construit et que la spécification OpenAPI
-reste générable, ce qui fait de la CI un garde-fou même quand le registre
-MLflow est injoignable — cas de la CI, précisément.
-
-Il vérifie aussi que la génération n'a besoin d'aucune dépendance de
-démarrage : le module ne doit joindre ni MLflow ni le stockage à l'import,
-sinon le job `contract-drift` échouerait sur une panne d'infrastructure et
-non sur une dérive de contrat.
-"""
-
 from __future__ import annotations
 
 from fastapi.openapi.utils import get_openapi
@@ -18,7 +6,6 @@ from serving.api import CONTRACT_VERSION, app
 
 
 def spec() -> dict:
-    """Retourne la spécification telle que le script d'export la produit."""
     return app.openapi()
 
 

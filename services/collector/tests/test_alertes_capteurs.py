@@ -1,19 +1,3 @@
-"""Collecte des deux routes que `mesure` ne remplace pas.
-
-`GET /api/v1/alerts` dit ce que la source a jugé anormal, avec sa valeur et
-son seuil — rien de tout cela n'est dans une mesure, et l'alerte disparaît de
-la réponse dès qu'elle se résout. `GET /api/v1/sensors/status` dit quel
-capteur est tombé et jusqu'à quand, là où `null_reasons` ne dit que ce qui
-manquait sur une ligne.
-
-Les deux appellent des traitements opposés, et c'est le seul point qui compte
-vraiment ici : les alertes sont un journal qu'on n'écrase jamais, l'état des
-capteurs est un présent qu'on repose à chaque tick.
-
-Aucun test ne joint PostgreSQL : le SQL produit est compilé pour le dialecte
-et lu tel quel.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -63,7 +47,6 @@ CAPTEURS = {
 
 
 def compiled(statement) -> str:
-    """Rend le SQL tel que le dialecte PostgreSQL l'émettra."""
     return str(statement.compile(dialect=postgresql.dialect()))
 
 
@@ -98,11 +81,6 @@ class TestAlertes:
         assert rows == []
 
     def test_le_journal_n_ecrase_jamais(self) -> None:
-        """Le poller repasse chaque minute sur une alerte encore active.
-
-        `alert_id` est stable côté source : sans DO NOTHING, une alerte d'une
-        heure serait enregistrée soixante fois.
-        """
         sql = compiled(build_alerte_insert(to_alerts([ALERTE])))
 
         assert "ON CONFLICT" in sql
@@ -171,11 +149,6 @@ class TestEtatDesCapteurs:
         assert to_sensor_states(payload) == []
 
     def test_le_present_est_repose_et_non_empile(self) -> None:
-        """Cette table dit l'état ; les épisodes vivent dans `capteur_panne`.
-
-        Empiler ici ferait une ligne par capteur et par minute pour décrire
-        une panne que deux lignes suffisent à borner.
-        """
         sql = compiled(build_capteur_etat_upsert(to_sensor_states(CAPTEURS)))
 
         assert "ON CONFLICT" in sql
@@ -208,14 +181,6 @@ NOW = datetime(2026, 9, 4, 14, 40, tzinfo=UTC)
 
 
 class TestJournalDesPannes:
-    """Les transitions, là où la source ne sert qu'un présent.
-
-    `capteur_etat` dit l'état, ce journal dit les épisodes. Et ni l'un ni
-    l'autre ne double `mesure.null_reasons`, qui ne connaît que les pannes
-    visibles SUR une mesure : un capteur tombé puis rétabli entre deux relevés
-    n'y laisse rien.
-    """
-
     def test_sain_puis_en_panne_ouvre_un_episode(self) -> None:
         states = to_sensor_states(CAPTEURS)
         previous = {("SITE001", "temperature"): "ok"}
@@ -262,11 +227,6 @@ class TestJournalDesPannes:
         assert closed == []
 
     def test_l_ouverture_ignore_un_episode_deja_ouvert(self) -> None:
-        """Deux processus concurrents ne doivent pas en créer deux.
-
-        `DO NOTHING` sans cible : la clé naturelle n'est pas la seule
-        contrainte à protéger, l'unicité de l'épisode ouvert compte autant.
-        """
         engine = FakeEngine()
         write_sensor_episodes(engine, {}, to_sensor_states(CAPTEURS), NOW, 10)
 

@@ -1,11 +1,3 @@
-"""Client de la source : découpage des fenêtres, reprises, débit borné.
-
-Aucun test ne sort sur le réseau. Ce qui compte ici est le comportement du
-client face à ce que la source lui répond — une page pleine, une page vide,
-une coupure, un statut d'erreur — parce que c'est ce comportement, et non la
-bibliothèque HTTP, qui décide si une journée est collectée entière.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -32,7 +24,6 @@ ONE_HOUR = (
 
 
 def json_response(payload) -> httpx.Response:
-    """Réponse 200 portant le corps demandé."""
     return httpx.Response(200, json=payload)
 
 
@@ -249,8 +240,6 @@ def test_settings_read_the_configuration_blocks() -> None:
 
 
 class TestRateLimiter:
-    """La limite protège la source, pas le collecteur."""
-
     def test_a_null_rate_never_waits(self) -> None:
         delays: list[float] = []
         limiter = RateLimiter(0.0, sleep=delays.append, clock=lambda: 0.0)
@@ -273,8 +262,6 @@ class TestRateLimiter:
 
 
 class TestSimulateSpike:
-    """La seule route en écriture de la source, et la seule qu'on ne rejoue pas."""
-
     def test_le_pic_est_demande_en_post_avec_la_duree(self, make_client) -> None:
         seen: list[httpx.Request] = []
 
@@ -303,7 +290,6 @@ class TestSimulateSpike:
         assert calls == []
 
     def test_un_echec_n_est_jamais_rejoue(self, make_client) -> None:
-        """Rejouer un POST déclencherait un second pic par-dessus le premier."""
         calls: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -322,8 +308,6 @@ class TestSimulateSpike:
 
 
 class TestAlertesEtCapteurs:
-    """Les deux lectures annexes : ce que `mesure` ne peut pas dire."""
-
     def test_les_alertes_sont_rendues_telles_que_la_source_les_sert(
         self, make_client
     ) -> None:

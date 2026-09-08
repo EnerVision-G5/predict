@@ -1,16 +1,3 @@
-"""Relecture du registre : ce qu'une version aliasée a enregistré.
-
-Le reste de `tracking` est un effet de bord — écrire un run, poser un alias —
-et se vérifie par une exécution réelle. Ce qui se teste ici sans serveur, c'est
-la lecture : la promotion s'appuie dessus pour opposer un candidat au champion,
-et une lecture qui rendrait les métriques sans les paramètres priverait la
-règle de la fenêtre sur laquelle elle tranche.
-
-Le client MLflow est remplacé par un double. Ce qui compte n'est pas que MLflow
-réponde — c'est son métier — mais que les deux moitiés d'un même run soient
-lues d'un seul geste, et que l'alias soit résolu avant le run et non l'inverse.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -26,36 +13,23 @@ PARAMS = {"arbitrage_window": "2026-08-01/2026-08-14"}
 
 @dataclass
 class FakeRun:
-    """Run réduit à ce que la relecture en tire."""
-
     data: Any
 
 
 @dataclass
 class FakeData:
-    """Les deux moitiés d'un run, métriques et paramètres."""
-
     metrics: dict[str, float]
     params: dict[str, str]
 
 
 @dataclass
 class FakeVersion:
-    """Version du registre, telle que l'alias ou le numéro la désigne."""
-
     version: str
     run_id: str
 
 
 @dataclass
 class FakeClient:
-    """Client MLflow qui mémorise ce qu'on lui a demandé.
-
-    Les appels sont mémorisés parce que leur ordre porte une garantie :
-    l'alias doit être résolu d'abord, sinon on lirait le run d'une version que
-    l'alias ne désigne plus.
-    """
-
     calls: list[tuple[str, str]] = field(default_factory=list)
 
     def get_model_version_by_alias(self, name: str, alias: str) -> FakeVersion:
@@ -73,15 +47,12 @@ class FakeClient:
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
-    """Remplace le client MLflow par le double, pour la durée du test."""
     double = FakeClient()
     monkeypatch.setattr(tracking.mlflow, "MlflowClient", lambda: double)
     return double
 
 
 class TestAliasSnapshot:
-    """La référence de la surveillance et de l'arbitrage."""
-
     def test_both_halves_of_the_run_are_read(self, client: FakeClient) -> None:
         snapshot = tracking.alias_snapshot("enervision_xgboost", "champion")
         assert snapshot.metrics == METRICS

@@ -1,22 +1,3 @@
-"""Miroir de la promotion dans `modele` : ce que l'inscription garantit.
-
-Aucun test ne joint PostgreSQL. Quatre garanties comptent ici.
-
-La version promue est inscrite active, et une version déjà connue est reposée
-plutôt que dupliquée : un retour arrière reprend une version qui est déjà dans
-la table, avec `actif` à faux.
-
-Les autres versions du même modèle sont éteintes, et elles seules. Deux
-modèles distincts ont chacun leur version en service.
-
-Les deux instructions partent dans une seule transaction : séparées, elles
-laisseraient une fenêtre où deux versions sont actives, ou aucune.
-
-Et la date inscrite est celle du run, pas celle de la promotion : promouvoir
-six semaines plus tard une version déjà entraînée ne change pas quand elle a
-appris.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -37,12 +18,10 @@ TRAINED_AT = datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
 
 
 def compile_statement(statement: object) -> str:
-    """Rend l'instruction telle que PostgreSQL la recevrait."""
     return str(statement.compile(dialect=postgresql.dialect()))
 
 
 def compiled_upsert(version: str = "3") -> str:
-    """Rend l'inscription d'une version promue, telle qu'elle part en base."""
     record = to_record(MODEL, version, RUN_ID, TRAINED_AT)
     return compile_statement(build_upsert(record))
 

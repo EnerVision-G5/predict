@@ -1,48 +1,10 @@
-"""Écriture de la couche brute : la réponse de la source, dans `mesure`.
-
-Ce module ne transforme rien. Il ne comble aucun trou et ne juge aucune
-valeur : une consommation nulle reste nulle, avec ses motifs. C'est ce qui
-permet de relire une ligne des mois plus tard et de la comparer à ce que l'API
-a servi, sans avoir à rejouer l'ETL et sans se demander laquelle des deux
-étapes a écrit quoi.
-
-Deux choses seulement lui sont faites, et aucune ne touche à la mesure.
-
-Le renommage `timestamp` → `ts`, parce que la table s'appelle ainsi. C'est la
-seule frontière de renommage de la chaîne, et elle est traversée une fois.
-
-La mise en conformité avec les contraintes de la table. `null_reasons` est
-`TEXT[] NOT NULL` : l'absence de motif s'y écrit par une liste vide, pas par un
-NULL. `data_quality` est `NOT NULL DEFAULT 'good'` avec un CHECK sur quatre
-valeurs : le schéma figé ne sait pas dire « non qualifiée ».
-
-Ce dernier point mérite d'être dit franchement, parce qu'il heurte la règle du
-projet. Quand la source se tait ou envoie une valeur hors CHECK, le collecteur
-écrit `good` — le défaut de la colonne — alors que rien ne l'atteste. C'est un
-mensonge borné dans le temps : l'ETL repose la qualification à son passage, à
-partir de ce que les données montrent, et un `good` sur une puissance absente
-redevient `critical`. Entre les deux, une mesure non encore transformée
-n'apparaît pas dans `idx_mesure_quality`. Les deux alternatives étaient pires :
-refuser la mesure jetterait la panne qu'on cherche justement à garder, et un
-NULL serait rejeté par la base.
-
-L'écriture n'écrase jamais. Un `ON CONFLICT DO NOTHING` sur (site_id, ts) rend
-le rejeu d'une journée sans effet de bord, et surtout : il empêche une
-recollecte de recouvrir les colonnes que l'ETL a déduites depuis. Relancer le
-collecteur sur une journée déjà transformée ne défait donc pas la
-transformation.
-
-Une seconde table est écrite ici, et une seule chose la distingue : son contenu
-ne vient pas de la source. `ingestion_etat` dit ce que le collecteur a fait,
-site par site, et c'est la seule chose que `mesure` ne saura jamais dire. Un
-capteur mort y dépose quand même une ligne — nulle, avec ses motifs — donc
-`max(inserted_at)` avance ; un poller arrêté ou une source en 500 n'en dépose
-aucune, et `max(inserted_at)` se fige exactement comme si le site avait cessé
-d'exister. C'est la panne la plus grave, et c'était la plus discrète.
-
-Sa politique d'écriture est l'inverse de celle des mesures : `DO UPDATE`, parce
-qu'elle décrit le présent et non un historique. Voir `write_state`.
-"""
+# **********************************************************************
+# * Nom     : sink.py                                                  *
+# * Type    : Module                                                   *
+# * Sujet   : Écriture de tout ce que le collecteur dépose : mesures,  *
+# *   états, alertes, capteurs, sites                                  *
+# * Service : collector                                                *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -87,22 +49,27 @@ from predict_common.timestamps import (
     to_utc,
 )
 
+# Qualification retenue quand la source n'en déclare aucune.
 UNQUALIFIED = QUALITY_GOOD
 
 logger = logging.getLogger(__name__)
 
 
+# Champs sans lesquels un site n'est pas synchronisable.
 SITE_REQUIRED = ("site_id", "site_type", "site_name", "capacity_kw")
 
+# Statut posé sur un site que la source ne qualifie pas.
 DEFAULT_SITE_STATUS = "active"
 
+# Pas sur lequel les horodatages sont alignés avant écriture.
 GRID_RESOLUTION = "1min"
 
 
 @dataclass(frozen=True)
 class WriteReport:
-    """Ce qu'une écriture a réellement soumis, et ce qu'elle a écarté."""
-
+    """Classe : WriteReport
+    Description : Bilan d'une écriture : lignes soumises et lignes écartées.
+    """
     rows: int
     dropped: int = 0
 
@@ -111,15 +78,9 @@ def to_measures(
     records: Iterable[dict[str, Any]],
     naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> pd.DataFrame:
-    """Construit le tableau de mesures correspondant à ce que la source a servi.
-
-    Le tableau retourné porte toujours les colonnes de `SOURCE_COLUMNS`, même
-    pour un lot vide : l'appelant n'a pas de cas dégénéré à traiter.
-
-    `naive_timezone` est le fuseau prêté aux horodatages que la source envoie
-    sans le leur, et à eux seuls — voir `predict_common.timestamps`. Sa valeur par
-    défaut ne déplace rien : c'est l'appelant qui sait de quelle source il
-    lit, et la configuration qui le lui dit.
+    """Méthode : to_measures
+    Description : Transforme les mesures de la source en tableau de la couche
+      brute.
     """
     rows = [_rename(record) for record in records]
     frame = pd.DataFrame(rows, columns=list(SOURCE_COLUMNS))
@@ -133,55 +94,24 @@ def to_measures(
 
 
 def snap_to_grid(stamps: pd.Series) -> pd.Series:
-    """Ramène les horodatages sur la grille à la minute de `mesure`.
-
-    La table est une grille : une ligne par site et par minute, et
-    `(site_id, ts)` en est la clé. Les deux points d'entrée du collecteur y
-    écrivent, et ils ne datent pas de la même façon :
-
-    - le rattrapage lit `/readings`, que la source sert par pas de 30 minutes,
-      donc sur des horodatages déjà alignés — `13:30:00` ;
-    - le poller lit `/current`, que la source date de l'instant de l'appel —
-      `13:53:31.587801`, et l'offset change à chaque tick comme à chaque
-      redémarrage du processus.
-
-    Sans cette normalisation, une minute couverte par les DEUX routes entre en
-    base sous deux clés différentes, et `ON CONFLICT DO NOTHING` n'a alors
-    rien à arbitrer puisqu'il n'y a pas de conflit. Le recouvrement porte sur
-    les minutes `:00` et `:30` de chaque heure — les seules que `/readings`
-    sert — soit 48 doublons par jour et par site sur une journée collectée au
-    fil de l'eau puis rattrapée. Un poller redémarré deux fois dans la même
-    minute produisait de même deux lignes au lieu d'une.
-
-    Ce n'est pas réécrire une mesure. La valeur, sa qualité et ses motifs
-    d'absence traversent intacts ; seul l'instant est ramené sur la grille où
-    la table le range. L'écart absorbé est borné par la cadence du poller, que
-    `collector.poll_interval_s` fixe à la minute.
-
-    L'arrondi est vers le bas : une mesure appartient à la minute qui a
-    commencé, jamais à celle qui n'a pas encore eu lieu.
+    """Méthode : snap_to_grid
+    Description : Aligne les horodatages sur le pas de la grille.
     """
     return stamps.dt.floor(GRID_RESOLUTION)
 
 
 def drop_unplaceable(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Écarte les lignes qu'aucune clé primaire ne pourrait identifier.
-
-    (site_id, ts) est la clé de `mesure` : sans l'un des deux, la ligne serait
-    refusée par la base sans que rien ne dise laquelle du lot est fautive.
-    Elle est comptée et journalisée ici, pas perdue en silence.
+    """Méthode : drop_unplaceable
+    Description : Écarte les mesures sans instant ni site, qu'aucune clé ne
+      place.
     """
     placeable = frame[frame[TIMESTAMP_COLUMN].notna() & frame[SITE_COLUMN].notna()]
     return placeable.reset_index(drop=True), len(frame) - len(placeable)
 
 
 def deduplicate(frame: pd.DataFrame) -> pd.DataFrame:
-    """Ne garde qu'une ligne par clé, la dernière.
-
-    Un lot qui porterait deux fois la même clé ferait échouer l'insertion
-    entière : `ON CONFLICT` arbitre entre le lot et la table, pas à
-    l'intérieur d'un même lot. La dernière occurrence gagne, elle correspond à
-    la relecture la plus récente de la source.
+    """Méthode : deduplicate
+    Description : Ne garde qu'une mesure par site et par instant.
     """
     return frame.drop_duplicates(
         subset=[SITE_COLUMN, TIMESTAMP_COLUMN], keep="last"
@@ -189,12 +119,8 @@ def deduplicate(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def select_day(frame: pd.DataFrame, day: date) -> pd.DataFrame:
-    """Ne garde que les mesures du jour collecté.
-
-    Une fenêtre demandée à la source déborde couramment d'un jour sur l'autre,
-    par arrondi ou par fuseau. Écrire ce débord en croyant collecter une
-    journée fausserait le compte rendu du run, seul moyen de savoir si la
-    journée est complète.
+    """Méthode : select_day
+    Description : Ne garde que les mesures d'une journée donnée.
     """
     if frame.empty:
         return frame
@@ -202,17 +128,17 @@ def select_day(frame: pd.DataFrame, day: date) -> pd.DataFrame:
 
 
 def validate(frame: pd.DataFrame) -> pd.DataFrame:
-    """Vérifie le contrat de la couche brute avant de soumettre le lot.
-
-    La validation est faite par le producteur, à l'écriture : une mesure qui
-    casse le contrat ne doit pas entrer dans la table. L'ETL la refera à la
-    lecture, et ce n'est pas une redite — voir `predict_common.schemas`.
+    """Méthode : validate
+    Description : Vérifie le lot contre le contrat de la couche brute.
     """
     return MEASURE_SCHEMA.validate(frame, lazy=True)
 
 
 def to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
-    """Convertit le tableau en lignes acceptables par SQLAlchemy."""
+    """Méthode : to_records
+    Description : Projette le tableau sur les colonnes de la source pour
+      l'écriture.
+    """
     projected = frame[list(SOURCE_COLUMNS)]
     return [
         {key: _to_sql_value(value) for key, value in row.items()}
@@ -221,11 +147,9 @@ def to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 def build_insert(records: list[dict[str, Any]]) -> Any:
-    """Construit l'insertion de mesures brutes, qui n'écrase jamais.
-
-    `DO NOTHING` et non `DO UPDATE` : la ligne présente peut déjà porter les
-    colonnes que l'ETL a déduites, et une recollecte n'a aucune raison de les
-    effacer. La source ne réécrit pas le passé, elle le confirme.
+    """Méthode : build_insert
+    Description : Construit l'insertion qui ne touche jamais une mesure déjà
+      écrite.
     """
     return insert(mesure).values(records).on_conflict_do_nothing(
         index_elements=list(CONFLICT_KEY)
@@ -238,14 +162,8 @@ def write(
     batch_size: int,
     day: date | None = None,
 ) -> WriteReport:
-    """Soumet un lot de mesures brutes et retourne ce qu'il a déposé.
-
-    Le calage sur la grille se fait ICI et pas dans `to_measures`, et la
-    distinction n'est pas cosmétique : la grille est une propriété de la
-    TABLE, pas de la mesure. Le poller lit l'âge de ce que la source vient de
-    servir sur l'horodatage brut — caler avant de le mesurer quantifierait ce
-    retard à la minute et ferait paraître en retard de cinquante secondes un
-    site parfaitement à l'heure.
+    """Méthode : write
+    Description : Nettoie puis insère un lot de mesures, et rend son bilan.
     """
     placeable, dropped = drop_unplaceable(frame)
     placeable = placeable.assign(
@@ -264,15 +182,9 @@ def write(
 
 @dataclass(frozen=True)
 class IngestionState:
-    """Ce qu'un essai de collecte a donné pour un site.
-
-    `error` porte le verdict : rempli, l'essai a échoué. Les deux cas ne
-    s'écrivent pas de la même façon — un échec ne doit toucher ni la date du
-    dernier succès, ni le nombre de lignes, ni le retard mesuré, qui décrivent
-    tous le dernier essai *abouti* et restent la seule chose vraie qu'on
-    sache du site.
+    """Classe : IngestionState
+    Description : Ce qu'un site a donné lors d'une tentative de collecte.
     """
-
     site_id: str
     attempted_at: datetime
     rows: int = 0
@@ -281,6 +193,9 @@ class IngestionState:
 
     @property
     def succeeded(self) -> bool:
+        """Méthode : succeeded
+        Description : Dit si la tentative s'est terminée sans erreur.
+        """
         return self.error is None
 
 
@@ -288,12 +203,8 @@ def to_success_states(
     states: Iterable[IngestionState],
     source: str,
 ) -> list[dict[str, Any]]:
-    """Projette les essais aboutis vers les colonnes de `ingestion_etat`.
-
-    `last_error` n'y figure pas : la cause du dernier échec est conservée
-    après un succès. Savoir de quoi un site relève a une valeur, et l'effacer
-    au premier tick réussi ferait disparaître la panne au moment précis où
-    quelqu'un vient la regarder.
+    """Méthode : to_success_states
+    Description : Traduit les tentatives réussies en lignes d'ingestion_etat.
     """
     return [
         {
@@ -314,12 +225,8 @@ def to_failure_states(
     states: Iterable[IngestionState],
     source: str,
 ) -> list[dict[str, Any]]:
-    """Projette les essais en échec vers les colonnes de `ingestion_etat`.
-
-    Trois colonnes sont volontairement absentes — `last_success_at`,
-    `last_rows`, `last_data_lag_s`. Un échec n'a rien à en dire, et les poser
-    à zéro ou à NULL effacerait ce que le dernier succès avait établi. Sur une
-    première insertion, ce sont les DEFAULT de la table qui s'appliquent.
+    """Méthode : to_failure_states
+    Description : Traduit les tentatives échouées en lignes d'ingestion_etat.
     """
     return [
         {
@@ -335,11 +242,8 @@ def to_failure_states(
 
 
 def build_state_success_upsert(records: list[dict[str, Any]]) -> Any:
-    """Construit la mise à jour d'état d'un essai abouti.
-
-    `DO UPDATE` et non `DO NOTHING` : la table décrit le présent, pas un
-    historique. Une ligne existe déjà pour chaque site dès le deuxième tick,
-    et ne rien faire figerait l'état au premier.
+    """Méthode : build_state_success_upsert
+    Description : Écrit un état de réussite et remet le compte d'échecs à zéro.
     """
     statement = insert(ingestion_etat).values(records)
     return statement.on_conflict_do_update(
@@ -356,13 +260,8 @@ def build_state_success_upsert(records: list[dict[str, Any]]) -> Any:
 
 
 def build_state_failure_upsert(records: list[dict[str, Any]]) -> Any:
-    """Construit la mise à jour d'état d'un essai en échec.
-
-    Le compteur est incrémenté depuis la valeur en base et non depuis le lot :
-    c'est le seul endroit qui sache combien d'essais ont déjà échoué, et le
-    calculer côté processus donnerait un compte remis à un à chaque
-    redémarrage du conteneur — c'est-à-dire précisément quand la panne est la
-    plus probable.
+    """Méthode : build_state_failure_upsert
+    Description : Écrit un état d'échec et incrémente le compte consécutif.
     """
     statement = insert(ingestion_etat).values(records)
     return statement.on_conflict_do_update(
@@ -382,12 +281,9 @@ def write_state(
     batch_size: int,
     source: str,
 ) -> int:
-    """Repose l'état de collecte des sites et retourne le nombre de lignes.
-
-    Deux instructions et non une : succès et échecs ne posent pas les mêmes
-    colonnes, et un lot mixte devrait choisir une forme pour les deux. Elles
-    partagent la transaction de `write_batches`, si bien qu'un tick est
-    enregistré en entier ou pas du tout.
+    """Méthode : write_state
+    Description : Repose l'état d'ingestion des sites, réussites et échecs
+      séparés.
     """
     collected = list(states)
     rows = write_batches(
@@ -405,8 +301,10 @@ def write_state(
     return rows
 
 
+# Champs sans lesquels une alerte n'est pas exploitable.
 ALERTE_REQUIRED = ("alert_id", "site_id", "timestamp", "severity", "type", "message")
 
+# Capteurs dont l'état est suivi, site par site.
 CAPTEURS = ("consumption", "electrical", "temperature", "humidity", "network")
 
 
@@ -414,15 +312,9 @@ def to_alerts(
     records: Iterable[dict[str, Any]],
     naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> list[dict[str, Any]]:
-    """Traduit les alertes de la source vers les colonnes de `alerte`.
-
-    `type` devient `type_alerte` : le mot est trop générique pour une colonne,
-    et la traduction est portée ici une fois plutôt que dans chaque requête.
-
-    Les alertes ne sont pas mieux datées que les mesures — la source y sert
-    aussi des horodatages nus — et `alerte.ts` est un `timestamptz` : écrire
-    un horodatage sans fuseau y ferait dépendre la date d'une alerte du
-    réglage de la session qui l'insère.
+    """Méthode : to_alerts
+    Description : Traduit les alertes de la source en lignes, incomplètes
+      écartées.
     """
     rows: list[dict[str, Any]] = []
     for record in records:
@@ -454,13 +346,8 @@ def to_alerts(
 
 
 def build_alerte_insert(records: list[dict[str, Any]]) -> Any:
-    """Construit l'insertion idempotente d'un lot d'alertes.
-
-    `DO NOTHING` : le poller repasse toutes les minutes sur des alertes encore
-    actives, et `alert_id` est stable côté source. Une alerte d'une heure
-    serait sinon enregistrée soixante fois. Et `DO NOTHING` plutôt que
-    `DO UPDATE` parce qu'une alerte ne change pas : elle est déclenchée, elle
-    ne se corrige pas.
+    """Méthode : build_alerte_insert
+    Description : Construit l'insertion idempotente d'un lot d'alertes.
     """
     return (
         insert(alerte)
@@ -475,7 +362,9 @@ def write_alerts(
     batch_size: int,
     naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> int:
-    """Journalise les alertes actives et retourne le nombre de lignes neuves."""
+    """Méthode : write_alerts
+    Description : Écrit les alertes actives servies par la source.
+    """
     rows = to_alerts(records, naive_timezone)
     written = write_batches(engine, rows, batch_size, build_alerte_insert)
     logger.info("alertes : %d ligne(s) soumise(s)", written)
@@ -486,11 +375,9 @@ def to_sensor_states(
     payload: dict[str, Any],
     naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> list[dict[str, Any]]:
-    """Met à plat l'état des capteurs, un enregistrement par couple site/capteur.
-
-    La source indexe par site et imbrique les capteurs. La table, elle, est
-    plate : c'est la seule forme qui permet de demander « quels capteurs sont
-    tombés » sans déplier un JSON en SQL.
+    """Méthode : to_sensor_states
+    Description : Traduit l'état des capteurs en une ligne par site et par
+      capteur.
     """
     rows: list[dict[str, Any]] = []
     for site_id, description in payload.items():
@@ -521,11 +408,8 @@ def to_sensor_states(
 
 
 def build_capteur_etat_upsert(records: list[dict[str, Any]]) -> Any:
-    """Construit la mise à jour de l'état des capteurs.
-
-    `DO UPDATE`, contrairement aux alertes : cette table décrit le présent.
-    L'historique des pannes vit dans `mesure.null_reasons`, une ligne par
-    minute avec sa cause ; le rejouer ici en ferait une seconde vérité.
+    """Méthode : build_capteur_etat_upsert
+    Description : Écrit l'état courant d'un capteur en l'horodatant.
     """
     statement = insert(capteur_etat).values(records)
     updated = {
@@ -545,23 +429,23 @@ def write_sensor_states(
     batch_size: int,
     naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> int:
-    """Repose l'état des capteurs et retourne le nombre de lignes."""
+    """Méthode : write_sensor_states
+    Description : Repose l'état courant de tous les capteurs.
+    """
     rows = to_sensor_states(payload, naive_timezone)
     written = write_batches(engine, rows, batch_size, build_capteur_etat_upsert)
     logger.info("capteurs : %d état(s) reposé(s)", written)
     return written
 
 
+# Statut d'un capteur en panne, tel que la source le nomme.
 SENSOR_FAILING = "failing"
 
 
 def read_sensor_statuses(engine: Engine) -> dict[tuple[str, str], str]:
-    """Lit l'état des capteurs déjà en base, indexé par (site, capteur).
-
-    C'est la seule lecture de tout le collecteur, et elle a une raison : la
-    source dit `failing` ou `ok` au présent, jamais depuis quand. Sans l'état
-    précédent, aucune transition n'est détectable, et un capteur en panne
-    depuis trois jours ouvrirait un épisode à chaque tick.
+    """Méthode : read_sensor_statuses
+    Description : Relit l'état connu des capteurs, pour détecter les
+      changements.
     """
     statement = select(
         capteur_etat.c.site_id, capteur_etat.c.capteur, capteur_etat.c.statut
@@ -573,8 +457,9 @@ def read_sensor_statuses(engine: Engine) -> dict[tuple[str, str], str]:
 
 @dataclass(frozen=True)
 class DayCoverage:
-    """Ce que la base porte pour un site et une journée."""
-
+    """Classe : DayCoverage
+    Description : Ce qu'une journée porte réellement en base, pour un site.
+    """
     site_id: str
     day: date
     first_at: datetime
@@ -587,20 +472,9 @@ def day_coverage(
     start: date,
     end: date,
 ) -> list[DayCoverage]:
-    """Retourne, par site et par journée, l'étendue de ce qui est déjà en base.
-
-    Le rattrapage a besoin de savoir où sont les TROUS, et non où s'arrête la
-    donnée. La différence décide de tout quand un poller tourne déjà : la
-    dernière mesure est alors « maintenant » quelle que soit l'ampleur de ce
-    qui manque derrière, et un repère de reprise ne verrait rien à combler.
-
-    Les journées sans aucune ligne n'apparaissent pas dans le résultat — c'est
-    leur absence qui les signale, et la demander à SQL coûterait une jointure
-    sur une série générée pour n'apprendre que ce que l'appelant sait déjà.
-
-    Une seule agrégation sur la fenêtre, faite au démarrage. Elle balaie les
-    journées demandées et rien d'autre : c'est `mesure.ts` qui porte le
-    partitionnement de l'hypertable.
+    """Méthode : day_coverage
+    Description : Interroge la base sur ce que chaque journée couvre
+      réellement.
     """
     day = func.date_trunc("day", mesure.c.ts)
     statement = (
@@ -635,18 +509,9 @@ def to_sensor_episodes(
     states: list[dict[str, Any]],
     now: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Retourne les épisodes à ouvrir et ceux à clore, sans toucher à la base.
-
-    Fonction pure, et c'est délibéré : toute la difficulté est ici, dans la
-    lecture des transitions, et elle s'éprouve sans moteur.
-
-    Quatre cas, trois conduites. Sain puis en panne ouvre un épisode. En panne
-    puis en panne le prolonge — seule `failing_until` bouge, la source pouvant
-    repousser sa date de rétablissement. En panne puis sain le clot. Sain puis
-    sain ne dit rien.
-
-    Un capteur inconnu de `capteur_etat` compte comme sain : c'est le premier
-    tick sur ce site, et sa panne éventuelle est bien un début.
+    """Méthode : to_sensor_episodes
+    Description : Compare l'état connu au nouveau et en déduit les pannes
+      ouvertes ou closes.
     """
     opened: list[dict[str, Any]] = []
     closed: list[dict[str, Any]] = []
@@ -670,11 +535,8 @@ def to_sensor_episodes(
 
 
 def build_panne_insert(records: list[dict[str, Any]]) -> Any:
-    """Construit l'ouverture idempotente d'un lot d'épisodes.
-
-    `DO NOTHING` sans cible : la clé naturelle n'est pas la seule contrainte à
-    protéger. Un épisode déjà ouvert sur le même capteur doit être ignoré lui
-    aussi, faute de quoi deux processus concurrents en créeraient deux.
+    """Méthode : build_panne_insert
+    Description : Construit l'ouverture idempotente d'une panne capteur.
     """
     return insert(capteur_panne).values(records).on_conflict_do_nothing()
 
@@ -686,11 +548,8 @@ def write_sensor_episodes(
     now: datetime,
     batch_size: int,
 ) -> tuple[int, int]:
-    """Ouvre et clot les épisodes de panne, et retourne les deux comptes.
-
-    Les deux écritures partagent une transaction avec l'état courant, plus
-    haut dans le tick : un épisode ouvert sans que `capteur_etat` le suive
-    serait rouvert au tick suivant.
+    """Méthode : write_sensor_episodes
+    Description : Ouvre les pannes nouvelles et ferme celles qui ont cessé.
     """
     opened, closed = to_sensor_episodes(previous, states, now)
     written = write_batches(engine, opened, batch_size, build_panne_insert)
@@ -714,12 +573,9 @@ def write_sensor_episodes(
 
 
 def to_sites(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Retient les sites que la table `site` peut accueillir.
-
-    Trois de ses colonnes sont NOT NULL sans défaut : un site que la source
-    décrirait à moitié serait rejeté, et avec lui le lot entier. Il est donc
-    écarté ici plutôt que soumis — le seed en a déjà posé une version
-    placeholder, qui vaut mieux qu'une insertion en échec.
+    """Méthode : to_sites
+    Description : Traduit le référentiel de la source en lignes, incomplètes
+      écartées.
     """
     complete: list[dict[str, Any]] = []
     for record in records:
@@ -743,12 +599,8 @@ def to_sites(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def build_site_upsert(records: list[dict[str, Any]]) -> Any:
-    """Construit la mise à jour du référentiel, qui écrase celle du seed.
-
-    `DO UPDATE` et non `DO NOTHING`, contrairement aux mesures : le seed pose
-    des capacités marquées « à synchroniser », et c'est précisément le rôle de
-    cette écriture de les remplacer. Le référentiel n'est pas un historique,
-    il décrit ce que les sites sont aujourd'hui.
+    """Méthode : build_site_upsert
+    Description : Écrit un site en réécrivant sa description à chaque passage.
     """
     statement = insert(site).values(records)
     return statement.on_conflict_do_update(
@@ -766,12 +618,8 @@ def sync_sites(
     records: Iterable[dict[str, Any]],
     batch_size: int,
 ) -> int:
-    """Met le référentiel à jour avant toute écriture de mesure.
-
-    Avant, et jamais après : `mesure.site_id` référence `site`, et une mesure
-    d'un site absent du référentiel est rejetée par la base quelle que soit sa
-    qualité. Sans cette étape, un huitième site apparu chez la source ferait
-    échouer chaque collecte sans que rien n'explique pourquoi.
+    """Méthode : sync_sites
+    Description : Synchronise le référentiel des sites depuis la source.
     """
     sites = to_sites(records)
     written = write_batches(engine, sites, batch_size, build_site_upsert)
@@ -780,7 +628,9 @@ def sync_sites(
 
 
 def _rename(record: dict[str, Any]) -> dict[str, Any]:
-    """Traduit le champ d'horodatage de la source vers celui de la table."""
+    """Méthode : _rename
+    Description : Renomme l'horodatage de la source vers celui de la chaîne.
+    """
     renamed = dict(record)
     if SOURCE_TIMESTAMP_COLUMN in renamed:
         renamed[TIMESTAMP_COLUMN] = renamed.pop(SOURCE_TIMESTAMP_COLUMN)
@@ -788,7 +638,9 @@ def _rename(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _clean_site_id(value: Any) -> Any:
-    """Ramène un identifiant de site à une chaîne, ou à rien."""
+    """Méthode : _clean_site_id
+    Description : Ramène un identifiant de site vide ou absent à None.
+    """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     text = str(value).strip()
@@ -796,10 +648,8 @@ def _clean_site_id(value: Any) -> Any:
 
 
 def _as_list(value: Any) -> list[str]:
-    """Ramène `null_reasons` au TEXT[] NOT NULL attendu par la table.
-
-    La source écrit tantôt une liste, tantôt rien, tantôt un motif seul. Les
-    trois formes disent la même chose, et une seule doit entrer en base.
+    """Méthode : _as_list
+    Description : Ramène une valeur à une liste de chaînes.
     """
     if isinstance(value, (list, tuple)):
         return [str(item) for item in value]
@@ -809,12 +659,9 @@ def _as_list(value: Any) -> list[str]:
 
 
 def _admitted_quality(value: Any) -> str:
-    """Ne laisse passer qu'une valeur que le CHECK de la colonne accepte.
-
-    Une qualification inconnue retombe sur le défaut de la colonne, faute de
-    pouvoir dire « non qualifiée » dans le schéma figé. La soumettre telle
-    quelle ferait échouer l'insertion du lot entier, et un NULL serait rejeté.
-    L'ETL la reposera de toute façon.
+    """Méthode : _admitted_quality
+    Description : N'accepte qu'une qualification connue, sinon retombe sur le
+      défaut.
     """
     if value in DATA_QUALITY_VALUES:
         return str(value)
@@ -822,11 +669,8 @@ def _admitted_quality(value: Any) -> str:
 
 
 def _to_sql_value(value: Any) -> Any:
-    """Ramène les manquants pandas (NaN, NaT) au NULL attendu par la base.
-
-    Sans cette conversion, le driver écrirait un NaN flottant dans une colonne
-    NUMERIC, ce que PostgreSQL accepte et qui pollue silencieusement les
-    agrégats en aval.
+    """Méthode : _to_sql_value
+    Description : Ramène les manquants pandas au NULL attendu par la base.
     """
     if isinstance(value, (list, tuple)):
         return [str(item) for item in value]

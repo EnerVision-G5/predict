@@ -1,12 +1,3 @@
-"""Collecte continue : cadence, tolérance aux pannes, journal du retard.
-
-Le poller est un processus long. Ce qui compte n'est donc pas seulement qu'il
-collecte, mais qu'il survive — à un site injoignable, à un tick qui déborde de
-la cadence, à un arrêt demandé au milieu d'une attente. Chaque test ci-dessous
-porte sur l'une de ces trois situations, et aucun n'attend réellement : la
-cadence et l'horloge sont injectées.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -40,14 +31,11 @@ NOW = datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
 
 @pytest.fixture
 def poll_settings() -> PollSettings:
-    """Réglages d'une boucle dont la cadence est injectée, jamais attendue."""
     return PollSettings(interval_s=60.0, lag_warning_s=180.0, batch_size=10)
 
 
 @pytest.fixture
 def make_context(poll_settings, make_client):
-    """Fabrique un contexte de boucle branché sur une source simulée."""
-
     def build(handler, engine: FakeEngine | None = None) -> PollContext:
         return PollContext(
             settings=poll_settings,
@@ -60,14 +48,11 @@ def make_context(poll_settings, make_client):
 
 
 def current(make_reading, **overrides):
-    """Gestionnaire qui sert une mesure courante."""
     reading = make_reading("2026-09-02T07:59:50Z", **overrides)
     return lambda _: httpx.Response(200, json=reading)
 
 
 class TestSchedule:
-    """La cadence est ancrée sur des instants absolus."""
-
     def test_a_tick_on_time_advances_by_one_interval(self) -> None:
         schedule = Schedule(interval_s=60.0, due_at=NOW)
         schedule.advance(NOW + timedelta(seconds=1))
@@ -87,8 +72,6 @@ class TestSchedule:
 
 
 class TestLag:
-    """Le retard de données mesure l'âge de ce que sert la source."""
-
     def test_the_lag_is_the_age_of_the_oldest_measure(self, make_reading) -> None:
         frame = to_measures([make_reading("2026-09-02T07:59:50Z")])
         assert ingestion_lag_s(frame, NOW) == pytest.approx(10.0)
@@ -288,16 +271,8 @@ def test_a_batch_the_source_cannot_place_is_not_written(
 
 
 class TestIngestionState:
-    """Ce que le tick repose en base, et que `mesure` ne peut pas dire.
-
-    Un site en échec n'écrit aucune mesure. Sans cette table, il serait
-    indiscernable d'un site dont la source n'avait rien de neuf — et c'est
-    justement la panne qu'on cherche à voir.
-    """
-
     @staticmethod
     def _state_statements(engine: FakeEngine) -> list[str]:
-        """Rend les instructions visant `ingestion_etat`, compilées."""
         from sqlalchemy.dialects import postgresql
 
         compiled = [

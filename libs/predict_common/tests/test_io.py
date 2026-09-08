@@ -1,12 +1,3 @@
-"""Écriture et lecture des partitions parquet.
-
-La propriété testée ici porte toute l'exploitation de la chaîne : l'écriture
-d'une journée remplace la journée. C'est ce qui rend un rejeu après incident
-sans effet de bord, et le rejeu est le mode d'exploitation normal. Un mode qui
-ajouterait rendrait le résultat dépendant du nombre de fois qu'on a lancé la
-commande, ce qu'aucun compte en aval ne saurait rattraper.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -27,12 +18,10 @@ SCHEMA = pyarrow.schema(
 
 
 def frame(*values: float, site_id: str = "SITE001") -> pd.DataFrame:
-    """Construit un lot minimal au schéma des tests."""
     return pd.DataFrame({"site_id": [site_id] * len(values), "valeur": list(values)})
 
 
 def partition(tmp_path: Path) -> str:
-    """Retourne le chemin d'une partition de test."""
     return join(str(tmp_path), "features/v1/dt=2026-09-02")
 
 
@@ -139,19 +128,6 @@ def test_resolve_refuses_an_unknown_scheme() -> None:
 
 
 class RefusesGroupedDelete:
-    """Stockage qui refuse la suppression groupée, comme Garage.
-
-    Le protocole S3 a deux suppressions : `DeleteObject`, qui porte une clé, et
-    `DeleteObjects`, qui en porte un lot. Garage n'accepte que la première, et
-    `delete_dir` émet la seconde — l'ETL échouait donc au moment de remplacer
-    la partition, après avoir tout calculé.
-
-    Le double ne dérive pas de `pyarrow.fs.FileSystem` : la fonction testée
-    n'appelle que ces trois méthodes, et hériter d'une classe C++ pour en
-    redéfinir une seule ferait porter au test le poids d'une liaison native
-    qu'il ne vérifie pas.
-    """
-
     def __init__(self, filesystem) -> None:
         self._inner = filesystem
         self.grouped_attempts = 0

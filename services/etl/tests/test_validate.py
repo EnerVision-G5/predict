@@ -1,12 +1,3 @@
-"""Vérification des contrats de couche, à la lecture comme à l'écriture.
-
-Ce qui est testé n'est pas pandera, mais la position du contrôle. Une
-ligne de `mesure` cassée doit faire échouer l'ETL au moment où il la lit, avec
-un message qui nomme la colonne fautive — pas trois étapes plus loin, quand un
-modèle entraîné dessus prédira n'importe quoi et que plus rien ne remontera à
-la cause.
-"""
-
 from __future__ import annotations
 
 import pandas as pd
@@ -27,7 +18,6 @@ SPEC = FeatureSpec(
 
 
 def conforming_features() -> pd.DataFrame:
-    """Produit une partition de variables réellement issue de l'ETL."""
     stamps = pd.date_range("2026-09-01T00:00:00Z", periods=72, freq="h", tz="UTC")
     measures = pd.DataFrame(
         {

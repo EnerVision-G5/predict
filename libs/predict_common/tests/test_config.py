@@ -1,12 +1,3 @@
-"""Chargement de la configuration : couches, environnement, typage.
-
-La garantie testée est qu'aucune valeur ne peut entrer dans la chaîne sans
-avoir été demandée. Une clé absente, une variable d'environnement obligatoire
-manquante ou un nombre illisible font échouer le chargement — un run qui
-partirait sur un défaut que personne n'a écrit produirait des artefacts au
-mauvais endroit, et rien ne le dirait.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -47,7 +38,6 @@ training:
 
 @pytest.fixture
 def conf_dir(tmp_path: Path) -> Path:
-    """Écrit une arborescence conf/ minimale mais réaliste."""
     (tmp_path / "base.yaml").write_text(BASE, encoding="utf-8")
     (tmp_path / "local.yaml").write_text(LOCAL, encoding="utf-8")
     return tmp_path
@@ -181,17 +171,14 @@ def test_get_bool_lit_les_ecritures_vraies(word: str) -> None:
 
 @pytest.mark.parametrize("word", ["false", "False", "0", "no", "off"])
 def test_get_bool_lit_les_ecritures_fausses(word: str) -> None:
-    """La chaîne "false" doit valoir False, pas "non vide donc vrai"."""
     assert Config(values={"a": {"b": word}}).get_bool("a.b") is False
 
 
 def test_get_bool_accepte_un_booleen_deja_type() -> None:
-    """Une valeur écrite en dur dans le YAML arrive déjà en booléen."""
     assert Config(values={"a": {"b": False}}).get_bool("a.b") is False
 
 
 def test_get_bool_refuse_ce_qu_il_ne_sait_pas_lire() -> None:
-    """`SERVING_AUTH_ENABLED=oui` doit se voir, pas se deviner."""
     with pytest.raises(ConfigError, match="booléen"):
         Config(values={"a": {"b": "oui"}}).get_bool("a.b")
 

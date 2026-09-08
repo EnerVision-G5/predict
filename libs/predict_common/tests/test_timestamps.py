@@ -1,15 +1,3 @@
-"""Lecture des horodatages de la source : ce qui est daté, et ce qui ne l'est pas.
-
-Un seul comportement est vérifié ici, sous ses deux faces. Un horodatage qui
-déclare son fuseau n'est jamais déplacé — c'est ce qui protège le rattrapage,
-que `/readings` sert en UTC. Un horodatage nu est lu dans le fuseau prêté à la
-source — c'est ce qui répare la collecte continue, que `/current` sert en heure
-locale depuis le 8 septembre 2026.
-
-Les deux formes arrivent de la même source et parfois dans le même lot : les
-traiter uniformément casserait l'une pour réparer l'autre.
-"""
-
 from __future__ import annotations
 
 import logging

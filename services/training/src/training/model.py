@@ -1,14 +1,9 @@
-"""Modèle XGBoost : hyperparamètres, ajustement, métriques.
-
-Le module ne sait rien de MLflow ni du stockage. Il reçoit trois tableaux et
-rend un modèle et des métriques, ce qui le rend testable sans serveur de suivi
-et sans partition sur disque. Le suivi est le métier de `training.tracking`.
-
-L'arrêt anticipé regarde le bloc de validation, jamais celui de test. C'est ce
-qui sépare les deux blocs : la validation sert à décider quand s'arrêter, donc
-le modèle finit par s'y ajuster ; le test n'est regardé qu'une fois, et c'est
-la seule mesure qu'on ait le droit de comparer entre deux runs.
-"""
+# **********************************************************************
+# * Nom     : model.py                                                 *
+# * Type    : Module                                                   *
+# * Sujet   : Ajustement du modèle retenu et mesure de sa qualité      *
+# * Service : training                                                 *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -19,21 +14,18 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
+# Nombre de résidus sous lequel un écart-type n'a pas de sens.
 MINIMUM_RESIDUALS = 2
 
+# Métrique sur laquelle se prend la décision de promotion.
 DECISION_METRIC = "mae"
 
 
 @dataclass(frozen=True)
 class ModelParams:
-    """Hyperparamètres du modèle, journalisés tels quels dans MLflow.
-
-    Un dataclass et non un dictionnaire : une faute de frappe dans un nom
-    d'hyperparamètre passerait inaperçue dans un dictionnaire, XGBoost
-    l'ignorerait, et le run serait enregistré avec un paramètre qui n'a rien
-    réglé.
+    """Classe : ModelParams
+    Description : Hyperparamètres du gradient boosté, avec leurs défauts.
     """
-
     n_estimators: int = 600
     max_depth: int = 6
     learning_rate: float = 0.05
@@ -42,7 +34,10 @@ class ModelParams:
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, object]) -> ModelParams:
-        """Construit les hyperparamètres depuis le bloc `training.params`."""
+        """Méthode : from_mapping
+        Description : Construit les hyperparamètres depuis la configuration, en
+          refusant l'inconnu.
+        """
         known = {
             field: values[field]
             for field in cls.__annotations__
@@ -57,7 +52,10 @@ class ModelParams:
         return cls(**known)  # type: ignore[arg-type]
 
     def as_dict(self) -> dict[str, object]:
-        """Retourne les hyperparamètres sous la forme attendue par XGBoost."""
+        """Méthode : as_dict
+        Description : Rend les hyperparamètres sous la forme attendue par la
+          bibliothèque.
+        """
         return asdict(self)
 
 
@@ -69,12 +67,9 @@ def fit(
     params: ModelParams,
     early_stopping_rounds: int,
 ) -> XGBRegressor:
-    """Entraîne le régresseur, en s'arrêtant quand la validation cesse de gagner.
-
-    Sans arrêt anticipé, `n_estimators` serait un pari : trop bas, le modèle
-    n'apprend pas ; trop haut, il apprend le bruit du jeu d'apprentissage. Ici
-    il devient une borne haute, et le nombre d'arbres réellement retenu est
-    journalisé avec le run.
+    """Méthode : fit
+    Description : Ajuste le modèle avec arrêt anticipé sur le bloc de
+      validation.
     """
     model = XGBRegressor(
         **params.as_dict(),
@@ -88,7 +83,9 @@ def fit(
 
 
 def evaluate(observed: pd.Series, predicted: Sequence[float]) -> dict[str, float]:
-    """Retourne les métriques de qualité comparables entre deux runs."""
+    """Méthode : evaluate
+    Description : Mesure l'écart entre observé et prédit : MAE, RMSE, R².
+    """
     return {
         "mae": float(mean_absolute_error(observed, predicted)),
         "rmse": float(mean_squared_error(observed, predicted) ** 0.5),
@@ -97,20 +94,9 @@ def evaluate(observed: pd.Series, predicted: Sequence[float]) -> dict[str, float
 
 
 def residual_std(observed: pd.Series, predicted: Sequence[float]) -> float:
-    """Écart-type des résidus sur le bloc de test, en kilowatts.
-
-    C'est la dispersion de l'erreur du modèle autour de zéro, et c'est ce qui
-    permet au service d'inférence d'assortir sa prévision d'un intervalle.
-    Mesurée sur le test et non sur la validation : la validation a décidé de
-    l'arrêt, le modèle s'y est donc ajusté et sa dispersion y est optimiste.
-
-    L'écart-type et non l'erreur absolue moyenne, parce que c'est lui qui se
-    compose : deux erreurs indépendantes s'additionnent en variance, ce dont
-    la récurrence du service a besoin pour élargir sa bande avec l'horizon.
-
-    Le degré de liberté est laissé à 1 (`ddof=1`) : la moyenne des résidus est
-    estimée sur ces mêmes points, et la retenir sans le dire sous-estimerait
-    la dispersion — d'autant plus que le bloc de test est court.
+    """Méthode : residual_std
+    Description : Écart-type des résidus, base de l'intervalle de confiance
+      servi.
     """
     residuals = pd.Series(observed).reset_index(drop=True) - pd.Series(
         list(predicted)
@@ -124,9 +110,7 @@ def residual_std(observed: pd.Series, predicted: Sequence[float]) -> float:
 
 
 def best_iteration(model: XGBRegressor) -> int:
-    """Nombre d'arbres réellement retenus par l'arrêt anticipé.
-
-    Comparé à `n_estimators`, il dit si la borne a été atteinte : si oui, le
-    modèle gagnait encore quand on l'a coupé, et la borne est trop basse.
+    """Méthode : best_iteration
+    Description : Nombre d'arbres retenus par l'arrêt anticipé.
     """
     return int(getattr(model, "best_iteration", 0) or 0) + 1

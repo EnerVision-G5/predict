@@ -1,29 +1,10 @@
-"""Le banc d'arbitrage : la fenêtre commune où les candidats se comparent.
-
-Deux modèles ne sont comparables que s'ils ont été jugés sur la même période.
-`tracking` le dit depuis toujours, mais rien ne le garantissait : chaque run
-mesurait sa qualité sur SON bloc de test, découpé dans SA fenêtre
-d'apprentissage. Deux entraînements espacés d'une semaine produisaient donc
-deux MAE que rien n'autorisait à mettre côte à côte — et c'est pourtant ce
-qu'un exploitant fait en ouvrant l'interface MLflow.
-
-Le banc corrige cela. C'est une fenêtre de journées retirée de
-l'apprentissage, sur laquelle tout candidat est réévalué : le modèle qu'on
-vient d'apprendre, la version en service, et les baselines naïves. Les trois
-reçoivent les mêmes heures, la même cible, les mêmes métriques.
-
-Le banc est glissant par défaut et figé sur demande, et la différence n'est
-pas cosmétique. Glissant, il vaut pour comparer entre eux les candidats d'un
-même entraînement, qui partagent la fenêtre du jour. Figé
-(`training.arbitration.start` et `.end`), il vaut en plus d'un entraînement à
-l'autre, parce que la fenêtre ne bouge plus. La promotion refuse de comparer
-deux mesures faites sur des bancs différents plutôt que de produire un
-classement qui n'en est pas un.
-
-Retirer le banc de l'apprentissage coûte des données, et c'est le prix d'une
-mesure qui veut dire quelque chose : un modèle évalué sur des heures qu'il a
-apprises annonce la qualité de sa mémoire, pas celle de ses prévisions.
-"""
+# **********************************************************************
+# * Nom     : arbitration.py                                           *
+# * Type    : Module                                                   *
+# * Sujet   : Banc d'arbitrage : la fenêtre commune où tous les        *
+# *   candidats sont jugés                                             *
+# * Service : training                                                 *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -41,63 +22,71 @@ from training.baseline import Persistence
 from training.dataset import matrices
 from training.model import DECISION_METRIC, evaluate
 
+# Préfixe des métriques mesurées sur le banc.
 BENCH_PREFIX = "arbitrage_"
 
+# Métrique de la meilleure baseline sur le même banc.
 NAIVE_METRIC = f"naif_{DECISION_METRIC}"
 
+# Paramètre portant la fenêtre, relu par la promotion.
 BENCH_WINDOW_PARAM = "arbitrage_window"
 
 logger = logging.getLogger(__name__)
 
 
 class ArbitrationError(ValueError):
-    """Le banc demandé est vide, mal borné, ou absent du stockage."""
+    """Classe : ArbitrationError
+    Description : Le banc demandé est vide, mal borné, ou absent du stockage.
+    """
 
 
 @dataclass(frozen=True)
 class Bench:
-    """La fenêtre du banc, et le fait qu'elle soit figée ou glissante."""
-
+    """Classe : Bench
+    Description : La fenêtre du banc, et le fait qu'elle soit figée ou
+      glissante.
+    """
     start: date
     end: date
     pinned: bool
 
     @property
     def label(self) -> str:
-        """Fenêtre telle qu'elle voyage dans les paramètres et les tags."""
+        """Méthode : label
+        Description : Fenêtre telle qu'elle voyage dans les paramètres et les
+          tags.
+        """
         return f"{self.start}/{self.end}"
 
     @property
     def days(self) -> int:
-        """Nombre de journées couvertes, bornes comprises."""
+        """Méthode : days
+        Description : Nombre de journées que couvre le banc.
+        """
         return (self.end - self.start).days + 1
 
 
 @dataclass(frozen=True)
 class BenchResult:
-    """Ce qu'un candidat a donné sur le banc, et sur quel banc.
-
-    La fenêtre voyage avec les métriques et non à côté : c'est ce qui permet
-    de refuser une comparaison entre deux mesures qui n'ont pas vu les mêmes
-    heures, au lieu de la faire sans le savoir.
+    """Classe : BenchResult
+    Description : Ce qu'un candidat a mesuré, et sur quelle fenêtre.
     """
-
     name: str
     window: str
     metrics: dict[str, float] = field(default_factory=dict)
 
     @property
     def error(self) -> float | None:
-        """Erreur de décision, ou rien si la mesure ne la porte pas."""
+        """Méthode : error
+        Description : Métrique de décision de ce résultat.
+        """
         return self.metrics.get(DECISION_METRIC)
 
 
 def resolve_bench(config: Config, end: date) -> Bench:
-    """Retourne le banc : celui de `conf/` s'il est figé, sinon le glissant.
-
-    Les deux bornes sont exigées ensemble. Une seule renseignée est une
-    configuration à moitié écrite, et deviner l'autre produirait un banc que
-    personne n'a décidé — donc des comparaisons qu'on croirait figées.
+    """Méthode : resolve_bench
+    Description : Détermine le banc : figé si la configuration le borne,
+      glissant sinon.
     """
     start_text = config.get_optional_str("training.arbitration.start")
     end_text = config.get_optional_str("training.arbitration.end")
@@ -125,12 +114,8 @@ def score(
     name: str,
     bench: Bench,
 ) -> BenchResult:
-    """Mesure un candidat sur le banc, quel que soit ce qu'il est.
-
-    Un modèle appris et une persistance passent par le même appel : la seconde
-    n'est qu'un `predict` qui recopie une colonne. Les mesurer par deux
-    chemins différents laisserait s'installer un écart de traitement entre la
-    référence et ce qu'elle est censée arbitrer.
+    """Méthode : score
+    Description : Mesure un candidat sur le banc et rend son résultat.
     """
     explanatory, observed = matrices(frame, columns)
     return BenchResult(
@@ -146,12 +131,8 @@ def naive_reference(
     columns: Sequence[str],
     bench: Bench,
 ) -> BenchResult:
-    """Retourne la meilleure des persistances, celle qu'il faut battre.
-
-    La meilleure et non la première : prendre une persistance au hasard ferait
-    une référence qu'on choisirait, donc une barre qu'on pourrait s'arranger
-    pour placer bas. ADR-010 demande une comparaison systématique, ce qui n'a
-    de sens que contre la plus dure des références gratuites.
+    """Méthode : naive_reference
+    Description : Retient la meilleure des baselines naïves sur le banc.
     """
     if not baselines:
         raise ArbitrationError(
@@ -166,7 +147,9 @@ def naive_reference(
 
 
 def bench_metrics(result: BenchResult, naive: BenchResult) -> dict[str, float]:
-    """Retourne les métriques du banc telles qu'elles partent dans le run."""
+    """Méthode : bench_metrics
+    Description : Compose les métriques journalisées avec le run.
+    """
     metrics = {
         f"{BENCH_PREFIX}{name}": value for name, value in result.metrics.items()
     }
@@ -179,11 +162,8 @@ def read_bench(
     params: Mapping[str, str],
     name: str,
 ) -> BenchResult | None:
-    """Relit d'un run passé ce qu'il a mesuré sur son banc.
-
-    Rend `None` quand le run n'en porte pas. Un modèle enregistré avant
-    l'existence du banc n'a rien de comparable : inventer une valeur ferait
-    passer une promotion pour une décision alors qu'elle serait un pari.
+    """Méthode : read_bench
+    Description : Relit le résultat de banc d'un run déjà enregistré.
     """
     measured = {
         key.removeprefix(BENCH_PREFIX): value
@@ -200,12 +180,8 @@ def read_naive(
     metrics: Mapping[str, float],
     params: Mapping[str, str],
 ) -> BenchResult | None:
-    """Relit la référence naïve qu'un run a journalisée à côté de sa mesure.
-
-    Elle est enregistrée avec le run et non recalculée : recalculer
-    aujourd'hui la persistance d'une fenêtre passée demanderait de relire des
-    partitions qui ont pu être régénérées depuis, et la référence d'une
-    décision doit être celle qui a servi à la prendre.
+    """Méthode : read_naive
+    Description : Relit la référence naïve d'un run déjà enregistré.
     """
     error = metrics.get(NAIVE_METRIC)
     window = params.get(BENCH_WINDOW_PARAM, "")

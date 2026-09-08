@@ -1,22 +1,10 @@
-"""Jeu d'apprentissage : lecture des partitions et découpe temporelle.
-
-L'entraînement ne lit plus la base. Il lit `features/{version}/dt=.../`, que
-l'ETL a produit et validé, et c'est tout ce qu'il connaît de l'amont. Le gain
-n'est pas seulement architectural : un jeu d'apprentissage est désormais un
-ensemble de fichiers immuables et datés, donc un run est reproductible en
-rejouant la même liste de partitions, ce qu'une requête sur une base vivante
-ne permettait pas.
-
-La découpe est temporelle, jamais aléatoire. Une coupe au hasard laisserait le
-modèle voir le futur d'une même journée pendant l'apprentissage et gonflerait
-artificiellement le score : le modèle paraîtrait excellent en validation et
-serait mauvais en production, ce qui est la pire des deux erreurs possibles.
-
-Trois blocs et non deux. La validation sert l'arrêt anticipé, donc le modèle
-la regarde à chaque tour et finit par s'y ajuster ; le test n'est regardé
-qu'une fois, à la fin. Mesurer la qualité sur le jeu qui a servi à décider
-quand s'arrêter reviendrait à se noter soi-même.
-"""
+# **********************************************************************
+# * Nom     : dataset.py                                               *
+# * Type    : Module                                                   *
+# * Sujet   : Lecture des variables et découpe temporelle en           *
+# *   apprentissage, validation, test                                  *
+# * Service : training                                                 *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -31,26 +19,32 @@ from predict_common import io
 from predict_common.paths import date_range, features_partition
 from predict_common.schemas import SITE_COLUMN, TARGET_COLUMN, TIMESTAMP_COLUMN
 
+# Part reconstruite d'une heure, qui décide de la garder ou non.
 IMPUTED_RATIO_COLUMN = "imputed_ratio"
 
 logger = logging.getLogger(__name__)
 
 
 class DatasetError(ValueError):
-    """Le jeu d'apprentissage demandé est vide ou impossible à découper."""
+    """Classe : DatasetError
+    Description : Le jeu lu est vide, incomplet, ou impossible à découper.
+    """
 
 
 @dataclass(frozen=True)
 class Split:
-    """Les trois blocs d'un jeu d'apprentissage, dans l'ordre du temps."""
-
+    """Classe : Split
+    Description : Les trois blocs d'un jeu découpé dans le temps.
+    """
     train: pd.DataFrame
     valid: pd.DataFrame
     test: pd.DataFrame
 
     @property
     def sizes(self) -> dict[str, int]:
-        """Volume de chaque bloc, tel qu'il part dans les paramètres du run."""
+        """Méthode : sizes
+        Description : Nombre d'heures de chaque bloc.
+        """
         return {
             "train_rows": len(self.train),
             "valid_rows": len(self.valid),
@@ -59,11 +53,8 @@ class Split:
 
     @property
     def window(self) -> str:
-        """Fenêtre couverte par l'apprentissage, `debut/fin`.
-
-        Journalisée comme paramètre du run : deux modèles aux mêmes
-        hyperparamètres et aux mêmes métriques ne sont pas comparables s'ils
-        n'ont pas vu la même période.
+        """Méthode : window
+        Description : Fenêtre couverte par le bloc d'apprentissage.
         """
         if self.train.empty:
             return ""
@@ -77,19 +68,8 @@ def read_features(
     start: date,
     end: date,
 ) -> pd.DataFrame:
-    """Lit les partitions de variables couvrant une fenêtre de journées.
-
-    Une journée absente est ignorée : la source a pu être arrêtée, ou la
-    chaîne démarrée en cours de fenêtre. C'est le volume total qui décide si
-    l'apprentissage est possible, pas la présence de chaque jour.
-
-    Ignorée, mais pas passée sous silence. `--history-days 90` sur une chaîne
-    qui n'a qu'un mois de partitions produit un modèle appris sur un mois, et
-    rien n'en avertissait : les journées manquantes sont journalisées en
-    `debug` par la couche de stockage, sous le niveau que les services
-    configurent. La proportion manquante est écrite ici, au niveau où elle
-    sera lue, parce qu'elle change ce que le modèle a pu apprendre — une
-    saisonnalité absente de la fenêtre ne s'apprend pas.
+    """Méthode : read_features
+    Description : Lit les partitions de variables d'une fenêtre de journées.
     """
     requested = date_range(start, end)
     partitions = [features_partition(root, version, day) for day in requested]
@@ -113,12 +93,8 @@ def _warn_on_gaps(
     requested: Sequence[date],
     version: str,
 ) -> None:
-    """Signale l'écart entre la fenêtre demandée et celle réellement lue.
-
-    Les journées présentes sont comptées dans le tableau lu plutôt que sur le
-    stockage : l'information est déjà là, et une seconde interrogation du
-    stockage objet coûterait un appel réseau par journée pour redire ce que
-    les données disent.
+    """Méthode : _warn_on_gaps
+    Description : Signale les journées demandées qui ne sont pas publiées.
     """
     present = frame[TIMESTAMP_COLUMN].dt.date.nunique()
     if present >= len(requested):
@@ -139,12 +115,9 @@ def select(
     sites: Sequence[str] | None,
     max_imputed_ratio: float,
 ) -> pd.DataFrame:
-    """Retient les lignes que le modèle a le droit d'apprendre.
-
-    Le filtre sur l'imputation n'est pas une précaution cosmétique : une heure
-    dont la cible a été reconstruite à 90 % enseigne l'interpolation de l'ETL,
-    pas la consommation du site. Le seuil est dans `conf/`, parce que c'est un
-    arbitrage entre volume et fidélité, et qu'il se règle.
+    """Méthode : select
+    Description : Ne garde que les sites demandés et les heures assez peu
+      reconstruites.
     """
     selected = frame
     if sites:
@@ -165,16 +138,8 @@ def exclude_window(
     start: date,
     end: date,
 ) -> pd.DataFrame:
-    """Retire les journées réservées au banc d'arbitrage, bornes comprises.
-
-    Le banc ne vaut que s'il est tenu hors de l'apprentissage. Un modèle
-    évalué sur des heures qu'il a apprises annonce la qualité de sa mémoire,
-    et le classement mettrait alors en tête celui qui a le mieux retenu, pas
-    celui qui prédit le mieux.
-
-    Le retrait est journalisé parce qu'il coûte : sur une fenêtre courte, un
-    banc de deux semaines peut emporter une part appréciable de ce qu'il y
-    avait à apprendre, et le run doit dire ce qu'il a payé.
+    """Méthode : exclude_window
+    Description : Retire du jeu les journées réservées au banc d'arbitrage.
     """
     if frame.empty:
         return frame
@@ -197,11 +162,8 @@ def split_by_time(
     valid_ratio: float,
     test_ratio: float,
 ) -> Split:
-    """Coupe le jeu en apprentissage, validation et test, dans l'ordre du temps.
-
-    La coupe se fait sur l'horodatage et non sur le rang des lignes : avec
-    plusieurs sites, une coupe par rang mettrait la fin de l'historique d'un
-    site dans l'apprentissage et le début d'un autre dans le test.
+    """Méthode : split_by_time
+    Description : Découpe dans l'ordre du temps, jamais au hasard.
     """
     if not 0.0 < valid_ratio + test_ratio < 1.0:
         raise DatasetError(
@@ -228,11 +190,8 @@ def matrices(
     frame: pd.DataFrame,
     columns: Sequence[str],
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Sépare les variables explicatives de la cible, dans l'ordre du modèle.
-
-    L'ordre des colonnes est celui de la signature MLflow, et il vient d'un
-    unique appel partagé avec le service d'inférence. Le fixer ici à la main
-    laisserait les deux diverger sans que rien ne le signale.
+    """Méthode : matrices
+    Description : Sépare les variables explicatives de la cible à prédire.
     """
     missing = [name for name in columns if name not in frame.columns]
     if missing:
@@ -241,11 +200,8 @@ def matrices(
 
 
 def _require_non_empty(split: Split) -> None:
-    """Refuse une découpe dont un bloc serait vide.
-
-    Un test vide donnerait un run sans métrique et un modèle enregistré sans
-    rien qui atteste sa qualité — pire qu'un échec, puisqu'il serait
-    promouvable.
+    """Méthode : _require_non_empty
+    Description : Refuse une découpe qui laisserait un bloc vide.
     """
     empty = [name for name, size in split.sizes.items() if size == 0]
     if empty:

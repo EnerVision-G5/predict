@@ -1,26 +1,9 @@
-"""Dépose l'historique de référence sur le stockage objet.
-
-Le pendant de la lecture faite par `collector.datasets` : les CSV ne sont ni
-dans le dépôt ni dans l'image, il faut donc les poser une fois là où le
-collecteur ira les chercher.
-
-    python deploy/push-datasets.py datasets s3://enervision-datasets
-
-Pourquoi ce script plutôt qu'un `aws s3 cp`. Parce qu'il n'exige rien de plus
-que l'environnement du projet : la même `predict_common.io` qui résout une
-racine pour l'ETL et pour le collecteur résout la destination ici, et un poste
-qui sait lancer la chaîne sait donc lancer l'envoi. Installer un client S3
-pour un transfert que sept fichiers épuisent serait une dépendance de plus à
-tenir à jour sur chaque poste et dans chaque image de CI.
-
-Les identifiants ne sont pas lus ici. `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`
-et `AWS_SECRET_ACCESS_KEY` sont pris dans l'environnement par la bibliothèque
-cliente, comme pour tous les autres accès au stockage de la chaîne.
-
-L'envoi ÉCRASE ce qui porte le même nom, et c'est voulu : le jeu de données
-est figé, un renvoi n'a donc rien à fusionner. Ce qui n'a pas de source ne
-disparaît pas pour autant — le script ne supprime rien à la destination.
-"""
+# **********************************************************************
+# * Nom     : push-datasets.py                                         *
+# * Type    : Script                                                   *
+# * Sujet   : Dépôt de l'historique de référence sur le stockage objet *
+# * Service : outillage de déploiement                                 *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -35,23 +18,26 @@ import pyarrow.fs
 from predict_common import io
 from predict_common.paths import join
 
+# Fichiers envoyés par défaut : un par site, et rien d'autre.
 SITE_PATTERN = "SITE*.csv"
+# Tout le contenu de la racine, demandé par --tout.
 ALL_PATTERN = "*"
 
+# Taille des blocs de transfert, pour ne pas tout charger en mémoire.
 CHUNK_BYTES = 1 << 20
 
+# Code de sortie d'un envoi abouti.
 EXIT_OK = 0
+# Code de sortie d'un envoi interrompu.
 EXIT_FAILED = 1
 
 logger = logging.getLogger("push-datasets")
 
 
 def source_files(root: str, pattern: str) -> list[str]:
-    """Liste les fichiers à envoyer, triés, et refuse une source muette.
-
-    Une source vide est une erreur et non un envoi de zéro fichier : la
-    commande aurait l'air d'avoir réussi, et le manque ne se verrait qu'au
-    premier import, du côté du serveur.
+    """Méthode : source_files
+    Description : Liste les fichiers à envoyer, triés, et refuse une source
+      muette.
     """
     filesystem, path = io.resolve(root)
     selector = pyarrow.fs.FileSelector(path, recursive=False, allow_not_found=True)
@@ -67,11 +53,9 @@ def source_files(root: str, pattern: str) -> list[str]:
 
 
 def copy_file(source: str, destination: str) -> int:
-    """Copie un fichier d'un stockage à l'autre et retourne sa taille.
-
-    Les deux extrémités sont ouvertes par `predict_common.io`, ce qui rend le
-    sens du transfert indifférent : disque vers seau, seau vers disque, ou
-    seau vers seau.
+    """Méthode : copy_file
+    Description : Copie un fichier d'un stockage à l'autre et retourne sa
+      taille.
     """
     source_fs, source_path = io.resolve(source)
     target_fs, target_path = io.resolve(destination)
@@ -87,7 +71,9 @@ def copy_file(source: str, destination: str) -> int:
 
 
 def push(root: str, destination: str, pattern: str) -> int:
-    """Envoie les fichiers de `root` vers `destination` et retourne le total."""
+    """Méthode : push
+    Description : Envoie les fichiers de la racine vers la destination.
+    """
     total = 0
     for source in source_files(root, pattern):
         name = source.replace("\\", "/").rsplit("/", 1)[-1]
@@ -98,6 +84,9 @@ def push(root: str, destination: str, pattern: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Méthode : build_parser
+    Description : Analyse la ligne de commande de l'envoi.
+    """
     parser = argparse.ArgumentParser(
         prog="push-datasets",
         description="Dépose l'historique de référence sur le stockage objet.",
@@ -123,6 +112,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Méthode : main
+    Description : Point d'entrée : dépose l'historique et rend un code de
+      sortie.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

@@ -1,19 +1,3 @@
-"""Variables explicatives : grille horaire, décalages, fuites évitées.
-
-Trois familles de garanties, et la première corrige une faute que la chaîne
-portait avant la découpe. Un décalage compté en nombre de lignes suppose une
-série sans trou : une coupure de capteur décalait alors tout l'historique, et
-`lag_24h` désignait autre chose que la veille sans que rien ne le dise. Ici,
-un décalage est une position sur une grille horaire complète.
-
-La deuxième porte sur les fuites. La moyenne glissante ne doit jamais contenir
-la cible de l'heure qu'on prédit, sans quoi le modèle lirait la réponse dans
-la question — excellent à l'apprentissage, faux en production.
-
-La troisième porte sur ce qu'une heure doit à l'ETL : `imputed_ratio` et
-`data_quality` doivent décrire l'heure, pas la moyenne de ses minutes.
-"""
-
 from __future__ import annotations
 
 from datetime import date
@@ -40,7 +24,6 @@ def measures(
     start: str = "2026-09-01T00:00:00Z",
     **columns,
 ) -> pd.DataFrame:
-    """Série horaire d'un site, déjà normalisée et imputée."""
     stamps = pd.date_range(start, periods=hours, freq="h", tz="UTC")
     frame = pd.DataFrame(
         {
@@ -59,8 +42,6 @@ def measures(
 
 
 class TestFeatureSpec:
-    """La définition d'une version décide de tout le reste."""
-
     def test_the_lookback_follows_the_deepest_lag(self) -> None:
         spec = FeatureSpec("v1", "1h", (1, 24, 168), 24)
         assert spec.lookback_days == 9
@@ -87,9 +68,6 @@ class TestFeatureSpec:
 
 
 class TestResample:
-    """La série change de pas : la source produit à la minute, le modèle prédit
-    à l'heure."""
-
     def test_minutes_are_averaged_into_an_hour(self) -> None:
         stamps = pd.date_range(
             "2026-09-08T00:00:00Z", periods=4, freq="15min", tz="UTC"
@@ -168,8 +146,6 @@ class TestResample:
 
 
 class TestBuild:
-    """Seule la journée demandée sort, et seulement si son historique existe."""
-
     def test_only_the_requested_day_is_returned(self) -> None:
         features = build(measures(24 * 9), SPEC, DAY)
         assert set(features["ts"].dt.date) == {DAY}

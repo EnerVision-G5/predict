@@ -1,14 +1,3 @@
-"""Enchaînement d'un run : lecture de la fenêtre, transformation, publication.
-
-Ce fichier teste ce que les étages ne peuvent pas tester seuls — la fenêtre
-lue, ce qui repart en base, et l'idempotence de la partition publiée.
-
-La base est remplacée par un moteur qui rend un lot préparé à la lecture et
-mémorise les instructions à l'écriture. Ce qui compte n'est pas que PostgreSQL
-accepte les instructions — c'est son métier, et le schéma figé le garantit —
-mais que l'ETL lise la bonne fenêtre et n'en repose que la bonne journée.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
@@ -44,13 +33,6 @@ SPEC_LAGS = [1, 24]
 
 
 class ReadingEngine(FakeEngine):
-    """Moteur factice qui rend un lot fixe à la lecture.
-
-    `pd.read_sql_query` passe par `connect()` ; l'écriture passe par `begin()`.
-    Séparer les deux permet de vérifier ce qui est relu autant que ce qui est
-    réécrit, sans jamais joindre une base.
-    """
-
     def __init__(self, frame: pd.DataFrame) -> None:
         super().__init__()
         self.frame = frame
@@ -67,7 +49,6 @@ class ReadingEngine(FakeEngine):
 
 
 def config_for(root: Path) -> Config:
-    """Configuration minimale d'un run, pointée sur un stockage jetable."""
     return Config(
         values={
             "storage": {"root": str(root)},
@@ -86,7 +67,6 @@ def config_for(root: Path) -> Config:
 
 
 def measures(make_raw, make_reading, days: int = 5, **overrides) -> pd.DataFrame:
-    """Lot tel qu'une lecture de `mesure` le rendrait, sur `days` journées."""
     readings = [
         make_reading(
             f"{(DAY - timedelta(days=offset)).isoformat()}T{hour:02d}:00:00Z",
@@ -100,8 +80,6 @@ def measures(make_raw, make_reading, days: int = 5, **overrides) -> pd.DataFrame
 
 @pytest.fixture
 def patched_read(monkeypatch):
-    """Remplace la lecture SQL par le lot que porte le moteur factice."""
-
     def install(engine: ReadingEngine) -> None:
         def read_sql_query(query, connection, params=None, **kwargs):
             connection.queried.append(dict(params or {}))
@@ -123,8 +101,6 @@ def test_the_command_line_overrides_the_configured_version(tmp_path: Path) -> No
 
 
 class TestWindow:
-    """La fenêtre lue déborde sur les journées que les décalages réclament."""
-
     def test_it_ends_at_midnight_after_the_produced_day(self) -> None:
         _, end = window(DAY, 3)
         assert end == datetime(2026, 9, 11, tzinfo=UTC)
@@ -289,8 +265,6 @@ def test_the_features_carry_no_excluded_measure(
 
 
 class TestParseArgs:
-    """La ligne de commande dit ce que le run produit."""
-
     def test_the_date_defaults_to_today(self) -> None:
         assert parse_args([]).date is None
 
@@ -310,17 +284,7 @@ class TestParseArgs:
 
 
 class TestADatabaseStillStartingUp:
-    """Le conteneur repart avant que TimescaleDB ait rejoué son WAL.
-
-    Au redémarrage du poste, le démon Docker relance tous les conteneurs
-    ensemble sans lire les `depends_on` du compose — ceux-ci n'ordonnent que
-    `compose up`. Le cycle suivant passera ; la trace du driver à cet endroit
-    faisait chercher un bug là où il n'y a qu'un ordre de démarrage.
-    """
-
     def failing_open(self, monkeypatch, tmp_path: Path, error: Exception) -> None:
-        """Fait échouer l'ouverture du moteur sur l'erreur donnée."""
-
         def refuse(*args, **kwargs):
             raise error
 
@@ -362,8 +326,6 @@ class TestADatabaseStillStartingUp:
 
 
 class TestDatabaseErrorReading:
-    """Les deux prédicats qui décident du ton du journal."""
-
     def test_the_startup_states_of_postgres_are_recognised(self) -> None:
         assert is_db_warming_up(Exception("FATAL: the database system is starting up"))
         assert is_db_warming_up(Exception("The Database System Is Shutting Down"))

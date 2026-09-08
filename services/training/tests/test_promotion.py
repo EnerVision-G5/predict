@@ -1,11 +1,3 @@
-"""La règle qui accepte ou refuse une mise en service.
-
-C'est le fichier le plus proche d'une décision d'exploitation : chaque test
-décrit une situation où quelqu'un aurait tapé `--promote`, et ce que le service
-aurait dû répondre. La raison est vérifiée autant que le verdict — un refus
-qu'on ne peut pas relire six mois plus tard n'est pas une décision.
-"""
-
 from __future__ import annotations
 
 from training.arbitration import BenchResult
@@ -16,7 +8,6 @@ OTHER_WINDOW = "2026-08-08/2026-08-21"
 
 
 def result(error: float, window: str = WINDOW, name: str = "xgboost") -> BenchResult:
-    """Une mesure de banc réduite à ce sur quoi la règle tranche."""
     return BenchResult(name=name, window=window, metrics={"mae": error})
 
 

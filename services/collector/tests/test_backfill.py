@@ -1,24 +1,3 @@
-"""Rattrapage de l'historique par lot : les critères d'EV-09.
-
-Trois exigences, et chacune a sa raison d'être vérifiée ici plutôt qu'à la
-main sur une base de recette.
-
-La période est paramétrable de deux façons, et elles ne servent pas au même
-usage : `--start/--end` nomme une période, ce que fait un analyste ;
-`--date/--days` nomme une journée et sa profondeur, ce que fait un
-ordonnanceur. Les mélanger laisserait deux périodes possibles pour un même
-appel, et le run partirait sur l'une des deux sans dire laquelle.
-
-La limite est bornée par la source à 1000. La refuser ici plutôt que de la
-découvrir dans une réponse 422 évite de lancer un rattrapage de trois mois qui
-échouera à la première page.
-
-L'idempotence tient à l'instruction produite, pas au hasard : un
-`ON CONFLICT DO NOTHING` sur la clé naturelle. C'est elle qui rend le rejeu
-sans effet de bord, et qui empêche une recollecte d'effacer ce que l'ETL a
-déduit depuis.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
@@ -41,13 +20,10 @@ SITES = tuple(f"SITE{index:03d}" for index in range(1, 8))
 
 
 def days_for(*argv: str) -> list[date]:
-    """Retourne les journées que la ligne de commande demande."""
     return requested_days(parse_args(list(argv)))
 
 
 class TestPeriode:
-    """Le premier critère : une période paramétrable."""
-
     def test_two_bounds_give_the_whole_range(self) -> None:
         days = days_for("--start", "2026-08-30", "--end", "2026-09-02")
         assert days == [
@@ -91,8 +67,6 @@ class TestPeriode:
 
 
 class TestLimite:
-    """Le deuxième critère : une limite de page, bornée par la source."""
-
     def test_the_source_bound_is_a_thousand(self) -> None:
         assert MAX_PAGE_SIZE == 1000
 
@@ -121,8 +95,6 @@ class TestLimite:
 
 
 class TestIdempotence:
-    """Le troisième critère : un rejeu qui ne double ni n'efface rien."""
-
     def test_the_insert_ignores_what_is_already_there(self, make_reading) -> None:
         frame = to_measures([make_reading("2026-09-02T08:00:00Z")])
         statement = build_insert(to_records(frame))
@@ -152,8 +124,6 @@ class TestIdempotence:
 
 
 class TestVolume:
-    """Le dernier critère : au moins 48 h pour les sept sites."""
-
     def test_two_days_are_expressible_in_both_forms(self) -> None:
         assert len(days_for("--start", "2026-09-01", "--end", "2026-09-02")) == 2
         assert len(days_for("--date", "2026-09-02", "--days", "2")) == 2
@@ -184,7 +154,6 @@ class TestVolume:
 
 
 def _settings() -> SourceSettings:
-    """Réglages de source dont seule la taille de page nous intéresse."""
     return SourceSettings(
         base_url="http://mock.invalid",
         sites_path="/api/v1/sites",
@@ -203,12 +172,6 @@ def _settings() -> SourceSettings:
 
 
 class _StubSource:
-    """Source réduite à ce que `collect_day` lui demande.
-
-    La pagination réelle, ses reprises et sa limite de débit sont éprouvées
-    par `test_client.py` : les rejouer ici ne testerait pas le rattrapage.
-    """
-
     def __init__(self, readings: list[dict], failing: str | None = None) -> None:
         self._readings = readings
         self._failing = failing
@@ -220,7 +183,6 @@ class _StubSource:
 
 
 def _state_params(engine: FakeEngine) -> list[dict]:
-    """Rend les paramètres des instructions visant `ingestion_etat`."""
     compiled = [
         statement.compile(dialect=postgresql.dialect())
         for statement in engine.executed
@@ -233,8 +195,6 @@ def _state_params(engine: FakeEngine) -> list[dict]:
 
 
 class TestBackfillState:
-    """Un rattrapage ne doit pas se faire passer pour une collecte vivante."""
-
     def test_a_replayed_day_is_recorded_as_a_backfill(self, make_reading) -> None:
         engine = FakeEngine()
         source = _StubSource([make_reading("2026-09-02T07:59:00Z")])
@@ -264,7 +224,6 @@ TODAY = date(2026, 9, 5)
 
 
 def covered(site_id: str, day: str, first: str = "00:00", last: str = "23:30"):
-    """Ligne d'agrégation telle que `day_coverage` la lit dans `mesure`."""
     stamp = date.fromisoformat(day)
     return (
         site_id,
@@ -275,12 +234,10 @@ def covered(site_id: str, day: str, first: str = "00:00", last: str = "23:30"):
 
 
 def engine_covering(*rows) -> FakeEngine:
-    """Moteur rendant la couverture par site et par journée."""
     return FakeEngine(rows=list(rows))
 
 
 def test_une_base_vide_est_entierement_rattrapee() -> None:
-    """Premier démarrage : aucune journée n'est couverte, toutes sont prises."""
     days = catch_up_days(engine_covering(), ["SITE001"], depth_days=35, today=TODAY)
 
     assert days[0] == date(2026, 8, 2)
@@ -289,12 +246,6 @@ def test_une_base_vide_est_entierement_rattrapee() -> None:
 
 
 def test_un_trou_ancien_est_vu_alors_que_le_poller_tourne() -> None:
-    """LE cas du redéploiement, et celui qu'un repère de reprise manquait.
-
-    Le poller tourne depuis le 4 : la dernière mesure est « aujourd'hui », et
-    pourtant tout août manque. Une reprise calée sur `max(ts)` ne collecterait
-    que la journée courante et laisserait le trou intact.
-    """
     engine = engine_covering(
         covered("SITE001", "2026-09-04"),
         covered("SITE001", "2026-09-05"),
@@ -308,17 +259,12 @@ def test_un_trou_ancien_est_vu_alors_que_le_poller_tourne() -> None:
 
 
 def test_la_journee_courante_est_toujours_reprise() -> None:
-    """Elle est incomplète par construction : elle n'est pas finie."""
     engine = engine_covering(covered("SITE001", "2026-09-05", last="23:30"))
 
     assert TODAY in catch_up_days(engine, ["SITE001"], depth_days=1, today=TODAY)
 
 
 def test_une_journee_commencee_en_retard_est_reprise() -> None:
-    """Le poller a démarré à 14 h : la matinée manque.
-
-    Un simple comptage la croirait collectée — c'est l'étendue qui la trahit.
-    """
     engine = engine_covering(covered("SITE001", "2026-09-04", first="14:00"))
 
     assert date(2026, 9, 4) in catch_up_days(
@@ -327,7 +273,6 @@ def test_une_journee_commencee_en_retard_est_reprise() -> None:
 
 
 def test_une_journee_interrompue_est_reprise() -> None:
-    """Le poller s'est arrêté à 09 h : le reste de la journée manque."""
     engine = engine_covering(covered("SITE001", "2026-09-04", last="09:00"))
 
     assert date(2026, 9, 4) in catch_up_days(
@@ -336,10 +281,6 @@ def test_une_journee_interrompue_est_reprise() -> None:
 
 
 def test_une_journee_venue_du_seul_rattrapage_est_tenue_pour_complete() -> None:
-    """`/readings` s'arrête à 23:30, pas à 23:59.
-
-    Sans tolérance, toute journée rattrapée serait reprise indéfiniment.
-    """
     engine = engine_covering(covered("SITE001", "2026-09-04", last="23:30"))
 
     assert date(2026, 9, 4) not in catch_up_days(
@@ -348,8 +289,6 @@ def test_une_journee_venue_du_seul_rattrapage_est_tenue_pour_complete() -> None:
 
 
 def test_un_seul_site_decouvert_suffit_a_reprendre_la_journee() -> None:
-    """La fenêtre est commune : `ON CONFLICT DO NOTHING` rend le recouvrement
-    gratuit en base, et découper par site rendrait le journal illisible."""
     engine = engine_covering(covered("SITE001", "2026-09-04"))
 
     days = catch_up_days(engine, ["SITE001", "SITE002"], depth_days=2, today=TODAY)
@@ -358,7 +297,6 @@ def test_un_seul_site_decouvert_suffit_a_reprendre_la_journee() -> None:
 
 
 def test_la_profondeur_borne_la_fenetre_cherchee() -> None:
-    """Une base vide ne fait pas remonter à l'origine des temps."""
     days = catch_up_days(engine_covering(), ["SITE001"], depth_days=7, today=TODAY)
 
     assert days[0] == date(2026, 8, 30)
@@ -366,7 +304,6 @@ def test_la_profondeur_borne_la_fenetre_cherchee() -> None:
 
 
 def test_le_rattrapage_refuse_une_periode_donnee_en_plus() -> None:
-    """`--catch-up --start` : l'un des deux serait ignoré en silence."""
     args = parse_args(["--catch-up", "--start", "2026-08-01"])
 
     with pytest.raises(ValueError, match="--start"):
@@ -378,7 +315,6 @@ def test_le_rattrapage_seul_est_accepte() -> None:
 
 
 def test_une_periode_explicite_reste_acceptee() -> None:
-    """Le mode existant n'est pas touché."""
     check_period_arguments(parse_args(["--start", "2026-08-01"]))
 
 

@@ -1,12 +1,3 @@
-"""Surveillance de l'écart : fenêtre, seuil, verdict, publication.
-
-Aucun test ne joint MLflow. Ce qui compte ici est la décision : à partir de
-quoi on conclut à une dérive, et ce qu'on répond quand on ne peut pas
-conclure. Une surveillance qui crierait au loup sur trois heures de mesures ou
-qui se tairait faute de référence serait pire qu'absente — on cesserait de la
-regarder.
-"""
-
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -51,7 +42,6 @@ def report(
     baseline_mae: float | None = 10.0,
     rows: int = 168,
 ) -> DriftReport:
-    """Construit un rapport dont seules l'erreur et la référence importent."""
     return DriftReport(
         metrics={"mae": mae, "rmse": mae * 1.3, "r2": 0.9},
         baseline={"mae": baseline_mae} if baseline_mae is not None else {},
@@ -62,8 +52,6 @@ def report(
 
 
 class TestWindow:
-    """La fenêtre glisse toute seule quand l'ordonnanceur ne la dit pas."""
-
     def test_without_bounds_it_covers_the_last_days(self) -> None:
         first, last = window(None, None, window_days=7)
         assert (last - first).days == 6
@@ -93,8 +81,6 @@ class TestWindow:
 
 
 class TestVerdict:
-    """Le seuil est un rapport à l'erreur d'entraînement, pas des kilowatts."""
-
     def test_an_error_close_to_the_baseline_is_stable(self) -> None:
         assert report(mae=11.0).verdict(SETTINGS) == "stable"
 
@@ -116,8 +102,6 @@ class TestVerdict:
 
 
 class TestQuandOnNePeutPasConclure:
-    """Se taire est une réponse, mais elle doit être dite."""
-
     def test_too_few_hours_gives_no_verdict(self) -> None:
         assert report(mae=100.0, rows=5).verdict(SETTINGS) == "indécis"
 
@@ -136,8 +120,6 @@ class TestQuandOnNePeutPasConclure:
 
 
 class TestMesure:
-    """L'écart est mesuré à un pas, comme à l'entraînement."""
-
     def test_a_perfect_model_has_no_error(self) -> None:
         frame = _features(48)
 
@@ -173,8 +155,6 @@ class TestMesure:
 
 
 class TestCodesDeSortie:
-    """Un ordonnanceur décide sur le code, pas sur le journal."""
-
     def test_a_drift_is_not_a_failure(self) -> None:
         assert EXIT_DRIFTED != EXIT_OK
         assert EXIT_DRIFTED == 2
@@ -200,7 +180,6 @@ class TestCodesDeSortie:
 
 
 def _features(hours: int) -> pd.DataFrame:
-    """Partition de variables, telle que l'ETL la publie."""
     stamps = pd.date_range("2026-09-01T00:00:00Z", periods=hours, freq="h", tz="UTC")
     return pd.DataFrame(
         {
@@ -227,11 +206,6 @@ def test_the_default_window_is_a_week() -> None:
 
 
 def _two_sites(hours: int) -> pd.DataFrame:
-    """Deux sites de tailles très différentes, dans une même partition.
-
-    C'est la situation que la moyenne d'ensemble masque : l'usine pèse dix
-    fois le bureau, et son erreur décide seule de la MAE globale.
-    """
     bureau = _features(hours)
     usine = _features(hours).assign(
         site_id="SITE002", consumption_kw=lambda frame: frame["consumption_kw"] * 10
@@ -240,8 +214,6 @@ def _two_sites(hours: int) -> pd.DataFrame:
 
 
 class TestDecoupageParSite:
-    """Une MAE d'ensemble dit ce que le parc coûte, pas où l'erreur est."""
-
     def test_each_site_gets_its_own_measure(self) -> None:
         frame = _two_sites(48)
 

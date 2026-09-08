@@ -1,21 +1,10 @@
-"""Qualification des mesures : nommer la cause de chaque valeur absente.
-
-Une valeur nulle n'est pas une valeur qui manque, c'est un capteur qui parle :
-il dit qu'il est tombé. La perdre, ou la ranger sous un `data_quality` à
-`good`, revient à effacer la panne. Ce module garantit donc deux choses avant
-tout traitement aval — toute colonne nulle est nommée dans `null_reasons`, et
-`data_quality` décrit ce que la mesure vaut réellement.
-
-Les motifs de la source ne sont jamais réécrits : elle seule sait pourquoi son
-capteur s'est tu, l'ETL ne fait que combler son silence.
-
-Sa qualification, elle, ne peut pas être meilleure que ce que ses données
-montrent. Des deux — celle de la source et celle que le lot laisse déduire —
-c'est la plus sévère qui est retenue. La source peut donc alerter au-delà de ce
-que l'ETL voit, jamais en deçà : un `good` posé sur une puissance nulle ferait
-disparaître la panne de `idx_mesure_quality`, l'index d'audit des capteurs, qui
-ne regarde justement que les mesures non `good`.
-"""
+# **********************************************************************
+# * Nom     : quality.py                                               *
+# * Type    : Module                                                   *
+# * Sujet   : Qualification des mesures : ce qui manque, et à quel     *
+# *   point c'est grave                                                *
+# * Service : etl                                                      *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -34,13 +23,18 @@ from predict_common.schemas import (
     TARGET_COLUMN,
 )
 
+# Marque une cause déduite par l'ETL, non déclarée par la source.
 DERIVED_REASON_SUFFIX = ":undeclared"
 
+# Nombre d'absences à partir duquel l'heure est dite dégradée.
 DEGRADED_NULL_COUNT = 3
 
 
 def derive_data_quality(missing: Sequence[str]) -> str:
-    """Déduit la qualité d'une mesure des colonnes restées nulles."""
+    """Méthode : derive_data_quality
+    Description : Déduit la qualification d'une heure des colonnes qui lui
+      manquent.
+    """
     if not missing:
         return QUALITY_GOOD
     if TARGET_COLUMN in missing:
@@ -54,11 +48,9 @@ def complete_null_reasons(
     declared: Sequence[str],
     missing: Sequence[str],
 ) -> list[str]:
-    """Nomme les colonnes nulles d'une mesure que la source n'a pas expliquée.
-
-    Un seul motif de la source suffit à couvrir la ligne : `network_loss`
-    explique aussi bien un capteur muet que sept. Y ajouter un motif par
-    colonne inventerait des causes distinctes là où il n'y en a qu'une.
+    """Méthode : complete_null_reasons
+    Description : Garde les causes déclarées, ou les déduit des colonnes
+      absentes.
     """
     if declared:
         return [str(reason) for reason in declared]
@@ -66,17 +58,9 @@ def complete_null_reasons(
 
 
 def qualify(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
-    """Complète `null_reasons` et `data_quality` de chaque ligne du lot.
-
-    `columns` porte les colonnes de mesure surveillées. Les passer en argument
-    évite à ce module de connaître le schéma de la table, dont la
-    normalisation reste seule responsable.
-
-    Le passage est signé : `quality_source` bascule de `source` — le défaut de
-    la base, posé par le collecteur — à `etl`. Sans cette marque, le `good`
-    que le collecteur écrit faute de mieux et le `good` que ce module vient de
-    confirmer sont le même caractère, et une fenêtre non encore traitée passe
-    pour une fenêtre saine.
+    """Méthode : qualify
+    Description : Pose sur tout le lot les causes, la qualification et son
+      auteur.
     """
     if frame.empty:
         return frame
@@ -97,7 +81,10 @@ def missing_columns(
     frame: pd.DataFrame,
     columns: Sequence[str],
 ) -> list[tuple[str, ...]]:
-    """Nomme, pour chaque ligne, les colonnes surveillées restées nulles."""
+    """Méthode : missing_columns
+    Description : Liste, ligne par ligne, les colonnes surveillées qui sont
+      vides.
+    """
     watched = list(columns)
     absent = frame[watched].isna().to_numpy()
     return [
@@ -109,11 +96,8 @@ def missing_columns(
 
 
 def worst(qualities: Sequence[str]) -> str:
-    """Retient la plus sévère des qualifications d'un ensemble de mesures.
-
-    L'agrégation horaire des variables en a besoin : une heure qui contient
-    une minute critique n'est pas une heure `good`, et la moyenne des
-    qualifications ne veut rien dire.
+    """Méthode : worst
+    Description : Retient la plus sévère de plusieurs qualifications.
     """
     known = [value for value in qualities if value in DATA_QUALITY_VALUES]
     if not known:
@@ -122,10 +106,9 @@ def worst(qualities: Sequence[str]) -> str:
 
 
 def _settle_quality(declared: object, missing: Sequence[str]) -> str:
-    """Retient la plus sévère des deux qualifications possibles.
-
-    Une valeur hors du CHECK de la colonne est ignorée plutôt que soumise :
-    elle ferait échouer l'insertion du lot entier, et pas seulement la sienne.
+    """Méthode : _settle_quality
+    Description : Arbitre entre la qualification déclarée et celle que les
+      données imposent.
     """
     derived = derive_data_quality(missing)
     if declared not in DATA_QUALITY_VALUES:

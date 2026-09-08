@@ -1,9 +1,3 @@
-"""Imputation de la puissance dans une colonne séparée de la valeur brute.
-
-La garantie testée est double : la valeur brute ressort intacte de l'étage,
-et la valeur reconstruite dit toujours par quelle méthode elle a été obtenue.
-"""
-
 from __future__ import annotations
 
 import pandas as pd
@@ -23,7 +17,6 @@ from predict_common.schemas import (
 
 
 def series(make_raw, make_reading, values, site_id="SITE001"):
-    """Construit un lot horaire d'un site à partir de ses puissances."""
     readings = [
         make_reading(
             f"2026-09-02T{hour:02d}:00:00Z",

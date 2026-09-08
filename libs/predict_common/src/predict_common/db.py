@@ -1,45 +1,10 @@
-"""Reflet du schéma figé v1.0 : la table `mesure` et sa table d'exclusions.
-
-Ce module est ici, et non dans un service, parce que deux services écrivent
-la même table. Le collecteur y dépose la mesure telle que la source l'a
-servie ; l'ETL y repose ce qu'il en a déduit. Deux définitions de `mesure`
-donneraient deux vérités sur la même table, et c'est précisément ce que le
-repo `enervision-db` interdit en détenant le schéma.
-
-Le partage s'arrête là. Les *instructions* ne sont pas ici : le collecteur
-insère sans écraser, l'ETL complète sans toucher aux colonnes de la source, et
-ces deux politiques n'ont rien en commun sinon la table qu'elles visent. Les
-mélanger ici rendrait possible qu'un service écrive avec la politique de
-l'autre.
-
-L'idempotence n'est pas un confort. Le pipeline est rejoué à la main après
-incident, et la fenêtre rejouée recouvre toujours des lignes déjà écrites. La
-clé primaire composite (site_id, ts) porte tout : c'est elle que vise chaque
-ON CONFLICT.
-
-Attention : trois migrations du repo enervision-db doivent être appliquées.
-Le schéma figé v1.0 n'a ni `consumption_kw_imputed` ni `imputation_method`
-(`03_mesure_imputation.sql`), ni la table `ingestion_etat`
-(`06_ingestion_etat.sql`), ni `mesure.quality_source`
-(`07_mesure_quality_source.sql`) — les trois sont écrites par cette chaîne.
-
-Les déclarations ci-dessous sont relevées sur `enervision-db/initdb/01_schema.sql`
-et sur ces migrations. Seules les tables que cette chaîne écrit sont déclarées,
-et dans chacune, seules les colonnes qu'elle remplit : `inserted_at` et
-`ingestion_etat.updated_at` ont un DEFAULT côté base, qui date l'écriture mieux
-que nous.
-
-`prediction` n'est donc pas ici : c'est l'API EnerVision qui l'écrit, elle
-sert le contrat de prédiction à ses consommateurs et archive ce qu'elle rend.
-Le service d'inférence de ce repo calcule et répond ; ce qu'on fait de sa
-réponse ne le regarde pas.
-
-`modele`, en revanche, y est. Elle décrit le modèle en service, pas la
-prévision qu'il produit, et le seul geste qui change ce qu'elle doit dire est
-la promotion d'un alias dans MLflow — un geste de l'entraînement. L'API ne
-peut que la déduire en interrogeant le registre, ce qui donnerait deux
-sources pour un fait dont une seule est autoritaire.
-"""
+# **********************************************************************
+# * Nom     : db.py                                                    *
+# * Type    : Module                                                   *
+# * Sujet   : Reflet des tables écrites par la chaîne et écriture par  *
+# *   lots bornés                                                      *
+# * Service : predict_common (bibliothèque partagée)                   *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -69,6 +34,7 @@ from predict_common.schemas import (
     TIMESTAMP_COLUMN,
 )
 
+# Clé naturelle d'une mesure, sur laquelle porte l'upsert.
 CONFLICT_KEY = (SITE_COLUMN, TIMESTAMP_COLUMN)
 
 metadata = MetaData()
@@ -77,7 +43,10 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseError(RuntimeError):
-    """La base est absente de la configuration, ou refuse l'écriture."""
+    """Classe : DatabaseError
+    Description : La base est absente de la configuration, ou refuse
+      l'écriture.
+    """
 
 
 mesure = Table(
@@ -118,6 +87,7 @@ site = Table(
     Column("status", String(20), nullable=False),
 )
 
+# Colonnes du référentiel des sites, dans l'ordre écrit.
 SITE_COLUMNS = (
     "site_id",
     "site_type",
@@ -153,6 +123,7 @@ alerte = Table(
     Column("seuil", Numeric(12, 2)),
 )
 
+# Clé d'une alerte : son identifiant, donné par la source.
 ALERTE_KEY = ("alert_id",)
 
 capteur_etat = Table(
@@ -166,6 +137,7 @@ capteur_etat = Table(
     Column("releve_le", DateTime(timezone=True)),
 )
 
+# Clé de l'état courant d'un capteur.
 CAPTEUR_ETAT_KEY = ("site_id", "capteur")
 
 
@@ -179,11 +151,15 @@ capteur_panne = Table(
     Column("failing_until", DateTime(timezone=True)),
 )
 
+# Clé d'une panne : un capteur et l'instant où elle s'ouvre.
 CAPTEUR_PANNE_KEY = ("site_id", "capteur", "debut_le")
 
+# Clé de l'état d'ingestion : un état par site.
 INGESTION_KEY = ("site_id",)
 
+# Marque un état posé par la collecte au fil de l'eau.
 INGESTION_SOURCE_POLLER = "poller"
+# Marque un état posé par un rattrapage daté.
 INGESTION_SOURCE_BACKFILL = "backfill"
 
 modele = Table(
@@ -196,8 +172,10 @@ modele = Table(
     Column("actif", Boolean, nullable=False),
 )
 
+# Clé d'un modèle enregistré : son nom et sa version.
 MODELE_KEY = ("nom", "version")
 
+# Colonnes réécrites quand un modèle déjà inscrit est remis à jour.
 MODELE_UPDATED_COLUMNS = (
     "mlflow_run_id",
     "date_entrainement",
@@ -205,6 +183,7 @@ MODELE_UPDATED_COLUMNS = (
 )
 
 
+# Colonnes appartenant au collecteur, que l'ETL ne réécrit jamais.
 SOURCE_COLUMNS = (
     TIMESTAMP_COLUMN,
     SITE_COLUMN,
@@ -219,6 +198,7 @@ SOURCE_COLUMNS = (
     "data_quality",
 )
 
+# Colonnes déduites par l'ETL, seules réécrites par lui.
 DERIVED_COLUMNS = (
     "null_reasons",
     "data_quality",
@@ -229,22 +209,16 @@ DERIVED_COLUMNS = (
 
 
 def is_configured(database_url: str) -> bool:
-    """Dit si une URL de base a été fournie.
-
-    Une URL vide n'est jamais une désactivation ici : la base est la couche
-    brute de la chaîne. C'est l'appelant qui transforme ce faux en refus de
-    démarrer, avec un message qui nomme la variable manquante.
+    """Méthode : is_configured
+    Description : Dit si une URL de base a été fournie.
     """
     return bool(database_url.strip())
 
 
 def open_engine(database_url: str, pool_pre_ping: bool = False) -> Engine:
-    """Ouvre le moteur SQLAlchemy, en refusant une URL absente.
-
-    `pool_pre_ping` est réservé aux processus longs : un poller vit des jours,
-    et une connexion coupée par la base entre deux ticks échouerait sur la
-    première écriture au lieu d'être renouvelée. Un traitement daté n'en a pas
-    besoin et paierait un aller-retour par connexion.
+    """Méthode : open_engine
+    Description : Ouvre le moteur SQLAlchemy, en refusant une configuration
+      vide.
     """
     if not is_configured(database_url):
         raise DatabaseError(
@@ -256,23 +230,9 @@ def open_engine(database_url: str, pool_pre_ping: bool = False) -> Engine:
 
 
 def verify_schema(engine: Engine, tables: Sequence[Table]) -> None:
-    """Vérifie que la base porte les colonnes que la chaîne va écrire.
-
-    Le schéma vit dans un autre dépôt — les migrations Alembic de l'API — et
-    rien ne garantit qu'une base rencontrée sur un poste ou un environnement
-    de démonstration soit à jour. Quand elle ne l'est pas, l'échec arrivait au
-    milieu du chargement, sous la forme brute que remonte le driver :
-        UndefinedColumn: column "quality_source" of relation "mesure" does
-        not exist
-
-    Ce message ne dit ni quelle migration manque, ni combien de colonnes sont
-    concernées, ni que le reste de la chaîne fonctionnera de nouveau une fois
-    la base remise à niveau. Il arrive en plus APRÈS le calcul complet de la
-    journée, qui est alors perdu.
-
-    Le contrôle est une seule requête sur `information_schema`, faite au
-    démarrage. Il ne vérifie que ce que la chaîne écrit : une colonne ajoutée
-    au schéma et qu'aucun service ne remplit n'a pas à faire échouer un run.
+    """Méthode : verify_schema
+    Description : Vérifie que la base porte les tables et colonnes attendues,
+      et nomme ce qui manque.
     """
     expected: dict[str, set[str]] = {
         table.name: {column.name for column in table.columns} for table in tables
@@ -305,15 +265,9 @@ def write_batches(
     batch_size: int,
     build: Callable[[list[dict[str, Any]]], Any],
 ) -> int:
-    """Écrit les lignes par lots bornés, tous dans la même transaction.
-
-    `build` produit l'instruction d'un lot : la même mécanique sert les trois
-    écritures de la chaîne — la mesure brute, la mesure enrichie et
-    l'exclusion — qui n'ont en commun que d'être idempotentes et bornées.
-
-    Le compteur porte sur les lignes soumises, pas sur les lignes réellement
-    écrites : un ON CONFLICT ne remonte pas ce qu'il a ignoré, et faire croire
-    le contraire fausserait le suivi d'ingestion.
+    """Méthode : write_batches
+    Description : Écrit les lignes par lots bornés, tous dans la même
+      transaction.
     """
     if not records:
         return 0

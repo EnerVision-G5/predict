@@ -1,12 +1,3 @@
-"""Prévision multi-pas : historique lu, récurrence, fuites évitées.
-
-Le service ne recalcule pas les variables depuis les mesures brutes — ce
-serait refaire le travail de l'ETL avec un second jeu de règles. Il lit la
-dernière partition publiée. Les tests fixent donc ce qu'il fait de cet
-historique : où il puise ses décalages, comment il enchaîne les heures, et à
-quel moment il refuse de continuer plutôt que d'inventer.
-"""
-
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -42,7 +33,6 @@ TODAY = date(2026, 9, 10)
 
 
 def spec_for(root: Path) -> ForecastSpec:
-    """Réglages du service, pointés sur un stockage jetable."""
     return ForecastSpec(
         root=str(root),
         feature_version="v1",
@@ -53,7 +43,6 @@ def spec_for(root: Path) -> ForecastSpec:
 
 
 def features(day: date, site_id: str = "SITE001") -> pd.DataFrame:
-    """Partition de variables d'une journée, telle que l'ETL la publie."""
     stamps = pd.date_range(
         f"{day.isoformat()}T00:00:00Z", periods=24, freq="h", tz="UTC"
     )
@@ -76,7 +65,6 @@ def features(day: date, site_id: str = "SITE001") -> pd.DataFrame:
 
 
 def seed(root: Path, days: int = 3, site_id: str = "SITE001") -> None:
-    """Publie les dernières partitions de variables."""
     for offset in range(days):
         day = TODAY - timedelta(days=offset)
         io.write_frame(
@@ -87,7 +75,6 @@ def seed(root: Path, days: int = 3, site_id: str = "SITE001") -> None:
 
 
 def series(hours: int = 48) -> pd.Series:
-    """Série horaire observée, indexée sur le temps."""
     index = pd.date_range("2026-09-08T00:00:00Z", periods=hours, freq="h", tz="UTC")
     return pd.Series([50.0 + index_ % 24 for index_ in range(hours)], index=index)
 
@@ -143,8 +130,6 @@ def test_horizon_stamps_follow_the_last_observed_hour() -> None:
 
 
 class TestBuildRow:
-    """Une ligne de variables, ou rien — mais jamais une valeur inventée."""
-
     def test_the_calendar_columns_are_integers(self, tmp_path: Path) -> None:
         row = build_row(series(), horizon_stamps(series(), 1)[0], spec_for(tmp_path))
         assert isinstance(row["hour"], int)
@@ -176,8 +161,6 @@ class TestBuildRow:
 
 
 class TestPredictSeries:
-    """Chaque heure prédite nourrit la suivante."""
-
     def test_the_horizon_is_served_in_full(self, tmp_path: Path) -> None:
         points = predict_series(
             lambda frame: [42.0], series(), 6, spec_for(tmp_path), COLUMNS
@@ -215,8 +198,6 @@ class TestPredictSeries:
 
 
 class TestConfidenceBand:
-    """La bande dit ce que vaut la prévision, ou ne dit rien."""
-
     def test_no_spread_gives_no_bounds(self) -> None:
         assert confidence_band(50.0, 1, None) == (None, None)
 
@@ -239,11 +220,6 @@ class TestConfidenceBand:
 
 
 def test_la_fenetre_n_est_lue_qu_une_fois_dans_le_ttl(monkeypatch) -> None:
-    """Deux prévisions rapprochées ne relisent pas le stockage.
-
-    L'ETL ne publie qu'une fois par cycle : relire plus souvent ne peut rien
-    apprendre de neuf.
-    """
     forecast.reset_history_cache()
     reads = []
 
@@ -266,7 +242,6 @@ def test_la_fenetre_n_est_lue_qu_une_fois_dans_le_ttl(monkeypatch) -> None:
 
 
 def test_un_ttl_nul_relit_a_chaque_fois(monkeypatch) -> None:
-    """Le cache se désactive par configuration, sans changer le reste."""
     forecast.reset_history_cache()
     reads = []
 
@@ -287,12 +262,6 @@ def test_un_ttl_nul_relit_a_chaque_fois(monkeypatch) -> None:
 
 
 def test_un_changement_de_journee_invalide_le_cache(monkeypatch) -> None:
-    """La clé porte la journée : minuit passé, la fenêtre a bougé.
-
-    Sans elle, un service démarré la veille servirait indéfiniment les
-    partitions de la veille, et `feature_lag_hours` grandirait sans que rien
-    ne relise.
-    """
     forecast.reset_history_cache()
     reads = []
 
@@ -314,7 +283,6 @@ def test_un_changement_de_journee_invalide_le_cache(monkeypatch) -> None:
 
 
 def spec_with_fallback(root: Path, years: int = 2) -> ForecastSpec:
-    """Mêmes réglages, avec le repli activé."""
     return ForecastSpec(
         root=str(root),
         feature_version="v1",
@@ -326,7 +294,6 @@ def spec_with_fallback(root: Path, years: int = 2) -> ForecastSpec:
 
 
 def seed_reference(root: Path, years: int, days: int = 3) -> date:
-    """Publie des partitions décalées de `years` années de 52 semaines."""
     origin = date.today() - timedelta(
         days=forecast.REFERENCE_SHIFT_DAYS * years
     )

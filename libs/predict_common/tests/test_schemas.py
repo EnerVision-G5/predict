@@ -1,12 +1,3 @@
-"""Schémas des couches : ce qu'un artefact doit contenir pour être lisible.
-
-Un schéma est un contrat entre deux services qui ne se connaissent pas. Les
-tests fixent donc ce qu'il accepte autant que ce qu'il refuse : un schéma trop
-permissif laisserait passer une partition fausse, un schéma trop strict
-refuserait une partition que le producteur vient d'écrire valide — et ce
-second cas est le pire, parce qu'il décrédibilise le contrôle.
-"""
-
 from __future__ import annotations
 
 import numpy
@@ -31,7 +22,6 @@ WINDOW = 24
 
 
 def raw_row(**overrides) -> pd.DataFrame:
-    """Construit une ligne de `mesure` conforme, avant surcharge."""
     row = {
         "ts": pd.Timestamp("2026-09-02T08:00:00Z"),
         "site_id": "SITE001",
@@ -44,7 +34,6 @@ def raw_row(**overrides) -> pd.DataFrame:
 
 
 def features_row(**overrides) -> pd.DataFrame:
-    """Construit une ligne de variables conforme, avant surcharge."""
     row = {
         "ts": pd.Timestamp("2026-09-02T08:00:00Z"),
         "site_id": "SITE001",

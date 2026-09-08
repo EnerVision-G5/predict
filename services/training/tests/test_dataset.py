@@ -1,12 +1,3 @@
-"""Jeu d'apprentissage : lecture des partitions et découpe temporelle.
-
-La garantie centrale est que le modèle ne voit jamais le futur. Une coupe au
-hasard le laisserait apprendre la fin d'une journée dont il doit prédire le
-début : ses métriques seraient excellentes en validation et fausses en
-production, ce qui est la pire des deux erreurs possibles — celle qui ne se
-voit qu'une fois déployée.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -35,7 +26,6 @@ END = date(2026, 9, 10)
 
 
 def features(day: date, hours: int = 24, site_id: str = "SITE001", **columns):
-    """Partition de variables d'une journée, telle que l'ETL la publie."""
     stamps = pd.date_range(
         f"{day.isoformat()}T00:00:00Z", periods=hours, freq="h", tz="UTC"
     )
@@ -61,7 +51,6 @@ def features(day: date, hours: int = 24, site_id: str = "SITE001", **columns):
 
 
 def seed(root: Path, days: int = 6, **columns) -> None:
-    """Publie `days` partitions de variables se terminant le jour de référence."""
     for offset in range(days):
         day = END - timedelta(days=offset)
         io.write_frame(
@@ -137,8 +126,6 @@ def test_select_keeps_a_lightly_imputed_target() -> None:
 
 
 class TestSplit:
-    """Trois blocs, dans l'ordre du temps, et jamais au hasard."""
-
     def test_the_blocks_follow_one_another_in_time(self) -> None:
         frame = pd.concat(
             [features(END - timedelta(days=offset)) for offset in range(6)],
@@ -200,10 +187,7 @@ def test_matrices_refuse_a_partition_missing_a_variable() -> None:
 
 
 class TestExcludeWindow:
-    """Le banc d'arbitrage ne vaut que s'il est tenu hors de l'apprentissage."""
-
     def frame(self) -> pd.DataFrame:
-        """Trois journées consécutives, une partition par jour."""
         return pd.concat(
             [features(END - timedelta(days=offset)) for offset in range(3)],
             ignore_index=True,

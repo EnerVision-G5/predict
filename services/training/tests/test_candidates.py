@@ -1,11 +1,3 @@
-"""Les familles opposées par le challenge, derrière une seule interface.
-
-Ce qui compte ici n'est pas laquelle gagne — c'est le banc qui le dit, sur des
-données réelles — mais que les trois soient réellement interchangeables. Un
-candidat qui échouerait là où un autre apprend produirait un classement où
-l'absence vaut défaite, ce qui n'est pas une comparaison.
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -32,7 +24,6 @@ PARAMS = {
 
 
 def learnable(rows: int = ROWS) -> tuple[pd.DataFrame, pd.Series]:
-    """Jeu synthétique linéaire, à la portée des trois familles."""
     generator = np.random.default_rng(seed=42)
     frame = pd.DataFrame(
         {column: generator.normal(size=rows) for column in COLUMNS}
@@ -41,7 +32,6 @@ def learnable(rows: int = ROWS) -> tuple[pd.DataFrame, pd.Series]:
 
 
 def fit_named(name: str, features: pd.DataFrame, target: pd.Series):
-    """Ajuste un candidat sur le même jeu que ses concurrents."""
     valid_features, valid_target = learnable(rows=60)
     return fit_candidate(
         name,
@@ -55,8 +45,6 @@ def fit_named(name: str, features: pd.DataFrame, target: pd.Series):
 
 
 class TestLearner:
-    """Le catalogue est nommé : une faute de frappe doit se lire."""
-
     def test_the_default_learner_is_registered(self) -> None:
         assert learner(DEFAULT_LEARNER).name == DEFAULT_LEARNER
 

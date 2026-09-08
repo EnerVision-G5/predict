@@ -1,10 +1,3 @@
-"""Qualification des mesures : aucune valeur nulle sans cause.
-
-La garantie testée est celle du ticket EV-08 : une mesure nulle qui
-traverserait l'ETL sans motif ni qualification aurait perdu la panne capteur,
-et aucune étape aval ne saurait la reconstituer.
-"""
-
 from __future__ import annotations
 
 import pandas as pd
@@ -146,8 +139,6 @@ def test_qualify_counts_an_unreadable_value_as_a_silent_sensor(
 
 
 class TestWorst:
-    """L'agrégation horaire retient la pire qualification, pas leur moyenne."""
-
     def test_a_critical_minute_makes_the_hour_critical(self) -> None:
         assert worst([QUALITY_GOOD, QUALITY_CRITICAL, QUALITY_GOOD]) == QUALITY_CRITICAL
 
@@ -162,14 +153,6 @@ class TestWorst:
 
 
 class TestQualitySource:
-    """La marque qui distingue un `good` posé d'un `good` confirmé.
-
-    `data_quality` est NOT NULL DEFAULT 'good' : le collecteur retombe sur le
-    défaut quand la source se tait. Sans cette marque, l'API métier compterait
-    0 % de mesures dégradées sur une journée que l'ETL n'a pas encore vue, et
-    le site paraîtrait parfait — l'inverse de ce que l'indicateur doit dire.
-    """
-
     def test_a_qualified_batch_is_signed_by_the_etl(
         self, make_raw, make_reading
     ) -> None:

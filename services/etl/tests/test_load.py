@@ -1,20 +1,3 @@
-"""Écriture de retour dans `mesure` : ce que l'ETL a le droit de réécrire.
-
-Aucun test ne joint PostgreSQL. Trois garanties comptent ici.
-
-Le `DO UPDATE` ne porte que sur les colonnes déduites. C'est ce qui empêche
-l'étage dont le métier est de décrire la panne d'effacer la panne elle-même :
-même si le lot soumis portait une consommation différente de celle en base, la
-base garderait celle de la source.
-
-Il repose, il n'ignore pas. Contrairement au collecteur, l'ETL a quelque chose
-de nouveau à dire sur une ligne déjà présente : sans `DO UPDATE`, corriger une
-règle de qualification n'aurait aucun effet sur l'historique déjà traité.
-
-Les manquants pandas sortent en NULL et non en NaN flottant, qu'une colonne
-NUMERIC accepterait en polluant silencieusement les agrégats.
-"""
-
 from __future__ import annotations
 
 import pandas as pd
@@ -36,7 +19,6 @@ from predict_common.db import DERIVED_COLUMNS, write_batches
 
 
 def to_loadable(make_raw, readings):
-    """Fait traverser au lot les étages qui précèdent le chargement."""
     return impute_frame(to_measures(make_raw(readings)))
 
 

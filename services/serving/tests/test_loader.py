@@ -1,11 +1,3 @@
-"""Résolution du modèle servi : alias, signature, tolérance à l'échec.
-
-Aucun test ne joint MLflow. Ce qui compte ici est le comportement du service
-face à ce que le registre lui rend — un modèle signé, un modèle sans
-signature, rien du tout — parce que c'est ce comportement qui décide si le
-conteneur vit ou redémarre en boucle.
-"""
-
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -26,8 +18,6 @@ COLUMNS = ("hour", "lag_1h")
 
 
 class FakeSignatureInputs:
-    """Signature minimale, telle que MLflow la restitue."""
-
     def __init__(self, names, types):
         self._names = list(names)
         self._types = list(types)
@@ -40,8 +30,6 @@ class FakeSignatureInputs:
 
 
 class FakeModel:
-    """Modèle pyfunc factice qui mémorise ce qu'on lui présente."""
-
     def __init__(self, signed: bool = True) -> None:
         inputs = (
             FakeSignatureInputs(COLUMNS, [numpy.dtype("int32"), numpy.dtype("float64")])
@@ -60,7 +48,6 @@ class FakeModel:
 
 
 def loaded(model: FakeModel) -> LoadedModel:
-    """Construit un modèle chargé à partir du faux."""
     inputs = model.metadata.signature.inputs
     return LoadedModel(
         model=model,
@@ -72,8 +59,6 @@ def loaded(model: FakeModel) -> LoadedModel:
 
 
 class FakeVersion:
-    """Entrée de registre telle que MLflow la restitue pour un alias."""
-
     def __init__(self, version: str = "3", tags: dict[str, str] | None = None) -> None:
         self.version = version
         self.tags = dict(tags or {})
@@ -87,8 +72,6 @@ def registry_serving(
     model: FakeModel | None,
     entry: FakeVersion | None = SERVED_ENTRY,
 ) -> ModelRegistry:
-    """Registre dont le chargement rend le modèle demandé, ou échoue."""
-
     def load_model(uri: str):
         if model is None:
             raise RuntimeError("registre injoignable")
@@ -131,8 +114,6 @@ def test_the_input_columns_come_from_the_signature(monkeypatch) -> None:
 
 
 class TestConform:
-    """Le lot est présenté au modèle comme sa signature l'exige."""
-
     def test_the_columns_are_reordered(self) -> None:
         model = FakeModel()
         frame = pd.DataFrame({"lag_1h": [50.0], "hour": [8]})
@@ -156,8 +137,6 @@ class TestConform:
 
 
 class TestAliasParsing:
-    """La version rendue est celle du registre, pas l'identifiant interne."""
-
     def test_an_alias_uri_is_decomposed(self) -> None:
         assert loader._parse_alias("models:/enervision_xgboost@champion") == (
             "enervision_xgboost",
@@ -179,8 +158,6 @@ class TestAliasParsing:
 
 
 class TestResidualStd:
-    """La dispersion servie vient du tag de la version, jamais d'un défaut."""
-
     def test_the_tag_is_read(self, monkeypatch) -> None:
         registry = registry_serving(
             monkeypatch, FakeModel(), FakeVersion("3", {"residual_std": "4.25"})

@@ -1,24 +1,3 @@
-"""La règle centrale de la découpe, rendue exécutable.
-
-Aucun service n'importe le code d'un autre. Si `etl` faisait
-`from collector.client import fetch`, il n'y aurait plus deux services mais un
-monolithe avec deux dossiers : le déploiement séparé deviendrait un mensonge,
-et une modification du collecteur casserait l'ETL sans que rien ne le
-signale.
-
-La règle est déjà tenue par les dépendances déclarées — aucun `pyproject.toml`
-de service ne nomme un autre service, donc un tel import ne s'installerait pas
-dans l'image. Ce test la vérifie une seconde fois, à la source, parce qu'un
-environnement de développement unique installe les quatre services ensemble :
-sur un poste, l'import fautif marcherait, et la panne n'apparaîtrait qu'au
-premier déploiement.
-
-Le fichier vérifie enfin ce que la bibliothèque partagée a le droit de faire.
-`predict_common` ne connaît aucun service ni aucune règle métier ; le jour où
-elle en porterait une, elle serait redevenue le monolithe que la découpe vient
-de défaire.
-"""
-
 from __future__ import annotations
 
 import ast
@@ -34,17 +13,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def service_sources(name: str) -> list[Path]:
-    """Retourne les fichiers de code d'un service, tests exclus.
-
-    Les tests sont exclus parce qu'ils n'entrent pas dans l'image : ils
-    peuvent lire le schéma partagé sans que cela dise quoi que ce soit du
-    couplage entre services.
-    """
     return sorted((ROOT / "services" / name / "src").rglob("*.py"))
 
 
 def imported_roots(path: Path) -> set[str]:
-    """Retourne les paquets racines importés par un fichier."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     roots: set[str] = set()
     for node in ast.walk(tree):

@@ -1,10 +1,3 @@
-"""Mise à l'écart des mesures inexploitables, et cause de chaque écart.
-
-Ce qui compte ici est le tri : quelles mesures sont écartées, lesquelles ne le
-sont pas, et avec quelle cause. L'écriture de ces exclusions vers TimescaleDB
-est une autre affaire, testée dans `test_sink_db`.
-"""
-
 from __future__ import annotations
 
 from etl.clean import deduplicate, to_measures
@@ -18,7 +11,6 @@ from etl.impute import impute_frame
 
 
 def ingest(make_raw, readings):
-    """Fait traverser au lot les étages qui précèdent l'exclusion."""
     return impute_frame(deduplicate(to_measures(make_raw(readings))))
 
 

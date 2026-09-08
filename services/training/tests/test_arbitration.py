@@ -1,10 +1,3 @@
-"""Le banc d'arbitrage : la fenêtre commune où les candidats se comparent.
-
-La propriété centrale est que la fenêtre voyage avec la mesure. Sans elle, deux
-MAE mesurées sur des périodes différentes se compareraient sans que rien ne le
-signale — ce que faisait la lecture côte à côte des runs dans l'interface.
-"""
-
 from __future__ import annotations
 
 from datetime import date
@@ -36,7 +29,6 @@ BENCH = Bench(start=date(2026, 9, 1), end=date(2026, 9, 3), pinned=False)
 
 
 def config_for(start: str = "", end: str = "", days: int = 14) -> Config:
-    """Configuration minimale du bloc `training.arbitration`."""
     return Config(
         values={
             "training": {
@@ -47,7 +39,6 @@ def config_for(start: str = "", end: str = "", days: int = 14) -> Config:
 
 
 def bench_frame() -> pd.DataFrame:
-    """Quatre heures dont la cible suit exactement `lag_24h`."""
     frame = pd.DataFrame(
         {column: [1.0, 2.0, 3.0, 4.0] for column in COLUMNS}
     )
@@ -58,8 +49,6 @@ def bench_frame() -> pd.DataFrame:
 
 
 class TestResolveBench:
-    """Le banc est glissant par défaut, figé quand `conf/` le décide."""
-
     def test_the_sliding_bench_ends_on_the_requested_day(self) -> None:
         bench = resolve_bench(config_for(days=3), END)
         assert (bench.start, bench.end) == (date(2026, 9, 8), END)
@@ -84,8 +73,6 @@ class TestResolveBench:
 
 
 class TestBench:
-    """La fenêtre est ce qui rend deux mesures comparables ou non."""
-
     def test_the_label_is_what_travels_in_the_run(self) -> None:
         assert BENCH.label == "2026-09-01/2026-09-03"
 
@@ -122,8 +109,6 @@ def test_bench_metrics_do_not_collide_with_the_test_block() -> None:
 
 
 class TestReadBack:
-    """Ce qu'un run passé permet de relire, et ce qu'il ne permet pas."""
-
     def test_a_run_carrying_a_bench_is_read_back(self) -> None:
         result = read_bench(
             {"arbitrage_mae": 3.0, "mae": 9.0},

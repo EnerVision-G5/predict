@@ -1,43 +1,10 @@
-"""Surveillance de l'écart entre ce que le modèle prédit et ce qui est mesuré.
-
-    python -m training.drift
-    python -m training.drift --since 2026-09-01 --until 2026-09-07
-
-Un modèle ne se dégrade pas d'un coup : il se dégrade parce que le monde
-change sous lui — un site qui déménage sa production, un capteur remplacé, une
-saison qui n'était pas dans l'historique. Les métriques du jour de
-l'entraînement ne disent rien de cela, puisqu'elles ont été mesurées sur des
-données du passé. Ce module rejoue le modèle en service sur les mesures
-arrivées depuis, et regarde s'il se trompe davantage qu'à sa naissance.
-
-Trois décisions structurent le fichier.
-
-**L'écart est mesuré à un pas, pas sur l'horizon complet.** Le service
-d'inférence prédit par récurrence sur 48 heures, et son erreur s'accumule
-mécaniquement à chaque pas ; la mêler à la dégradation du modèle rendrait les
-deux indiscernables. Ici chaque heure est prédite à partir de ses décalages
-réels — la même tâche que celle mesurée à l'entraînement, donc la seule
-comparable.
-
-**Le seuil est un rapport, pas une valeur absolue.** Un écart de 20 kW n'a pas
-le même sens sur un bureau de 200 kW et sur une usine de 1000. La référence
-est l'erreur du modèle sur son jeu de test, lue dans le run qui l'a produit :
-elle suit le modèle, et promouvoir une autre version change la référence du
-même geste.
-
-**Le verdict est un code de sortie.** Un ordonnanceur n'a pas à lire un
-journal pour savoir s'il doit alerter. Le code 2 dit « dérive », distinct du 1
-qui dit « le calcul lui-même a échoué » — les confondre ferait chercher un
-problème de modèle là où il n'y a qu'une base injoignable.
-
-**La mesure est faite site par site autant que d'ensemble.** Une MAE unique
-sur tout le parc est dominée par le plus gros consommateur : elle dit ce que
-le parc coûte en erreur, pas où l'erreur se trouve, et un bureau qui double la
-sienne disparaît dans la moyenne d'une usine dix fois plus grande. Le code 2
-sort donc aussi quand un seul site dérive, sans quoi le détail par site serait
-publié sans jamais être écouté. La référence, elle, reste celle du modèle et
-n'est pas propre au site : voir `SiteMeasure.verdict`.
-"""
+# **********************************************************************
+# * Nom     : drift.py                                                 *
+# * Type    : Point d'entrée                                           *
+# * Sujet   : Écart entre le modèle servi et les mesures arrivées      *
+# *   depuis, verdict en code de sortie                                *
+# * Service : training                                                 *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -59,27 +26,38 @@ from training import tracking
 from training.dataset import DatasetError, matrices, read_features
 from training.model import DECISION_METRIC, evaluate
 
+# Le modèle servi tient ses métriques.
 EXIT_OK = 0
+# Le calcul lui-même a échoué.
 EXIT_FAILED = 1
+# Dérive constatée : c'est un verdict, pas une panne.
 EXIT_DRIFTED = 2
 
 
+# Le modèle reste dans les clous de sa référence.
 VERDICT_STABLE = "stable"
+# L'erreur dépasse le seuil toléré face à la référence.
 VERDICT_DRIFTED = "dérive"
+# Trop peu d'heures mesurées pour conclure.
 VERDICT_UNDECIDED = "indécis"
+# Le run de référence n'a pas de métrique comparable.
 VERDICT_NO_REFERENCE = "sans référence"
 
 logger = logging.getLogger(__name__)
 
 
 class MonitoringError(RuntimeError):
-    """La surveillance n'a pas pu être menée à son terme."""
+    """Classe : MonitoringError
+    Description : La surveillance n'a pas pu mesurer ce qu'elle devait.
+    """
 
 
 @dataclass(frozen=True)
 class DriftSettings:
-    """Ce qui règle une évaluation, extrait de la configuration une fois."""
-
+    """Classe : DriftSettings
+    Description : Fenêtre, seuils et modèle surveillé, lus dans la
+      configuration.
+    """
     experiment: str
     window_days: int
     alert_ratio: float
@@ -90,7 +68,10 @@ class DriftSettings:
 
     @classmethod
     def from_config(cls, config: Config) -> DriftSettings:
-        """Lit le bloc `monitoring` et le nom du modèle surveillé."""
+        """Méthode : from_config
+        Description : Construit les réglages depuis le bloc monitoring de la
+          configuration.
+        """
         return cls(
             experiment=config.get_str("monitoring.experiment"),
             window_days=config.get_int("monitoring.window_days"),
@@ -106,12 +87,8 @@ def error_ratio(
     metrics: dict[str, float],
     baseline: dict[str, float],
 ) -> float | None:
-    """Rapport entre l'erreur mesurée et celle de l'entraînement.
-
-    `None` quand la référence manque ou vaut zéro : un modèle enregistré sans
-    métrique de test ne permet aucune comparaison, inventer un rapport de 1
-    laisserait croire que tout va bien, et diviser par zéro donnerait un
-    infini, donc une alerte permanente.
+    """Méthode : error_ratio
+    Description : Rapport entre l'erreur mesurée et celle de référence.
     """
     reference = baseline.get(DECISION_METRIC)
     if not reference:
@@ -126,11 +103,9 @@ def verdict_for(
     min_rows: int,
     alert_ratio: float,
 ) -> str:
-    """Conclut, ou dit pourquoi il n'y a rien à conclure.
-
-    Sortie ici plutôt que portée par le rapport : la même règle tranche pour
-    l'ensemble de la fenêtre et pour chacun de ses sites, avec un plancher de
-    lignes différent. L'écrire deux fois laisserait les deux dériver.
+    """Méthode : verdict_for
+    Description : Tranche entre stable, dérive et indécis selon le volume et le
+      seuil.
     """
     if rows < min_rows:
         return VERDICT_UNDECIDED
@@ -142,8 +117,9 @@ def verdict_for(
 
 @dataclass(frozen=True)
 class SiteMeasure:
-    """Ce que le modèle servi a donné sur un seul site de la fenêtre."""
-
+    """Classe : SiteMeasure
+    Description : Ce qu'un site a mesuré sur la fenêtre surveillée.
+    """
     site_id: str
     metrics: dict[str, float]
     rows: int
@@ -153,14 +129,8 @@ class SiteMeasure:
         settings: DriftSettings,
         baseline: dict[str, float],
     ) -> str:
-        """Conclut pour ce site, avec le plancher de lignes qui lui convient.
-
-        La référence reste celle du modèle, mesurée sur tout son jeu de test :
-        elle n'est pas propre au site. Un site structurellement plus difficile
-        que la moyenne paraîtra donc dégradé dès le premier jour. Ce verdict
-        sert à ranger les sites entre eux et à voir l'un d'eux se détacher, pas
-        à juger un site dans l'absolu — une référence par site demanderait que
-        l'entraînement en enregistre une, ce qu'il ne fait pas encore.
+        """Méthode : verdict
+        Description : Verdict propre à ce périmètre, avec ses seuils.
         """
         return verdict_for(
             self.metrics,
@@ -173,8 +143,10 @@ class SiteMeasure:
 
 @dataclass(frozen=True)
 class DriftReport:
-    """Ce qu'une évaluation a mesuré, et ce qu'elle en conclut."""
-
+    """Classe : DriftReport
+    Description : Bilan de la surveillance : ensemble, référence et détail par
+      site.
+    """
     metrics: dict[str, float]
     baseline: dict[str, float]
     rows: int
@@ -184,11 +156,15 @@ class DriftReport:
 
     @property
     def ratio(self) -> float | None:
-        """Rapport entre l'erreur mesurée et celle de l'entraînement."""
+        """Méthode : ratio
+        Description : Rapport d'erreur de l'ensemble face à la référence.
+        """
         return error_ratio(self.metrics, self.baseline)
 
     def verdict(self, settings: DriftSettings) -> str:
-        """Dit ce que la mesure d'ensemble permet de conclure."""
+        """Méthode : verdict
+        Description : Verdict propre à ce périmètre, avec ses seuils.
+        """
         return verdict_for(
             self.metrics,
             self.baseline,
@@ -198,12 +174,8 @@ class DriftReport:
         )
 
     def drifted_sites(self, settings: DriftSettings) -> tuple[str, ...]:
-        """Sites dont l'erreur dépasse le seuil, dans l'ordre alphabétique.
-
-        C'est la raison d'être de la découpe. Une MAE d'ensemble est dominée
-        par le plus gros consommateur : un site de bureau qui double son
-        erreur disparaît dans la moyenne d'une usine dix fois plus grande, et
-        la dérive qu'on cherche est précisément celle-là.
+        """Méthode : drifted_sites
+        Description : Sites dont l'erreur dépasse le seuil à eux seuls.
         """
         return tuple(
             site.site_id
@@ -217,10 +189,9 @@ def window(
     until: date | None,
     window_days: int,
 ) -> tuple[date, date]:
-    """Retourne la fenêtre évaluée, bornes comprises.
-
-    Sans borne, on regarde les derniers jours : c'est ce que fait un
-    ordonnanceur quotidien, pour qui la fenêtre glisse et n'a pas à être dite.
+    """Méthode : window
+    Description : Détermine la fenêtre surveillée à partir des bornes
+      demandées.
     """
     if window_days < 1:
         raise MonitoringError("La fenêtre de surveillance couvre au moins un jour.")
@@ -232,11 +203,8 @@ def window(
 
 
 def load_served_model(settings: DriftSettings) -> tuple[object, str]:
-    """Charge le modèle en service et retourne sa version du registre.
-
-    Le modèle surveillé est celui que le service sert, pas le dernier
-    entraîné : surveiller un `challenger` que personne n'utilise ne dirait
-    rien de ce que les consommateurs reçoivent.
+    """Méthode : load_served_model
+    Description : Charge le modèle actuellement servi et son numéro de version.
     """
     uri = f"models:/{settings.registered_model}@{settings.alias}"
     try:
@@ -252,18 +220,8 @@ def measure(
     frame: pd.DataFrame,
     columns: Sequence[str],
 ) -> dict[str, float]:
-    """Compare, heure par heure, ce que le modèle prédit à ce qui a été mesuré.
-
-    Les décalages viennent des mesures réelles et non de prédictions
-    antérieures : c'est la tâche à un pas, celle qu'on sait comparer à
-    l'entraînement. Le service, lui, prédit par récurrence, et son erreur
-    grandit avec l'horizon pour une raison qui n'a rien à voir avec la dérive.
-
-    C'est aussi pourquoi ce nombre n'est pas celui que l'API métier publie
-    sous « écart prédiction / consommation réelle » : celui-là compare les
-    prévisions réellement servies, récursives, à ce qui est arrivé ensuite.
-    Les deux sont justes, celui-ci sera toujours le meilleur des deux, et les
-    afficher sous le même libellé serait un contresens.
+    """Méthode : measure
+    Description : Mesure le modèle sur un lot de variables déjà lu.
     """
     explanatory, observed = matrices(frame, columns)
     predicted = model.predict(explanatory)
@@ -275,14 +233,9 @@ def measure_sites(
     frame: pd.DataFrame,
     columns: Sequence[str],
 ) -> tuple[SiteMeasure, ...]:
-    """Refait la même mesure, site par site, dans l'ordre des identifiants.
-
-    Une moyenne d'ensemble est dominée par le plus gros consommateur : elle
-    dit ce que le parc coûte en erreur, pas où l'erreur se trouve. Le tri par
-    identifiant rend le journal comparable d'un run à l'autre.
-
-    Une partition dépourvue de la colonne de site rend un tuple vide plutôt
-    qu'une erreur : la mesure d'ensemble, elle, reste valable.
+    """Méthode : measure_sites
+    Description : Mesure le modèle site par site, si la partition les
+      distingue.
     """
     if SITE_COLUMN not in frame.columns:
         logger.warning(
@@ -306,7 +259,9 @@ def evaluate_window(
     since: date,
     until: date,
 ) -> DriftReport:
-    """Mesure l'écart du modèle servi sur les mesures d'une fenêtre."""
+    """Méthode : evaluate_window
+    Description : Lit la fenêtre, mesure le modèle servi et compose le bilan.
+    """
     frame = read_features(
         config.get_str("storage.root"), version_of_features, since, until
     )
@@ -330,11 +285,8 @@ def evaluate_window(
 
 
 def publish(report: DriftReport, settings: DriftSettings, feature_version: str) -> None:
-    """Écrit la mesure dans MLflow, dans l'expérience de surveillance.
-
-    Un run par évaluation, et non un run unique qu'on rallongerait : chaque
-    fenêtre est un fait daté, et la vue « Chart » de l'expérience trace la
-    série sans qu'on ait à tenir un identifiant de run entre deux exécutions.
+    """Méthode : publish
+    Description : Enregistre le bilan dans sa propre expérience MLflow.
     """
     mlflow.set_experiment(settings.experiment)
     with mlflow.start_run(run_name=f"drift-{report.window.split('/')[-1]}"):
@@ -360,13 +312,9 @@ def publish(report: DriftReport, settings: DriftSettings, feature_version: str) 
 
 
 def run(config: Config, since: date | None, until: date | None, version: str) -> int:
-    """Mesure l'écart, le publie, et retourne le code de sortie qui convient.
-
-    Le code 2 sort dès qu'un site dérive, et pas seulement quand l'ensemble
-    dérive. C'est ce que la découpe par site sert à voir : une MAE globale est
-    dominée par le plus gros consommateur, et attendre qu'elle bouge
-    reviendrait à ne jamais réagir à la dérive d'un petit site — c'est-à-dire
-    à publier un détail par site sans jamais l'écouter.
+    """Méthode : run
+    Description : Surveille la fenêtre demandée et rend le code de sortie du
+      verdict.
     """
     settings = DriftSettings.from_config(config)
     mlflow.set_tracking_uri(config.get_str("mlflow.tracking_uri"))
@@ -385,7 +333,9 @@ def run(config: Config, since: date | None, until: date | None, version: str) ->
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Analyse la ligne de commande de la surveillance."""
+    """Méthode : parse_args
+    Description : Analyse la ligne de commande de la surveillance.
+    """
     parser = argparse.ArgumentParser(
         prog="training.drift",
         description="Écart entre le modèle servi et les mesures arrivées depuis.",
@@ -405,7 +355,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Point d'entrée de la surveillance."""
+    """Méthode : main
+    Description : Point d'entrée : mesure la dérive et rend son verdict en code
+      de sortie.
+    """
     _configure_logging()
     args = parse_args(argv)
     try:
@@ -420,11 +373,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _baseline(settings: DriftSettings) -> dict[str, float]:
-    """Retourne les métriques de référence, ou rien si elles manquent.
-
-    L'absence de référence n'interrompt pas la mesure : l'écart brut reste
-    utile, et le journal dira qu'il n'a pas pu être rapporté à quoi que ce
-    soit.
+    """Méthode : _baseline
+    Description : Lit les métriques de référence, sans faire échouer la mesure
+      si elles manquent.
     """
     try:
         return tracking.baseline_metrics(settings.registered_model, settings.alias)
@@ -439,7 +390,9 @@ def _log_verdict(
     verdict: str,
     ratio: float | None,
 ) -> None:
-    """Journalise la conclusion, en disant toujours sur quoi elle repose."""
+    """Méthode : _log_verdict
+    Description : Journalise le verdict d'ensemble et ce qui l'a fondé.
+    """
     mesure = report.metrics[DECISION_METRIC]
     reference = report.baseline.get(DECISION_METRIC)
     if verdict == VERDICT_UNDECIDED:
@@ -473,11 +426,9 @@ def _log_verdict(
 
 
 def _publish_sites(report: DriftReport, settings: DriftSettings) -> None:
-    """Publie le détail par site : une métrique et un tag par identifiant.
-
-    Les noms sont préfixés par le site plutôt que regroupés dans un seul
-    dictionnaire : la vue « Chart » de MLflow trace une métrique nommée, et un
-    dictionnaire ne s'y trace pas.
+    """Méthode : _publish_sites
+    Description : Enregistre les mesures et verdicts de chaque site dans le
+      run.
     """
     for site in report.sites:
         for name, value in site.metrics.items():
@@ -493,10 +444,8 @@ def _log_sites(
     settings: DriftSettings,
     drifted: Sequence[str],
 ) -> None:
-    """Journalise le détail par site, du plus en erreur au moins en erreur.
-
-    Le tri par erreur décroissante, et non par identifiant : ce qu'on vient
-    lire dans ce journal, c'est quel site s'est détaché.
+    """Méthode : _log_sites
+    Description : Journalise le détail par site, du plus dégradé au moins.
     """
     if not report.sites:
         return
@@ -518,11 +467,9 @@ def _log_sites(
 
 
 def _configure_logging() -> None:
-    """Arme le journal, et met la sortie standard à l'abri de l'encodage local.
-
-    MLflow imprime des emoji quand il rend la main ; une console Windows en
-    cp1252 lève alors une UnicodeEncodeError au beau milieu d'un run qui, lui,
-    s'est bien passé.
+    """Méthode : _configure_logging
+    Description : Arme le journal et met la sortie à l'abri de l'encodage
+      local.
     """
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)

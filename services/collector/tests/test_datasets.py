@@ -1,15 +1,3 @@
-"""Import de l'historique de référence : lecture, qualification, bornes.
-
-Aucun test ne touche la base. Ce qui est éprouvé ici est la TRADUCTION d'une
-ligne de CSV en lecture de source — l'écriture, elle, est celle du collecteur
-et a ses propres tests.
-
-Le jeu de données est la seule origine possible de l'historique
-d'apprentissage, puisque la source ne remonte qu'à 48 heures. Une ligne mal
-traduite ne se verrait donc nulle part avant les métriques d'un entraînement,
-c'est-à-dire trop tard.
-"""
-
 from __future__ import annotations
 
 import pandas as pd
@@ -32,7 +20,6 @@ def csv_line(
     temperature: str = "4.3",
     humidity: str = "70.6",
 ) -> str:
-    """Une ligne au format exact des fichiers fournis avec la source."""
     return (
         f"{stamp},{site},office,Bureau Tertiaire,{consumption},13.38,"
         f"{temperature},{humidity},49.0,0,6,Sunday,1,1,0"
@@ -40,13 +27,11 @@ def csv_line(
 
 
 def write_dataset(directory, name: str, lines: list[str]) -> None:
-    """Dépose un fichier par site dans le répertoire donné."""
     path = directory / name
     path.write_text("\n".join([COLUMNS, *lines]) + "\n", encoding="utf-8")
 
 
 def read_one(directory, line: str) -> dict:
-    """Retourne la lecture produite par une ligne unique."""
     write_dataset(directory, "SITE001.csv", [line])
     frame = datasets.read_file(directory / "SITE001.csv")
     return next(iter(datasets.to_readings(frame)))
@@ -142,8 +127,6 @@ def test_une_colonne_attendue_absente_est_nommee(tmp_path) -> None:
 
 
 class TestStorageRoot:
-    """Ce que la commande accepte comme racine, et comment elle échoue."""
-
     def test_un_chemin_local_est_une_racine_valide(self, tmp_path) -> None:
         write_dataset(tmp_path, "SITE001.csv", [csv_line()])
         assert len(datasets.find_files(tmp_path)) == 1
@@ -162,8 +145,6 @@ class TestStorageRoot:
 
 
 class TestBaseName:
-    """Le nom rendu au journal, quel que soit le stockage d'où il vient."""
-
     def test_une_uri_s3_rend_son_dernier_segment(self) -> None:
         uri = "s3://enervision-datasets/SITE001.csv"
         assert datasets.base_name(uri) == "SITE001.csv"
@@ -173,17 +154,7 @@ class TestBaseName:
 
 
 class TestUriRendues:
-    """Ce que `find_files` rend doit pouvoir repasser dans `read_file`.
-
-    `get_file_info` rend le chemin tel que le système de fichiers le connaît,
-    donc SANS son schéma : `enervision-datasets/SITE001.csv` pour un seau S3.
-    Le rendre tel quel faisait chercher un répertoire de ce nom sur le disque,
-    et l'import échouait sur un `WinError 3` qui ne nommait pas la cause.
-    """
-
     def liste_factice(self, monkeypatch, noms: list[str]) -> None:
-        """Remplace l'inventaire du stockage par des entrées sans schéma."""
-
         class Entree:
             def __init__(self, nom: str) -> None:
                 self.base_name = nom

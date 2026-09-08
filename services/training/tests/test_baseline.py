@@ -1,11 +1,3 @@
-"""Baselines naïves : la référence gratuite qu'un modèle doit battre.
-
-ADR-010 range la baseline parmi les livrables permanents. Ce qui se teste ici
-n'est pas sa qualité de prévision — elle n'en a aucune ambition — mais qu'elle
-soit bien ce qu'elle prétend : une recopie exacte d'une colonne déjà publiée,
-et non un calcul qui aurait dérivé.
-"""
-
 from __future__ import annotations
 
 import pandas as pd
@@ -15,7 +7,6 @@ from training.baseline import BaselineError, Persistence, naive_baselines
 
 
 def frame() -> pd.DataFrame:
-    """Trois heures portant les décalages que l'ETL publie."""
     return pd.DataFrame(
         {
             "lag_1h": [10.0, 11.0, 12.0],
@@ -26,8 +17,6 @@ def frame() -> pd.DataFrame:
 
 
 class TestPersistence:
-    """Une persistance est une lecture de colonne, pas un modèle."""
-
     def test_the_name_carries_the_lag(self) -> None:
         assert Persistence(hours=24).name == "persistance-24h"
 

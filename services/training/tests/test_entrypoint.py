@@ -1,10 +1,3 @@
-"""Aiguillage de l'entraînement : ce qui se décide avant d'apprendre.
-
-Le run MLflow reste un effet de bord, testé par une exécution réelle et non par
-la CI. Ce qui se teste ici sans dépendance, c'est ce qui décide : quels
-candidats le challenge oppose, et ce qu'un refus de promotion fait réellement.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -18,7 +11,6 @@ from training.promotion import Verdict
 
 
 def config_for(candidates: dict | None = None) -> Config:
-    """Configuration réduite aux deux blocs que le challenge énumère."""
     return Config(
         values={
             "training": {
@@ -30,8 +22,6 @@ def config_for(candidates: dict | None = None) -> Config:
 
 
 class TestCandidateParams:
-    """Le challenge énumère les familles, le modèle ordinaire en tête."""
-
     def test_the_registered_family_comes_first(self) -> None:
         first, _ = next(iter(candidate_params(config_for())))
         assert first == DEFAULT_LEARNER
@@ -55,8 +45,6 @@ class TestCandidateParams:
 
 
 class TestEnforce:
-    """Un refus doit arrêter la promotion, pas seulement la commenter."""
-
     def test_an_accepted_verdict_lets_the_promotion_through(self, caplog) -> None:
         with caplog.at_level(logging.INFO, logger="training.__main__"):
             enforce(Verdict(accepted=True, reason="meilleur"), force=False)

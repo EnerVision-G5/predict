@@ -1,11 +1,3 @@
-"""Construction des chemins de partition.
-
-Ce module est la seule chose que les quatre services partagent pour se
-comprendre : deux services qui ne construiraient pas le même chemin pour la
-même journée ne se parleraient plus. Les tests fixent donc la forme exacte des
-chemins, et pas seulement le fait qu'ils soient produits.
-"""
-
 from __future__ import annotations
 
 from datetime import date

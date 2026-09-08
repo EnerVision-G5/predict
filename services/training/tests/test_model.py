@@ -1,11 +1,3 @@
-"""Modèle : hyperparamètres, ajustement, métriques.
-
-Le run MLflow est un effet de bord, testé par une exécution réelle et non par
-la CI. Ce qui se teste ici sans dépendance, c'est que le modèle apprend un
-signal qu'on lui a mis, que l'arrêt anticipé regarde bien la validation, et
-que les hyperparamètres lus dans `conf/` sont ceux qu'on croit.
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -26,15 +18,12 @@ ROWS = 300
 
 
 def learnable(rows: int = ROWS) -> tuple[pd.DataFrame, pd.Series]:
-    """Jeu synthétique linéaire, appris exactement par un arbre boosté."""
     generator = np.random.default_rng(seed=42)
     frame = pd.DataFrame({column: generator.normal(size=rows) for column in COLUMNS})
     return frame, 3.0 * frame["lag_1h"] + 2.0
 
 
 class TestModelParams:
-    """Un dataclass, et non un dictionnaire d'hyperparamètres."""
-
     def test_the_seed_is_fixed(self) -> None:
         assert ModelParams().random_state == 42
 

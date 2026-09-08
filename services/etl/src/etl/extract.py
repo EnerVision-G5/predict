@@ -1,21 +1,10 @@
-"""Lecture des mesures brutes dans `mesure`, sur une fenêtre de journées.
-
-L'ETL lit ce que le collecteur a déposé. Il ne rappelle jamais la source : le
-collecteur est seul à la joindre, et une seconde lecture donnerait une seconde
-version de la vérité amont — celle de l'API à l'instant de l'ETL, qui n'est pas
-celle qu'on a stockée.
-
-La fenêtre lue déborde volontairement sur les journées précédentes. Le décalage
-de 168 heures d'une heure du 2 septembre désigne une heure du 26 août : lire la
-seule journée demandée donnerait des décalages vides, et elle sortirait presque
-entièrement écartée sans que rien ne l'explique.
-
-Les mesures déjà écartées par un run précédent sont exclues à la lecture, et
-c'est le seul endroit où `mesure_exclu` est consultée. Une mesure qu'un
-analyste a jugée aberrante ne doit pas revenir nourrir les variables au
-prochain rejeu, sous prétexte qu'elle est toujours dans `mesure` — elle y est
-justement parce qu'on ne supprime pas les pannes.
-"""
+# **********************************************************************
+# * Nom     : extract.py                                               *
+# * Type    : Module                                                   *
+# * Sujet   : Lecture des mesures brutes sur une fenêtre, exclusions   *
+# *   déjà écartées                                                    *
+# * Service : etl                                                      *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -30,8 +19,10 @@ from predict_common.db import SOURCE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
+# Colonnes projetées par la requête, celles de la source seules.
 SELECTED = ", ".join(f"m.{name}" for name in SOURCE_COLUMNS)
 
+# Lit la fenêtre en écartant ce qu'un analyste a exclu.
 MEASURES_QUERY = text(
     f"""
     SELECT {SELECTED}
@@ -47,11 +38,9 @@ MEASURES_QUERY = text(
 
 
 def window(day: date, lookback_days: int) -> tuple[datetime, datetime]:
-    """Retourne la fenêtre UTC couvrant le jour produit et son historique.
-
-    Bornes `[début, fin[` : la borne haute est exclue pour qu'une mesure de
-    minuit pile appartienne au lendemain et à lui seul, sans quoi elle serait
-    lue deux fois par deux runs voisins.
+    """Méthode : window
+    Description : Retourne la fenêtre UTC couvrant le jour produit et son
+      historique.
     """
     if lookback_days < 1:
         raise ValueError("La fenêtre de lecture couvre au moins un jour.")
@@ -64,10 +53,9 @@ def read_measures(
     start_time: datetime,
     end_time: datetime,
 ) -> pd.DataFrame:
-    """Lit les mesures retenues de la fenêtre, exclusions déjà écartées.
-
-    Le tableau retourné porte toujours les colonnes de la source, même vide :
-    les étages suivants n'ont pas de cas dégénéré à traiter.
+    """Méthode : read_measures
+    Description : Lit les mesures retenues de la fenêtre et rend toujours les
+      colonnes attendues.
     """
     with engine.connect() as connection:
         frame = pd.read_sql_query(

@@ -1,13 +1,3 @@
-"""Contrat HTTP du service : les quatre réponses qu'il sait donner.
-
-Le service est branché ici sur un modèle et un stockage factices, sans MLflow
-ni réseau. Ce qui est testé est la correspondance entre une situation
-d'exploitation et le code de statut renvoyé : un registre vide donne 503, un
-site inconnu donne 404, une requête hors bornes donne 422, et le reste donne
-une série. Un service qui confondrait 503 et 404 enverrait les exploitants
-chercher la panne du mauvais côté.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
@@ -31,8 +21,6 @@ TODAY = date.today()
 
 
 class StubModel:
-    """Modèle chargé qui prédit une constante, sans MLflow derrière."""
-
     def __init__(
         self,
         version: str = "3",
@@ -47,8 +35,6 @@ class StubModel:
 
 
 class StubRegistry(ModelRegistry):
-    """Registre déjà résolu, ou volontairement vide."""
-
     def __init__(self, model: StubModel | None) -> None:
         super().__init__("http://mlflow.invalid", "models:/enervision_xgboost@champion")
         self._loaded = model
@@ -61,7 +47,6 @@ class StubRegistry(ModelRegistry):
 
 
 def features(day: date, site_id: str = "SITE001") -> pd.DataFrame:
-    """Partition de variables d'une journée, telle que l'ETL la publie."""
     stamps = pd.date_range(
         f"{day.isoformat()}T00:00:00Z", periods=24, freq="h", tz="UTC"
     )
@@ -85,7 +70,6 @@ def features(day: date, site_id: str = "SITE001") -> pd.DataFrame:
 
 @pytest.fixture
 def serving_root(tmp_path: Path) -> Path:
-    """Publie trois journées de variables pour un site."""
     for offset in range(3):
         day = TODAY - timedelta(days=offset)
         io.write_frame(
@@ -98,8 +82,6 @@ def serving_root(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def client(serving_root: Path, monkeypatch):
-    """Client HTTP dont le démarrage résout un modèle factice."""
-
     def build(served: bool = True, model: StubModel | None = None):
         def configure() -> None:
             resolved = (model or StubModel()) if served else None
@@ -215,13 +197,6 @@ def test_a_validation_error_uses_the_shared_model(client) -> None:
 
 
 class TestSurQuoiLaPrevisionSAppuie:
-    """Une prévision calculée sur des variables anciennes n'est pas fausse.
-
-    Elle est aveugle, et rien d'autre dans le contrat ne le disait. Le service
-    lit les partitions publiées par l'ETL, pas la base : lui seul sait de
-    quand datent les variables qu'il vient d'utiliser.
-    """
-
     def test_the_answer_says_which_hour_it_starts_from(self, client) -> None:
         with client() as http:
             body = http.post(
@@ -246,8 +221,6 @@ class TestSurQuoiLaPrevisionSAppuie:
 
 
 class TestReadiness:
-    """Pourquoi la prévision manque, ce qu'un 503 nu ne dit pas."""
-
     def test_a_served_model_and_features_are_ready(self, client) -> None:
         with client() as http:
             body = http.get("/ready").json()

@@ -1,23 +1,10 @@
-"""Schémas des couches d'artefacts : le contrat entre deux services.
-
-Chaque frontière de la chaîne est un chemin plus un schéma. Le chemin est
-construit par `paths`, le schéma est déclaré ici, et c'est leur couple qui
-remplace l'appel de fonction que la découpe a supprimé.
-
-Deux formes coexistent, et elles ne servent pas à la même chose.
-
-Le schéma pandera valide le contenu : les types, les bornes, les valeurs
-admises, ce qui peut être nul. Il est vérifié à l'écriture par le producteur
-et à la lecture par le consommateur. Cette double vérification n'est pas une
-redite : validée à l'écriture seule, une rupture de contrat serait imputée au
-consommateur trois étapes plus loin ; validée à la lecture seule, une
-partition fausse serait déjà publiée.
-
-Le schéma pyarrow fixe les types du fichier. Sans lui, une colonne entièrement
-nulle sur une journée s'écrirait en type `null`, et la lecture de deux
-partitions dont l'une a des valeurs et l'autre non échouerait à la
-concaténation — panne fréquente, tardive, et dont la cause est invisible.
-"""
+# **********************************************************************
+# * Nom     : schemas.py                                               *
+# * Type    : Module                                                   *
+# * Sujet   : Contrats des couches : noms de colonnes, valeurs admises *
+# *   et schémas de validation                                         *
+# * Service : predict_common (bibliothèque partagée)                   *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -27,6 +14,7 @@ import numpy
 import pandera.pandas as pa
 import pyarrow
 
+# Colonnes numériques de la couche brute.
 NUMERIC_COLUMNS = (
     "consumption_kw",
     "consumption_kwh",
@@ -37,16 +25,25 @@ NUMERIC_COLUMNS = (
     "humidity_percent",
 )
 
+# Colonne que le modèle apprend à prédire.
 TARGET_COLUMN = "consumption_kw"
 
+# Nom de l'horodatage tel que la source le rend.
 SOURCE_TIMESTAMP_COLUMN = "timestamp"
+# Nom de l'horodatage dans toute la chaîne.
 TIMESTAMP_COLUMN = "ts"
+# Nom de l'identifiant de site dans toute la chaîne.
 SITE_COLUMN = "site_id"
 
+# Qualification d'une heure sans défaut constaté.
 QUALITY_GOOD = "good"
+# Qualification d'une heure incomplète mais exploitable.
 QUALITY_PARTIAL = "partial"
+# Qualification d'une heure dont la valeur est douteuse.
 QUALITY_DEGRADED = "degraded"
+# Qualification d'une heure inexploitable.
 QUALITY_CRITICAL = "critical"
+# Qualifications admises, de la meilleure à la pire.
 DATA_QUALITY_VALUES = (
     QUALITY_GOOD,
     QUALITY_PARTIAL,
@@ -54,46 +51,57 @@ DATA_QUALITY_VALUES = (
     QUALITY_CRITICAL,
 )
 
+# Colonne disant QUI a posé la qualification.
 QUALITY_SOURCE_COLUMN = "quality_source"
+# Qualification posée par le collecteur, faute de mieux.
 QUALITY_SOURCE_SOURCE = "source"
+# Qualification déduite des données par l'ETL.
 QUALITY_SOURCE_ETL = "etl"
+# Auteurs admis d'une qualification.
 QUALITY_SOURCE_VALUES = (QUALITY_SOURCE_SOURCE, QUALITY_SOURCE_ETL)
 
+# Valeur brute, ou rien à reconstruire.
 METHOD_NONE = "none"
+# Valeur reconstruite par report de la dernière connue.
 METHOD_LOCF = "locf"
+# Valeur reconstruite entre deux valeurs connues.
 METHOD_INTERPOLATION = "interpolation"
+# Méthodes de reconstruction admises.
 IMPUTATION_METHODS = (METHOD_NONE, METHOD_LOCF, METHOD_INTERPOLATION)
 
+# Type pandas exigé de tout horodatage de la chaîne.
 UTC_DTYPE = "datetime64[ns, UTC]"
 
+# Longueur maximale d'un identifiant de site en base.
 SITE_ID_MAX_LENGTH = 20
 
+# Bornes physiques du facteur de puissance.
 POWER_FACTOR_RANGE = (0.0, 1.0)
+# Bornes physiques de l'humidité relative, en pourcent.
 HUMIDITY_RANGE = (0.0, 100.0)
 
+# Nom de la couche des variables dans les chemins.
 FEATURES_LAYER = "features"
 
 
 def is_sequence(value: object) -> bool:
-    """Dit si une valeur est un tableau de motifs, quelle que soit sa forme.
-
-    `null_reasons` est écrit en `list<string>` et relu par pyarrow sous forme
-    de tableau numpy, pas de liste Python. Les deux sont le même contrat :
-    n'accepter que la liste ferait échouer la validation sur une partition que
-    le producteur venait pourtant d'écrire valide, ce qui est le pire des
-    faux positifs — celui qui décrédibilise le contrôle.
+    """Méthode : is_sequence
+    Description : Dit si une valeur est une liste, un tuple ou un tableau.
     """
     return isinstance(value, (list, tuple, numpy.ndarray))
 
 
 def _numeric_columns(nullable: bool) -> dict[str, pa.Column]:
-    """Déclare les sept colonnes de mesure, toutes décimales."""
+    """Méthode : _numeric_columns
+    Description : Décrit les colonnes numériques de la couche brute.
+    """
     return {
         name: pa.Column(float, nullable=nullable, required=True)
         for name in NUMERIC_COLUMNS
     }
 
 
+# Contrat de la couche brute, vérifié à la lecture.
 MEASURE_SCHEMA = pa.DataFrameSchema(
     {
         TIMESTAMP_COLUMN: pa.Column(UTC_DTYPE, nullable=False),
@@ -130,6 +138,7 @@ MEASURE_SCHEMA = pa.DataFrameSchema(
 )
 
 
+# Colonnes de calendrier et de météo publiées telles quelles.
 PUBLISHED_FIXED_COLUMNS = (
     "hour",
     "day_of_week",
@@ -137,37 +146,36 @@ PUBLISHED_FIXED_COLUMNS = (
     "temperature_celsius",
 )
 
+# Colonnes de calendrier que le modèle reçoit.
 MODEL_FIXED_COLUMNS = (
     "hour",
     "day_of_week",
     "is_weekend",
 )
 
+# Bornes de l'heure du jour.
 HOUR_RANGE = (0, 23)
+# Bornes du jour de la semaine, lundi valant zéro.
 DAY_OF_WEEK_RANGE = (0, 6)
 
 
 def lag_column(hours: int) -> str:
-    """Nom de la colonne portant le décalage de `hours` heures."""
+    """Méthode : lag_column
+    Description : Nomme la colonne d'un décalage exprimé en heures.
+    """
     return f"lag_{hours}h"
 
 
 def rolling_column(hours: int) -> str:
-    """Nom de la colonne portant la moyenne glissante sur `hours` heures."""
+    """Méthode : rolling_column
+    Description : Nomme la colonne d'une moyenne glissante en heures.
+    """
     return f"roll_mean_{hours}h"
 
 
 def feature_columns(lag_hours: Sequence[int], rolling_window_h: int) -> tuple[str, ...]:
-    """Retourne les variables explicatives, dans l'ordre attendu du modèle.
-
-    L'ordre compte : c'est celui de la signature MLflow, donc celui dans lequel
-    le service d'inférence doit présenter ses colonnes. Le déduire d'un même
-    appel des deux côtés est ce qui empêche l'entraînement et le service de
-    diverger sans que rien ne le dise.
-
-    La température n'en fait pas partie : voir `MODEL_FIXED_COLUMNS`. La
-    surveillance de dérive lit cette même liste, si bien qu'elle mesure la
-    tâche que le service rend vraiment, et non une tâche plus facile.
+    """Méthode : feature_columns
+    Description : Énumère les colonnes que le modèle reçoit en entrée.
     """
     return (
         *MODEL_FIXED_COLUMNS,
@@ -180,12 +188,8 @@ def published_columns(
     lag_hours: Sequence[int],
     rolling_window_h: int,
 ) -> tuple[str, ...]:
-    """Retourne les colonnes calculées que l'ETL écrit dans la partition.
-
-    Sur-ensemble de `feature_columns` : la partition porte en plus ce que le
-    modèle ne consomme pas encore. Retirer une colonne d'ici change le contrat
-    de la couche, donc impose une nouvelle `feature_version` ; en retirer une
-    de `feature_columns` ne change que le modèle, que MLflow versionne déjà.
+    """Méthode : published_columns
+    Description : Énumère les colonnes écrites dans une partition de variables.
     """
     return (
         *PUBLISHED_FIXED_COLUMNS,
@@ -198,11 +202,9 @@ def features_schema(
     lag_hours: Sequence[int],
     rolling_window_h: int,
 ) -> pa.DataFrameSchema:
-    """Construit le schéma pandera de la couche des variables.
-
-    Le schéma dépend de la configuration parce que les décalages en dépendent :
-    changer `etl.lag_hours` change les colonnes produites, et c'est pour cela
-    que ce changement s'accompagne d'une nouvelle `feature_version`.
+    """Méthode : features_schema
+    Description : Construit le contrat d'une partition de variables pour des
+      décalages donnés.
     """
     derived = {
         name: pa.Column(float, nullable=False)
@@ -247,7 +249,9 @@ def features_arrow_schema(
     lag_hours: Sequence[int],
     rolling_window_h: int,
 ) -> pyarrow.Schema:
-    """Construit le schéma pyarrow correspondant, qui fixe les types écrits."""
+    """Méthode : features_arrow_schema
+    Description : Construit le schéma parquet correspondant, types figés.
+    """
     derived = [
         (name, pyarrow.float64())
         for name in (

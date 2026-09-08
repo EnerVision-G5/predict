@@ -1,5 +1,3 @@
-"""Normalisation de la couche brute en tableau de mesures typé."""
-
 from __future__ import annotations
 
 import pandas as pd

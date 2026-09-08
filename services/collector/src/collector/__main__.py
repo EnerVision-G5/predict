@@ -1,36 +1,10 @@
-"""Point d'entrée du collecteur : rattrapage de l'historique par lot.
-
-    python -m collector --start 2026-08-01 --end 2026-09-01
-    python -m collector --start 2026-08-01 --end 2026-09-01 --site SITE001
-    python -m collector --date 2026-09-02 --days 7
-
-Deux façons de dire la même chose, parce qu'elles ne servent pas au même
-usage. `--start/--end` nomme une période, ce que fait un analyste qui rattrape
-un historique. `--date/--days` nomme une journée et sa profondeur, ce que fait
-un ordonnanceur qui rejoue la veille : la date y est un paramètre, et la
-profondeur une constante.
-
-Le collecteur remplit la couche brute, qui est la table `mesure` de
-TimescaleDB. Il ne connaît ni l'ETL, ni l'entraînement, ni le service : sa
-sortie est une table et un schéma, et c'est tout ce que son consommateur a
-besoin de savoir.
-
-Une journée est traitée en entier avant la suivante. Le lot d'un jour tient en
-mémoire — sept sites à la minute font une dizaine de milliers de lignes — là
-où trois mois n'y tiendraient pas, et une journée soumise en une transaction
-est soit chargée, soit absente, jamais à moitié écrite.
-
-Relancer la même date ne double rien et n'efface rien : l'insertion est un
-`ON CONFLICT DO NOTHING`. C'est ce qui rend le rejeu après incident sans effet
-de bord — et le rejeu est le mode d'exploitation normal, pas l'exception : une
-source indisponible pendant deux heures se rattrape en relançant la journée.
-
-Le rattrapage repose son état dans `ingestion_etat` comme le poller, mais sous
-`source='backfill'`. La distinction compte : le rattrapage est justement ce
-qu'on lance quand la collecte continue est arrêtée, et une ligne qui ne dirait
-pas d'où elle vient ferait passer une journée rejouée à la main pour une
-ingestion vivante.
-"""
+# **********************************************************************
+# * Nom     : __main__.py                                              *
+# * Type    : Point d'entrée                                           *
+# * Sujet   : Collecte datée d'une période, et rattrapage des journées *
+# *   incomplètes                                                      *
+# * Service : collector                                                *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -70,35 +44,27 @@ from predict_common.source import (
 )
 from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
+# Nombre de journées collectées quand rien n'est demandé.
 DEFAULT_DAYS = 1
 
+# Profondeur du rattrapage automatique, en journées.
 DEFAULT_CATCH_UP_DAYS = 35
 
+# Écart toléré aux bornes avant de dire une journée incomplète.
 COVERAGE_TOLERANCE = timedelta(hours=1)
 
+# Code de sortie d'une collecte aboutie.
 EXIT_OK = 0
+# Code de sortie d'une collecte interrompue.
 EXIT_FAILED = 1
 
 logger = logging.getLogger(__name__)
 
 
 def day_window(day: date, now: datetime | None = None) -> tuple[datetime, datetime]:
-    """Retourne la fenêtre UTC d'une journée, JAMAIS au-delà de maintenant.
-
-    Les mesures rendues par la source sont ensuite filtrées sur le jour
-    demandé : une source qui déborderait d'une seconde ne serait pas comptée
-    dans une journée qu'elle ne concerne pas.
-
-    La borne haute est ramenée à l'instant courant, et ce n'est pas un détail
-    d'exactitude : sans elle, rattraper la journée EN COURS demande à la
-    source les heures qui n'ont pas encore eu lieu. Elle ne répond pas une
-    erreur — elle répond des mesures nulles, que le collecteur écrit, et que
-    son `ON CONFLICT DO NOTHING` rend alors DÉFINITIVES.
-
-    Le poller collecte ensuite ces minutes-là pour de vrai, une par une, et
-    ses valeurs sont silencieusement rejetées : la ligne existe déjà, vide. Un
-    rattrapage lancé à 02:30 stérilisait ainsi les vingt et une heures
-    suivantes, chaque jour, sans qu'aucun journal ne le dise.
+    """Méthode : day_window
+    Description : Retourne les bornes UTC d'une journée, sans dépasser
+      l'instant courant.
     """
     start = datetime.combine(day, time.min, tzinfo=UTC)
     end = start + timedelta(days=1)
@@ -113,11 +79,9 @@ def collect_day(
     sites: Sequence[str],
     naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> int:
-    """Collecte une journée pour les sites demandés et la charge en base.
-
-    Le fuseau vient de la configuration et non du client, comme `batch_size` :
-    la source est interrogée ici, elle n'est pas interprétée. Ce que ce
-    rattrapage demande à sa source tient dans `iter_readings`.
+    """Méthode : collect_day
+    Description : Collecte une journée pour chaque site et écrit son état
+      d'ingestion.
     """
     start_time, end_time = day_window(day)
     records: list[dict] = []
@@ -167,16 +131,9 @@ def record_collection(
     states: Sequence[IngestionState],
     batch_size: int,
 ) -> None:
-    """Repose l'état de collecte du rattrapage, sans jamais le faire échouer.
-
-    `source='backfill'` et non `'poller'` : un rattrapage lancé à la main
-    pendant que la collecte continue est arrêtée ne doit pas faire paraître
-    l'ingestion vivante. C'est exactement le cas où la fraîcheur affichée
-    deviendrait un mensonge, puisqu'il se produit quand quelque chose ne va
-    déjà pas.
-
-    L'échec de cette écriture n'est pas celui du rattrapage : les mesures,
-    elles, sont chargées. Il est journalisé et n'emporte pas le run.
+    """Méthode : record_collection
+    Description : Repose l'état d'ingestion sans jamais faire échouer la
+      collecte.
     """
     try:
         write_state(engine, states, batch_size, INGESTION_SOURCE_BACKFILL)
@@ -190,18 +147,8 @@ def resolve_sites(
     batch_size: int,
     requested: Sequence[str] | None,
 ) -> list[str]:
-    """Synchronise le référentiel et retourne les sites à collecter.
-
-    La synchronisation entretient `site`, que `mesure.site_id` référence : un
-    site absent de la table ferait rejeter ses mesures sans que rien
-    n'explique pourquoi. C'est aussi ce que le seed `02_seed_sites.sql`
-    attend, ses capacités des sites 4 à 7 étant des placeholders.
-
-    Elle n'est exigée que lorsqu'on en dépend pour savoir quoi collecter.
-    Avec `--site`, l'exploitant a nommé ses sites : une source qui ne sert pas
-    son référentiel ne doit pas l'empêcher de rattraper une journée, puisque
-    le seed a déjà posé les sites courants. L'échec est journalisé, et c'est
-    la clé étrangère qui tranchera s'il manquait vraiment quelque chose.
+    """Méthode : resolve_sites
+    Description : Choisit les sites à collecter, référentiel ou liste demandée.
     """
     try:
         referential = client.fetch_sites()
@@ -220,7 +167,9 @@ def resolve_sites(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Analyse la ligne de commande du collecteur."""
+    """Méthode : parse_args
+    Description : Analyse la ligne de commande de la collecte.
+    """
     parser = argparse.ArgumentParser(
         prog="collector",
         description="Collecte des mesures EnerVision vers TimescaleDB.",
@@ -283,12 +232,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def check_period_arguments(args: argparse.Namespace) -> None:
-    """Refuse une période donnée deux fois, ou donnée à qui la déduit.
-
-    Vérifiée dans les deux modes, et depuis `main` plutôt que depuis
-    `requested_days` : cette dernière n'est pas appelée en mode rattrapage,
-    et le contrôle n'y serait donc jamais exécuté dans le seul cas où il
-    compte.
+    """Méthode : check_period_arguments
+    Description : Refuse un rattrapage assorti de bornes de période.
     """
     if not args.catch_up:
         return
@@ -314,34 +259,8 @@ def catch_up_days(
     depth_days: int,
     today: date | None = None,
 ) -> list[date]:
-    """Retourne les journées à rattraper, déduites des TROUS de la base.
-
-    C'est le mode du redéploiement : personne ne sait ce qui manque, et
-    demander une période reviendrait à le faire deviner à l'exploitant.
-
-    La détection porte sur les trous et non sur la dernière mesure, et c'est
-    la seule chose qui compte ici. Un serveur où le poller tourne déjà a une
-    dernière mesure à « maintenant » quelle que soit l'ampleur de ce qui
-    manque derrière : un repère de reprise ne verrait rien à combler, alors
-    qu'il peut manquer un mois entier plus tôt dans la fenêtre.
-
-    Une journée est retenue dès qu'UN site ne la couvre pas entièrement. Trois
-    cas la rendent incomplète, et le troisième est celui qu'un simple comptage
-    manquerait :
-
-    - aucune ligne — la journée n'a jamais été collectée ;
-    - la première mesure arrive trop tard — le poller a démarré en cours de
-      journée, la matinée manque ;
-    - la dernière arrive trop tôt — le poller s'est arrêté en cours de
-      journée.
-
-    La journée courante est toujours retenue : elle est incomplète par
-    construction, puisqu'elle n'est pas finie.
-
-    La fenêtre est commune à tous les sites plutôt que découpée par site :
-    `ON CONFLICT DO NOTHING` rend le recouvrement gratuit en base, et une
-    journée coûte UNE requête par site à la source, `/readings` servant 48
-    points là où `limit` en autorise 1000.
+    """Méthode : catch_up_days
+    Description : Liste les journées dont la couverture est incomplète en base.
     """
     end = today or datetime.now(UTC).date()
     first = end - timedelta(days=max(depth_days, 1) - 1)
@@ -358,15 +277,8 @@ def catch_up_days(
 
 
 def covers_full_day(entry: DayCoverage, today: date) -> bool:
-    """Dit si ce que la base porte couvre la journée d'un bout à l'autre.
-
-    La tolérance absorbe le pas de la source sans avoir à le connaître :
-    `/readings` sert 48 points par journée, de 00:00 à 23:30, quand le poller
-    en dépose 1440, de 00:00 à 23:59. Les deux couvrent la journée ; exiger
-    une dernière mesure à 23:59 ferait rattraper indéfiniment toutes les
-    journées venues du seul rattrapage.
-
-    La journée courante n'est jamais couverte : elle n'est pas finie.
+    """Méthode : covers_full_day
+    Description : Dit si une journée est couverte de bout en bout.
     """
     if entry.day >= today:
         return False
@@ -379,11 +291,8 @@ def covers_full_day(entry: DayCoverage, today: date) -> bool:
 
 
 def requested_days(args: argparse.Namespace) -> list[date]:
-    """Retourne les journées à collecter, dans l'ordre chronologique.
-
-    Les deux formes s'excluent : les mélanger laisserait deux périodes
-    possibles pour un même appel, et le run partirait sur l'une des deux sans
-    que rien ne dise laquelle.
+    """Méthode : requested_days
+    Description : Traduit les arguments de période en liste de journées.
     """
     borne = args.start is not None or args.end is not None
     if borne and args.date is not None:
@@ -408,13 +317,9 @@ def requested_days(args: argparse.Namespace) -> list[date]:
 
 
 def _configure_logging() -> None:
-    """Arme le journal, et met la sortie standard à l'abri de l'encodage local.
-
-    MLflow imprime des emoji quand il rend la main ; une console Windows en
-    cp1252 lève alors une UnicodeEncodeError au beau milieu d'un run qui, lui,
-    s'est bien passé. On ne peut pas demander à MLflow de se taire, mais on
-    peut faire en sorte qu'un caractère non représentable dégrade l'affichage
-    au lieu d'interrompre le traitement.
+    """Méthode : _configure_logging
+    Description : Arme le journal et met la sortie à l'abri de l'encodage
+      local.
     """
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -427,7 +332,10 @@ def _configure_logging() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Point d'entrée du conteneur de collecte."""
+    """Méthode : main
+    Description : Point d'entrée : collecte les journées demandées et rend un
+      code de sortie.
+    """
     _configure_logging()
     args = parse_args(argv)
     try:
