@@ -28,6 +28,7 @@ voudrait rien dire. Les deux informent l'entraînement sans décider à sa place
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -50,6 +51,8 @@ from predict_common.schemas import (
 IMPUTED_RATIO_COLUMN = "imputed_ratio"
 WEEKEND_FIRST_DAY = 5
 SECONDS_PER_HOUR = 3600
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureError(ValueError):
@@ -155,7 +158,37 @@ def build(frame: pd.DataFrame, spec: FeatureSpec, day: date) -> pd.DataFrame:
     )
     selected = enriched[enriched[TIMESTAMP_COLUMN].dt.date == day]
     complete = selected.dropna(subset=list(_required_columns(spec)))
+    _report_incomplete(selected, complete, spec)
     return complete[list(_output_columns(spec))].reset_index(drop=True)
+
+
+def _report_incomplete(
+    selected: pd.DataFrame,
+    complete: pd.DataFrame,
+    spec: FeatureSpec,
+) -> None:
+    """Dit quelles colonnes ont fait retirer des heures, et combien.
+
+    Sans ce compte, une journée sort vide sans rien dire de plus, et la cause
+    la plus courante — un décalage qui n'a pas encore d'historique à désigner,
+    parce que la collecte a démarré il y a moins de `lag_168h` — se cherche
+    pendant des jours. La journée reste produite vide : c'est une information
+    d'exploitation, pas une erreur. Elle mérite seulement d'être motivée.
+    """
+    removed = len(selected) - len(complete)
+    if not removed:
+        return
+    causes = {
+        name: int(selected[name].isna().sum())
+        for name in _required_columns(spec)
+        if selected[name].isna().any()
+    }
+    logger.warning(
+        "%d heure(s) sur %d retirée(s), faute d'un historique suffisant : %s",
+        removed,
+        len(selected),
+        ", ".join(f"{name} absent sur {count}" for name, count in causes.items()),
+    )
 
 
 def _resample_site(

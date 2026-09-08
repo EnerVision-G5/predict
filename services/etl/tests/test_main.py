@@ -259,6 +259,42 @@ def test_a_day_of_outages_publishes_an_empty_partition(
     assert io.exists(features_partition(str(tmp_path), "v1", DAY))
 
 
+def test_an_empty_run_keeps_the_partition_it_would_have_erased(
+    tmp_path: Path, make_raw, make_reading, patched_read
+) -> None:
+    # L'écriture REMPLACE la partition : un run vide par accident de fenêtre
+    # — collecte trop jeune pour lag_168h, source muette un cycle — effacerait
+    # des variables que rien ne reproduit à cette date, sans lever d'erreur.
+    engine = ReadingEngine(measures(make_raw, make_reading))
+    patched_read(engine)
+    assert run(config_for(tmp_path), engine, DAY, version=None) == 24
+    partition = features_partition(str(tmp_path), "v1", DAY)
+
+    vide = ReadingEngine(
+        measures(
+            make_raw,
+            make_reading,
+            consumption_kw=None,
+            null_reasons=["sensor_failure"],
+        )
+    )
+    patched_read(vide)
+    assert run(config_for(tmp_path), vide, DAY, version=None) == 0
+    assert len(io.read_frames([partition])) == 24
+
+
+def test_publish_reports_that_nothing_was_written(
+    tmp_path: Path, make_raw, make_reading, patched_read
+) -> None:
+    # `None` plutôt que le chemin : l'appelant ne doit pas journaliser une
+    # publication qui n'a pas eu lieu.
+    engine = ReadingEngine(measures(make_raw, make_reading))
+    patched_read(engine)
+    run(config_for(tmp_path), engine, DAY, version=None)
+    spec = feature_spec(config_for(tmp_path))
+    assert publish(pd.DataFrame(), str(tmp_path), spec, DAY) is None
+
+
 def test_the_features_carry_no_excluded_measure(
     tmp_path: Path, make_raw, make_reading, patched_read
 ) -> None:
