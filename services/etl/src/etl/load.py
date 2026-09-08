@@ -29,6 +29,7 @@ import logging
 from typing import Any
 
 import pandas as pd
+from sqlalchemy import or_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 
@@ -84,11 +85,29 @@ def build_upsert(records: list[dict[str, Any]]) -> Any:
     quelque chose de nouveau à dire sur une ligne déjà présente. Un rejeu doit
     reposer la qualification et l'imputation, sans quoi corriger une règle
     n'aurait aucun effet sur l'historique déjà traité.
+
+    Mais seulement si le résultat diffère. Sans la garde ci-dessous, rejouer
+    une fenêtre réécrit chacune de ses lignes à l'identique : PostgreSQL n'a
+    pas de mise à jour sans écriture, chaque UPDATE laisse un tuple mort,
+    remplit le WAL et donne du travail à l'autovacuum. Un rattrapage sur deux
+    ans a ainsi porté un seul chunk à 361 000 UPDATE pour 88 000 lignes.
+
+    `IS DISTINCT FROM` et non `<>` : `data_quality` peut passer de NULL à une
+    valeur, et une comparaison ordinaire rendrait NULL — donc faux — laissant
+    la correction sur le carreau précisément là où elle compte.
     """
     statement = insert(mesure).values(records)
+    excluded = statement.excluded
+    changed = or_(
+        *(
+            mesure.c[name].is_distinct_from(getattr(excluded, name))
+            for name in DERIVED_COLUMNS
+        )
+    )
     return statement.on_conflict_do_update(
         index_elements=list(CONFLICT_KEY),
-        set_={name: getattr(statement.excluded, name) for name in DERIVED_COLUMNS},
+        set_={name: getattr(excluded, name) for name in DERIVED_COLUMNS},
+        where=changed,
     )
 
 

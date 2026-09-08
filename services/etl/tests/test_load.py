@@ -126,6 +126,20 @@ def test_build_upsert_targets_the_natural_key(make_raw, make_reading) -> None:
     assert "ON CONFLICT (site_id, ts) DO UPDATE" in str(compiled)
 
 
+def test_build_upsert_rewrites_only_what_changed(make_raw, make_reading) -> None:
+    # Un rejeu qui réécrit des lignes identiques laisse autant de tuples morts
+    # et remplit le WAL pour rien : c'est ce qui a porté un chunk à 361 000
+    # UPDATE pour 88 000 lignes lors d'un rattrapage sur deux ans.
+    frame = to_loadable(make_raw, [make_reading("2026-09-02T08:00:00Z")])
+    compiled = str(
+        build_upsert(to_records(frame)).compile(dialect=postgresql.dialect())
+    )
+    condition = compiled.split("DO UPDATE", 1)[1]
+    assert "WHERE" in condition
+    for column in DERIVED_COLUMNS:
+        assert f"mesure.{column} IS DISTINCT FROM excluded.{column}" in condition
+
+
 def test_build_exclusion_upsert_ignores_an_exclusion_already_filed() -> None:
     records = [
         {
