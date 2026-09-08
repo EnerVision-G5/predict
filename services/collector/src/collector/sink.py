@@ -81,6 +81,11 @@ from predict_common.schemas import (
     SOURCE_TIMESTAMP_COLUMN,
     TIMESTAMP_COLUMN,
 )
+from predict_common.timestamps import (
+    DEFAULT_SOURCE_TIMEZONE,
+    parse_timestamp,
+    to_utc,
+)
 
 # Qualification écrite faute de mieux quand la source se tait. C'est le DEFAULT
 # de la colonne, repris explicitement plutôt que laissé à la base : un lot
@@ -119,20 +124,23 @@ class WriteReport:
     dropped: int = 0
 
 
-def to_measures(records: Iterable[dict[str, Any]]) -> pd.DataFrame:
+def to_measures(
+    records: Iterable[dict[str, Any]],
+    naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
+) -> pd.DataFrame:
     """Construit le tableau de mesures correspondant à ce que la source a servi.
 
     Le tableau retourné porte toujours les colonnes de `SOURCE_COLUMNS`, même
     pour un lot vide : l'appelant n'a pas de cas dégénéré à traiter.
+
+    `naive_timezone` est le fuseau prêté aux horodatages que la source envoie
+    sans le leur, et à eux seuls — voir `predict_common.timestamps`. Sa valeur par
+    défaut ne déplace rien : c'est l'appelant qui sait de quelle source il
+    lit, et la configuration qui le lui dit.
     """
     rows = [_rename(record) for record in records]
     frame = pd.DataFrame(rows, columns=list(SOURCE_COLUMNS))
-    # Format ISO imposé, et non deviné : le contrat de la source l'annonce en
-    # ISO 8601, et laisser pandas interpréter au cas par cas ferait accepter un
-    # `03/09/2026` dont personne ne saurait dire si c'est mars ou septembre.
-    frame[TIMESTAMP_COLUMN] = pd.to_datetime(
-        frame[TIMESTAMP_COLUMN], utc=True, errors="coerce", format="ISO8601"
-    )
+    frame[TIMESTAMP_COLUMN] = to_utc(frame[TIMESTAMP_COLUMN], naive_timezone)
     for column in NUMERIC_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame[SITE_COLUMN] = frame[SITE_COLUMN].map(_clean_site_id)
@@ -429,11 +437,19 @@ ALERTE_REQUIRED = ("alert_id", "site_id", "timestamp", "severity", "type", "mess
 CAPTEURS = ("consumption", "electrical", "temperature", "humidity", "network")
 
 
-def to_alerts(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+def to_alerts(
+    records: Iterable[dict[str, Any]],
+    naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
+) -> list[dict[str, Any]]:
     """Traduit les alertes de la source vers les colonnes de `alerte`.
 
     `type` devient `type_alerte` : le mot est trop générique pour une colonne,
     et la traduction est portée ici une fois plutôt que dans chaque requête.
+
+    Les alertes ne sont pas mieux datées que les mesures — la source y sert
+    aussi des horodatages nus — et `alerte.ts` est un `timestamptz` : écrire
+    un horodatage sans fuseau y ferait dépendre la date d'une alerte du
+    réglage de la session qui l'insère.
     """
     rows: list[dict[str, Any]] = []
     for record in records:
@@ -443,7 +459,7 @@ def to_alerts(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 record.get("alert_id", "?"),
             )
             continue
-        stamp = _parse_stamp(record["timestamp"])
+        stamp = parse_timestamp(record["timestamp"], naive_timezone)
         if stamp is None:
             logger.warning(
                 "alerte %s ignorée : horodatage illisible", record["alert_id"]
@@ -484,15 +500,19 @@ def write_alerts(
     engine: Engine,
     records: Iterable[dict[str, Any]],
     batch_size: int,
+    naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> int:
     """Journalise les alertes actives et retourne le nombre de lignes neuves."""
-    rows = to_alerts(records)
+    rows = to_alerts(records, naive_timezone)
     written = write_batches(engine, rows, batch_size, build_alerte_insert)
     logger.info("alertes : %d ligne(s) soumise(s)", written)
     return written
 
 
-def to_sensor_states(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def to_sensor_states(
+    payload: dict[str, Any],
+    naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
+) -> list[dict[str, Any]]:
     """Met à plat l'état des capteurs, un enregistrement par couple site/capteur.
 
     La source indexe par site et imbrique les capteurs. La table, elle, est
@@ -518,7 +538,9 @@ def to_sensor_states(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "site_id": str(site_id).strip(),
                     "capteur": str(capteur),
                     "statut": str(etat.get("status") or "ok"),
-                    "failing_until": _parse_stamp(etat.get("failing_until")),
+                    "failing_until": parse_timestamp(
+                        etat.get("failing_until"), naive_timezone
+                    ),
                     "overall": overall,
                 }
             )
@@ -552,9 +574,10 @@ def write_sensor_states(
     engine: Engine,
     payload: dict[str, Any],
     batch_size: int,
+    naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> int:
     """Repose l'état des capteurs et retourne le nombre de lignes."""
-    rows = to_sensor_states(payload)
+    rows = to_sensor_states(payload, naive_timezone)
     written = write_batches(engine, rows, batch_size, build_capteur_etat_upsert)
     logger.info("capteurs : %d état(s) reposé(s)", written)
     return written
@@ -719,18 +742,6 @@ def write_sensor_episodes(
             "pannes capteur : %d ouverte(s), %d clos(es)", written, len(closed)
         )
     return written, len(closed)
-
-
-def _parse_stamp(value: Any) -> datetime | None:
-    """Lit un horodatage ISO de la source, ou rend None s'il est illisible."""
-    if value in (None, ""):
-        return None
-    if isinstance(value, datetime):
-        return value
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
 
 
 def to_sites(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

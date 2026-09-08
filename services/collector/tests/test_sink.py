@@ -58,6 +58,26 @@ def test_to_measures_normalizes_the_timestamp_to_utc(make_reading) -> None:
     assert frame.loc[0, "ts"].hour == 6
 
 
+def test_to_measures_reads_a_bare_timestamp_in_the_source_timezone(
+    make_reading,
+) -> None:
+    # `/current` sert l'heure locale de sa machine sans la nommer. La prendre
+    # pour de l'UTC écrirait la mesure deux heures dans le futur, où le
+    # dashboard, qui borne ses lectures à l'instant présent, ne la verrait pas.
+    frame = to_measures([make_reading("2026-09-02T08:30:00")], "Europe/Paris")
+    assert str(frame.loc[0, "ts"].tz) == "UTC"
+    assert frame.loc[0, "ts"].hour == 6
+
+
+def test_to_measures_leaves_a_dated_timestamp_where_the_source_put_it(
+    make_reading,
+) -> None:
+    # Le fuseau prêté ne vaut que pour les horodatages nus : `/readings`
+    # répond en UTC, et le rattrapage ne doit pas glisser pour autant.
+    frame = to_measures([make_reading("2026-09-02T08:30:00Z")], "Europe/Paris")
+    assert frame.loc[0, "ts"].hour == 8
+
+
 def test_to_measures_keeps_a_null_measure(make_reading) -> None:
     # Une valeur nulle porte une panne capteur : la filtrer perdrait la panne.
     frame = to_measures(

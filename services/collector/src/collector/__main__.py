@@ -68,6 +68,7 @@ from predict_common.source import (
     SourceError,
     SourceSettings,
 )
+from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
 DEFAULT_DAYS = 1
 
@@ -120,8 +121,14 @@ def collect_day(
     batch_size: int,
     day: date,
     sites: Sequence[str],
+    naive_timezone: str = DEFAULT_SOURCE_TIMEZONE,
 ) -> int:
-    """Collecte une journée pour les sites demandés et la charge en base."""
+    """Collecte une journée pour les sites demandés et la charge en base.
+
+    Le fuseau vient de la configuration et non du client, comme `batch_size` :
+    la source est interrogée ici, elle n'est pas interprétée. Ce que ce
+    rattrapage demande à sa source tient dans `iter_readings`.
+    """
     start_time, end_time = day_window(day)
     records: list[dict] = []
     states: list[IngestionState] = []
@@ -155,7 +162,12 @@ def collect_day(
                 data_lag_s=None,
             )
         )
-    report = write(engine, to_measures(records), batch_size, day=day)
+    report = write(
+        engine,
+        to_measures(records, naive_timezone),
+        batch_size,
+        day=day,
+    )
     logger.info(
         "%s : %d mesure(s) soumise(s)%s",
         day,
@@ -476,7 +488,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 settings.page_size,
             )
             for day in days:
-                total += collect_day(client, engine, batch_size, day, sites)
+                total += collect_day(
+                    client, engine, batch_size, day, sites, settings.timezone
+                )
     except (SourceError, SQLAlchemyError) as exc:
         logger.error("collecte interrompue : %s", exc)
         return EXIT_FAILED
