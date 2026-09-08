@@ -11,6 +11,10 @@
 set -e
 
 BUCKET="${GARAGE_BUCKET:-enervision}"
+# Seau de l'historique de référence, séparé de celui des partitions : un rejeu
+# de l'ETL réécrit les partitions, et deux années de mesures que rien ne sait
+# régénérer n'ont pas à partager un préfixe avec ce qui s'efface.
+DATASETS_BUCKET="${GARAGE_DATASETS_BUCKET:-enervision-datasets}"
 KEY_NAME="${GARAGE_KEY_NAME:-predict}"
 
 NODE=$(/garage node id -q 2>/dev/null | cut -d@ -f1)
@@ -21,9 +25,13 @@ if ! /garage layout show 2>/dev/null | grep -q "$NODE"; then
     /garage layout apply --version 1
 fi
 
-/garage bucket create "$BUCKET" 2>/dev/null || echo "seau $BUCKET déjà présent"
 /garage key create "$KEY_NAME" 2>/dev/null || echo "clé $KEY_NAME déjà présente"
-/garage bucket allow --read --write --owner "$BUCKET" --key "$KEY_NAME"
 
-echo "--- seau $BUCKET prêt. Identifiants à reporter dans .env : ---"
+for bucket in "$BUCKET" "$DATASETS_BUCKET"; do
+    /garage bucket create "$bucket" 2>/dev/null || echo "seau $bucket déjà présent"
+    /garage bucket allow --read --write --owner "$bucket" --key "$KEY_NAME"
+done
+
+echo "--- seaux $BUCKET et $DATASETS_BUCKET prêts."
+echo "--- Identifiants à reporter dans .env : ---"
 /garage key info "$KEY_NAME" --show-secret

@@ -26,6 +26,11 @@ x-artifacts: &artifacts
   # déploiement, cette valeur devient une URI s3:// vers Garage et le montage
   # disparaît.
   PREDICT_STORAGE_ROOT: ${PREDICT_STORAGE_ROOT:-/app/data}
+  # Racine de l'historique de référence. Elle ne suit plus le code : les CSV
+  # ne sont ni dans le dépôt ni dans l'image, et le défaut désigne le montage
+  # posé sur le service `collector` ci-dessous. En déploiement, cette valeur
+  # devient une URI s3:// et le montage disparaît, comme pour les partitions.
+  PREDICT_DATASETS_ROOT: ${PREDICT_DATASETS_ROOT:-/app/datasets}
   PREDICT_ENV: ${PREDICT_ENV:-local}
   MLFLOW_TRACKING_URI: http://mlflow:5000
   AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
@@ -88,6 +93,13 @@ services:
     environment:
       <<: [*artifacts, *database]
       MOCK_API_URL: ${MOCK_API_URL_CONTAINER:?definir MOCK_API_URL_CONTAINER dans .env}
+    volumes:
+      # Historique de référence, monté en lecture seule depuis le poste. Il ne
+      # rentre plus dans l'image, et sans Garage local c'est le seul chemin
+      # par lequel `python -m collector.datasets` le trouve. Avec Garage
+      # (profil `garage`), poser PREDICT_DATASETS_ROOT=s3://... rend ce
+      # montage sans effet.
+      - ./datasets:/app/datasets:ro
     extra_hosts:
       # Linux ne résout pas host.docker.internal par défaut, contrairement à
       # Docker Desktop. La ligne ne sert que si la base ou l'API Mock tournent

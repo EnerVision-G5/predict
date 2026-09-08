@@ -24,14 +24,8 @@ libs/*/tests/
 services/*/tests/
 tests/
 
-# Jeux de données de référence. Les fichiers PAR SITE entrent dans l'image du
-# collecteur, qui les charge en base : la source ne sert pas d'historique, et
-# un déploiement doit pouvoir le poser sans transfert de fichiers.
-#
-# Deux exclusions, parce qu'ils n'apporteraient que du poids :
-#  - all_sites_combined.csv porte exactement les mêmes lignes que les sept
-#    fichiers par site, pour 11 Mo de plus ;
-#  - les métadonnées décrivent le jeu (période, anomalies, profil) et sont
-#    faites pour être lues par un humain, pas chargées.
-datasets/all_sites_combined.csv
-datasets/*_metadata.json
+# Jeux de données de référence. Aucun n'entre dans l'image : ils vivent sur le
+# stockage objet, et `python -m collector.datasets` les y lit. Les laisser
+# passer ici les ferait revenir dans le contexte de build sans que rien ne les
+# copie, pour vingt-quatre mégaoctets envoyés au démon à chaque construction.
+datasets/

@@ -15,6 +15,13 @@ mlruns/
 # exactement ce qu'un dépôt de code n'a pas à porter.
 data/
 
+# Historique de référence : deux années horaires par site, vingt-quatre
+# mégaoctets de CSV figés. Ils vivent sur le stockage objet, d'où
+# `python -m collector.datasets` les lit — un dépôt de code n'a pas à faire
+# transiter ce poids à chaque clone, et Git ne sait rien en faire qu'un
+# stockage objet ne fasse mieux.
+datasets/
+
 # Sorties de notebooks.
 .ipynb_checkpoints/
 

@@ -105,6 +105,43 @@ interrompre la boucle — un tick dont la base vient de refuser les mesures ne
 pourra pas y écrire son échec non plus, et mourir là serait mourir au moment
 où le processus a le plus de raisons de continuer.
 
+## Poser l'historique de référence
+
+Deux années horaires par site, fournies avec la source. C'est la SEULE origine
+possible de l'historique d'apprentissage : `GET /api/v1/readings` ne remonte
+qu'à 48 heures et répond des mesures nulles au-delà, sans erreur.
+
+```bash
+python -m collector.datasets                             # racine de conf/
+python -m collector.datasets --root s3://enervision-datasets
+```
+
+**Ces fichiers ne sont ni dans le dépôt ni dans l'image.** Vingt-quatre
+mégaoctets de CSV figés pesaient sur chaque clone et sur chaque couche
+publiée, pour une donnée qu'un seul geste lit une seule fois. Ils vivent sur
+le stockage objet, et `storage.datasets_root` dit où — un chemin de poste ou
+une URI `s3://`, les deux traversant `predict_common.io` comme les partitions.
+
+Leur seau est distinct de celui des partitions, et ce n'est pas de la
+symétrie : un rejeu de l'ETL réécrit les partitions, et deux années de mesures
+que rien dans la chaîne ne sait régénérer n'ont pas à partager un préfixe avec
+ce qui s'efface.
+
+Les y déposer une première fois, depuis un poste qui les a :
+
+```bash
+aws --endpoint-url http://localhost:3900 s3 cp datasets/     s3://enervision-datasets/ --recursive --exclude "*" --include "SITE*.csv"
+```
+
+Seuls les fichiers par site sont lus. `all_sites_combined.csv` porte
+exactement les mêmes lignes pour 11 Mo de plus, et les `*_metadata.json`
+décrivent le jeu pour un lecteur humain — les déposer aussi ne coûte que du
+stockage, les charger doublerait le travail pour un résultat identique.
+
+**Le rejeu est sans effet de bord**, pour la même raison que le rattrapage :
+`sink.write` insère en `ON CONFLICT DO NOTHING`. Sur une base qui collecte
+déjà, l'import comble ce qui manque et ne touche à aucune mesure présente.
+
 ## Rattraper l'historique
 
 C'est ce qui alimente le premier entraînement. Sans historique, la couche des
@@ -746,6 +783,11 @@ make storage        # démarre garage, crée le seau, affiche la clé générée
 Le script d'amorçage relève une clé et un secret : les reporter dans `.env`
 (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), puis poser
 `PREDICT_STORAGE_ROOT=s3://enervision` et `AWS_ENDPOINT_URL=http://garage:3900`.
+
+Il pose DEUX seaux. `enervision` porte les partitions de variables, que
+l'ETL réécrit à chaque run ; `enervision-datasets` porte l'historique de
+référence, figé et irremplaçable, désigné par `PREDICT_DATASETS_ROOT`. Voir
+« Poser l'historique de référence ».
 
 Les quatre services traversent exactement le même code : `predict_common.io`
 résout un chemin nu vers le disque et une URI `s3://` vers le stockage objet.

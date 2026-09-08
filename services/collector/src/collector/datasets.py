@@ -29,6 +29,13 @@ n'ont pas eu lieu, sans rien apporter en aval.
 Ce que le jeu de données ne porte pas reste NULL : ni tension, ni intensité, ni
 facteur de puissance. Les déduire d'une consommation horaire serait inventer
 trois grandeurs électriques à partir d'une seule.
+
+Où vivent les fichiers. Sur le stockage objet, pas dans le dépôt ni dans
+l'image. Vingt-quatre mégaoctets de CSV figés faisaient grossir chaque clone
+et chaque couche d'image publiée, pour une donnée qu'un seul geste lit une
+seule fois. `storage.datasets_root` désigne donc un répertoire ou un seau —
+`datasets` sur un poste, `s3://enervision-datasets` en déploiement — et les
+deux traversent le même code, celui de `predict_common.io`.
 """
 
 from __future__ import annotations
@@ -36,13 +43,15 @@ from __future__ import annotations
 import argparse
 import logging
 from collections.abc import Iterator, Sequence
-from pathlib import Path
+from fnmatch import fnmatch
 from typing import Any
 
 import pandas as pd
+import pyarrow.fs
 from sqlalchemy.engine import Engine
 
 from collector import sink
+from predict_common import io
 from predict_common.config import Config, ConfigError, load_config
 from predict_common.db import (
     DatabaseError,
@@ -96,30 +105,57 @@ class DatasetError(RuntimeError):
     """Le jeu de données est absent, illisible, ou incomplet."""
 
 
-def find_files(directory: Path) -> list[Path]:
-    """Retourne les fichiers par site, triés, et refuse un dossier muet.
+def find_files(root: str) -> list[str]:
+    """Retourne les URI des fichiers par site, triées, et refuse une racine
+    muette.
 
-    Un dossier vide est une erreur et non un import de zéro ligne : la
+    Une racine vide est une erreur et non un import de zéro ligne : la
     commande aurait l'air d'avoir réussi, et le défaut ne se verrait qu'à
     l'entraînement, faute de variables à apprendre.
+
+    Le filtrage est fait ici et non par le stockage : S3 ne connaît pas les
+    motifs de shell, il ne sait que lister un préfixe.
     """
-    if not directory.is_dir():
-        raise DatasetError(f"Répertoire de jeux de données absent : {directory}.")
-    files = sorted(directory.glob(FILE_PATTERN))
-    if not files:
-        raise DatasetError(
-            f"Aucun fichier {FILE_PATTERN} dans {directory}."
+    try:
+        filesystem, path = io.resolve(str(root))
+        entries = filesystem.get_file_info(
+            pyarrow.fs.FileSelector(path, recursive=False, allow_not_found=True),
         )
+    except (OSError, io.StorageError) as exc:
+        raise DatasetError(f"Stockage des jeux de données injoignable : {exc}") from exc
+    files = sorted(
+        entry.path
+        for entry in entries
+        if entry.type == pyarrow.fs.FileType.File
+        and fnmatch(entry.base_name, FILE_PATTERN)
+    )
+    if not files:
+        raise DatasetError(f"Aucun fichier {FILE_PATTERN} dans {root}.")
     return files
 
 
-def read_file(path: Path) -> pd.DataFrame:
-    """Lit un fichier par site et vérifie qu'il porte ce qu'on attend."""
-    frame = pd.read_csv(path)
-    missing = [name for name in REQUIRED_COLUMNS if name not in frame.columns]
+def read_file(uri: str) -> pd.DataFrame:
+    """Lit un fichier par site et vérifie qu'il porte ce qu'on attend.
+
+    L'URI désigne un fichier du disque ou du stockage objet ; c'est
+    `predict_common.io` qui décide lequel, à partir du schéma.
+    """
+    name = base_name(uri)
+    try:
+        filesystem, path = io.resolve(str(uri))
+        with filesystem.open_input_stream(path) as stream:
+            frame = pd.read_csv(stream)
+    except (OSError, io.StorageError) as exc:
+        raise DatasetError(f"Fichier {name} illisible : {exc}") from exc
+    missing = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
     if missing:
-        raise DatasetError(f"Colonnes absentes de {path.name} : {missing}.")
+        raise DatasetError(f"Colonnes absentes de {name} : {missing}.")
     return frame
+
+
+def base_name(uri: str) -> str:
+    """Dernier segment d'une URI, pour les journaux et les messages."""
+    return str(uri).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
 
 
 def to_readings(frame: pd.DataFrame) -> Iterator[dict[str, Any]]:
@@ -151,7 +187,7 @@ def to_readings(frame: pd.DataFrame) -> Iterator[dict[str, Any]]:
         }
 
 
-def load_file(engine: Engine, path: Path, batch_size: int) -> int:
+def load_file(engine: Engine, uri: str, batch_size: int) -> int:
     """Charge un fichier et retourne le nombre de mesures soumises.
 
     Soumises et non écrites : le `ON CONFLICT DO NOTHING` ne remonte pas ce
@@ -159,23 +195,23 @@ def load_file(engine: Engine, path: Path, batch_size: int) -> int:
     premier sans avoir rien inséré — c'est le comportement attendu, et le
     seul honnête, puisque la base ne dit pas ce qu'elle a écarté.
     """
-    frame = read_file(path)
+    frame = read_file(uri)
     measures = sink.to_measures(to_readings(frame))
     report = sink.write(engine, measures, batch_size)
     logger.info(
         "%s : %d ligne(s) lue(s), %d mesure(s) soumise(s)",
-        path.name,
+        base_name(uri),
         len(frame),
         report.rows,
     )
     return report.rows
 
 
-def load(engine: Engine, directory: Path, batch_size: int) -> int:
-    """Charge tous les fichiers par site du répertoire, dans l'ordre."""
+def load(engine: Engine, root: str, batch_size: int) -> int:
+    """Charge tous les fichiers par site de la racine, dans l'ordre."""
     total = 0
-    for path in find_files(directory):
-        total += load_file(engine, path, batch_size)
+    for uri in find_files(root):
+        total += load_file(engine, uri, batch_size)
     return total
 
 
@@ -243,6 +279,10 @@ def _batch_size(config: Config) -> int:
     return config.get_int("database.batch_size", DEFAULT_BATCH_SIZE)
 
 
+def _datasets_root(config: Config) -> str:
+    return config.get_str("storage.datasets_root")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="collector.datasets",
@@ -251,10 +291,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--dir",
-        dest="directory",
-        default="datasets",
-        help="Répertoire des fichiers par site. Défaut : datasets.",
+        "--root",
+        dest="root",
+        default=None,
+        help=(
+            "Racine des fichiers par site, chemin ou URI s3://."
+            " Défaut : storage.datasets_root."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -274,6 +317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = load_config()
+        root = args.root or _datasets_root(config)
         engine = open_engine(config.get_optional_str("database.url"))
         # Avant le premier fichier : cent vingt mille lignes lues et
         # transformées pour échouer au chargement seraient du travail perdu,
@@ -281,7 +325,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # retard sur les migrations de l'API.
         verify_schema(engine, (mesure,))
         batch_size = args.batch_size or _batch_size(config)
-        written = load(engine, Path(args.directory), batch_size)
+        logger.info("jeux de données lus depuis %s", root)
+        written = load(engine, root, batch_size)
     except (ConfigError, DatabaseError, DatasetError, ValueError) as exc:
         logger.error("import impossible : %s", exc)
         return 1

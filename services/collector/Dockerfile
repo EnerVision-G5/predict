@@ -61,11 +61,12 @@ WORKDIR /app
 COPY --from=builder --chown=predict:predict /app/.venv /app/.venv
 COPY --chown=predict:predict conf/ conf/
 
-# Historique de référence, chargé par `python -m collector.datasets`. Il entre
-# dans l'image plutôt que d'être monté : c'est une donnée de référence figée,
-# versionnée avec le code qui la lit, et un déploiement n'a alors aucun
-# fichier à transporter pour poser deux ans d'historique.
-COPY --chown=predict:predict datasets/ datasets/
+# L'historique de référence n'entre PAS dans l'image. Vingt-quatre mégaoctets
+# de CSV figés pesaient sur chaque couche publiée et sur chaque clone du
+# dépôt, pour une donnée que `python -m collector.datasets` lit une seule fois
+# à l'installation. Elle vit sur le stockage objet, et la commande la lit là
+# où `storage.datasets_root` la désigne — voir le module, qui traverse le même
+# `predict_common.io` que les partitions.
 
 USER predict
 

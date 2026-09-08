@@ -134,7 +134,8 @@ def test_le_fichier_combine_n_est_pas_relu(tmp_path) -> None:
     # en plus doublerait le travail pour un résultat identique.
     write_dataset(tmp_path, "SITE001.csv", [csv_line()])
     write_dataset(tmp_path, "all_sites_combined.csv", [csv_line()])
-    assert [p.name for p in datasets.find_files(tmp_path)] == ["SITE001.csv"]
+    found = datasets.find_files(tmp_path)
+    assert [datasets.base_name(uri) for uri in found] == ["SITE001.csv"]
 
 
 def test_un_repertoire_sans_fichier_est_une_erreur(tmp_path) -> None:
@@ -157,3 +158,45 @@ def test_une_colonne_attendue_absente_est_nommee(tmp_path) -> None:
     with pytest.raises(datasets.DatasetError) as erreur:
         datasets.read_file(path)
     assert "consumption_kwh" in str(erreur.value)
+
+
+# --- Racine de stockage ------------------------------------------------------
+#
+# Les CSV ne sont plus dans le dépôt ni dans l'image : ils vivent sur le
+# stockage objet, et la racine est une valeur de configuration. Le disque et
+# une URI s3:// traversent le même code — celui de `predict_common.io` — donc
+# ce qui est éprouvé ici est le contrat de cette frontière, pas S3.
+
+
+class TestStorageRoot:
+    """Ce que la commande accepte comme racine, et comment elle échoue."""
+
+    def test_un_chemin_local_est_une_racine_valide(self, tmp_path) -> None:
+        write_dataset(tmp_path, "SITE001.csv", [csv_line()])
+        assert len(datasets.find_files(tmp_path)) == 1
+
+    def test_une_racine_au_schema_inconnu_est_une_erreur_de_jeu_de_donnees(
+        self,
+    ) -> None:
+        # Et non une StorageError nue : l'opérateur qui lance l'import lit un
+        # message sur SON geste, pas sur la couche qui l'a refusé.
+        with pytest.raises(datasets.DatasetError) as erreur:
+            datasets.find_files("nulle-part://enervision-datasets")
+        assert "nulle-part://" in str(erreur.value)
+
+    def test_un_fichier_absent_est_nomme(self, tmp_path) -> None:
+        with pytest.raises(datasets.DatasetError) as erreur:
+            datasets.read_file(tmp_path / "SITE404.csv")
+        assert "SITE404.csv" in str(erreur.value)
+
+
+class TestBaseName:
+    """Le nom rendu au journal, quel que soit le stockage d'où il vient."""
+
+    def test_une_uri_s3_rend_son_dernier_segment(self) -> None:
+        uri = "s3://enervision-datasets/SITE001.csv"
+        assert datasets.base_name(uri) == "SITE001.csv"
+
+    def test_un_chemin_windows_rend_son_dernier_segment(self) -> None:
+        # Le chemin d'un poste traverse la même fonction que celui d'un seau.
+        assert datasets.base_name(r"D:\jeux\SITE001.csv") == "SITE001.csv"

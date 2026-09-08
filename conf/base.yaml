@@ -18,6 +18,20 @@ storage:
   # La couche brute n'est pas ici : c'est la table `mesure`, plus bas.
   root: ${PREDICT_STORAGE_ROOT:-data}
 
+  # Racine de l'historique de référence — les CSV par site, deux années
+  # horaires, lus une seule fois par `python -m collector.datasets`.
+  #
+  # Séparée de `root` et non dérivée d'elle : ce sont deux couches de nature
+  # opposée. `root` porte des partitions PRODUITES, réécrites à chaque run et
+  # jetables ; celle-ci porte une donnée FIGÉE et irremplaçable, que rien dans
+  # la chaîne ne sait régénérer. Les mettre sous le même préfixe exposerait
+  # l'historique aux effacements d'un rejeu.
+  #
+  # Ces fichiers ne sont ni dans le dépôt ni dans l'image : vingt-quatre
+  # mégaoctets figés n'ont à grossir ni les clones ni les couches publiées.
+  # Voir README, « Poser l'historique de référence ».
+  datasets_root: ${PREDICT_DATASETS_ROOT:-datasets}
+
 database:
   # Couche brute de la chaîne. Le collecteur y écrit les mesures de la source,
   # l'ETL les y relit et y repose ce qu'il en déduit. La base est fournie par
