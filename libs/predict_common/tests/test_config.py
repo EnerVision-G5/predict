@@ -154,6 +154,22 @@ def test_get_int_list_refuses_a_lone_value() -> None:
         config.get_int_list("a")
 
 
+def test_get_int_list_splits_a_value_from_the_environment() -> None:
+    # `${ETL_LAG_HOURS:-1,24,168}` ne peut pas produire une liste YAML : une
+    # valeur venue de l'environnement est toujours une chaîne. Sans ce
+    # découpage, les décalages seraient la seule clé qu'un déploiement ne
+    # pourrait pas surcharger.
+    assert Config(values={"a": "1, 24, 168"}).get_int_list("a") == [1, 24, 168]
+    assert Config(values={"a": "24"}).get_int_list("a") == [24]
+
+
+def test_get_int_list_refuses_an_empty_environment_value() -> None:
+    # Une liste de décalages vide publierait des variables sans historique,
+    # au lieu de signaler la variable mal renseignée qui l'a produite.
+    with pytest.raises(ConfigError, match="vide"):
+        Config(values={"a": " , "}).get_int_list("a")
+
+
 def test_section_returns_a_block(conf_dir: Path) -> None:
     config = load_config(env={}, directory=conf_dir)
     assert dict(config.section("training.params"))["max_depth"] == 6
