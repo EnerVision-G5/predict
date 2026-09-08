@@ -4,7 +4,8 @@ Repo Data d'EnerVision. Il porte quatre exécutables indépendants qui ne
 communiquent que par des artefacts — une table, des partitions, un registre de
 modèles : la collecte des mesures depuis l'API Mock IoT vers TimescaleDB, leur
 transformation en variables d'apprentissage, l'entraînement des modèles suivi
-par MLflow, et le service d'inférence FastAPI déployé sur Azure.
+par MLflow, et le service d'inférence FastAPI, déployé on-premise et appelé par
+la seule API métier.
 
 La règle centrale tient en une phrase. **Aucun service n'importe le code d'un
 autre.** Si `etl` faisait `from collector.client import fetch`, il n'y aurait
@@ -103,6 +104,56 @@ jour à purger, pour une question qui est au présent. L'écriture ne peut jamai
 interrompre la boucle — un tick dont la base vient de refuser les mesures ne
 pourra pas y écrire son échec non plus, et mourir là serait mourir au moment
 où le processus a le plus de raisons de continuer.
+
+## Poser l'historique de référence
+
+Deux années horaires par site, fournies avec la source. C'est la SEULE origine
+possible de l'historique d'apprentissage : `GET /api/v1/readings` ne remonte
+qu'à 48 heures et répond des mesures nulles au-delà, sans erreur.
+
+```bash
+python -m collector.datasets                             # racine de conf/
+python -m collector.datasets --root s3://enervision-datasets
+```
+
+**Ces fichiers ne sont ni dans le dépôt ni dans l'image.** Vingt-quatre
+mégaoctets de CSV figés pesaient sur chaque clone et sur chaque couche
+publiée, pour une donnée qu'un seul geste lit une seule fois. Ils vivent sur
+le stockage objet, et `storage.datasets_root` dit où — un chemin de poste ou
+une URI `s3://`, les deux traversant `predict_common.io` comme les partitions.
+
+Leur seau est distinct de celui des partitions, et ce n'est pas de la
+symétrie : un rejeu de l'ETL réécrit les partitions, et deux années de mesures
+que rien dans la chaîne ne sait régénérer n'ont pas à partager un préfixe avec
+ce qui s'efface.
+
+Les y déposer une première fois, depuis un poste qui les a :
+
+```bash
+make storage                                    # démarre Garage, pose seaux et clé
+# reporter AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY dans .env, puis
+# AWS_ENDPOINT_URL=http://localhost:3900
+make datasets-push                              # dépose les sept CSV
+```
+
+Ou directement, vers n'importe quelle racine :
+
+```bash
+uv run python deploy/push-datasets.py datasets s3://enervision-datasets
+```
+
+L'envoi n'exige aucun client S3 sur le poste : il passe par la même
+`predict_common.io` que la lecture, si bien qu'une machine qui sait lancer la
+chaîne sait déposer les fichiers.
+
+Seuls les fichiers par site sont lus. `all_sites_combined.csv` porte
+exactement les mêmes lignes pour 11 Mo de plus, et les `*_metadata.json`
+décrivent le jeu pour un lecteur humain — les déposer aussi ne coûte que du
+stockage, les charger doublerait le travail pour un résultat identique.
+
+**Le rejeu est sans effet de bord**, pour la même raison que le rattrapage :
+`sink.write` insère en `ON CONFLICT DO NOTHING`. Sur une base qui collecte
+déjà, l'import comble ce qui manque et ne touche à aucune mesure présente.
 
 ## Rattraper l'historique
 
@@ -213,6 +264,7 @@ make run-day DATE=2026-09-02 FV=v1
 | `services/serving/loader.py` | Résolution du modèle par alias |
 | `services/serving/forecast.py` | Historique lu, prévision par récurrence |
 | `services/serving/api.py` | FastAPI, `CONTRACT_VERSION` |
+| `services/serving/auth.py` | Clé de service exigée sur les routes du contrat |
 | `services/serving/schemas.py` | DTO : source de vérité du contrat |
 | `tests/test_architecture.py` | Vérifie qu'aucun service n'en importe un autre |
 | `data/` | Partitions de variables, jamais commitées — ou un seau Garage |
@@ -399,6 +451,107 @@ sert. Après une promotion faite ainsi, un `--promote-version` sur la version
 concernée remet tout d'aplomb — l'inscription est un `ON CONFLICT (nom,
 version) DO UPDATE`, donc rejouable autant de fois qu'on veut.
 
+### Le banc d'arbitrage, et ce que promouvoir veut dire
+
+Le vocabulaire du challenge — `challenger`, `champion` — a longtemps été le
+seul morceau de challenge : `--promote` posait l'alias sur ce qui venait
+d'être appris sans jamais regarder ce que la version en place savait faire.
+Une semaine d'apprentissage dégradée pouvait remplacer un modèle meilleur
+qu'elle, et le seul garde-fou était l'attention de qui tapait la commande.
+
+Deux choses manquaient, et elles se tiennent.
+
+**Une fenêtre commune.** Chaque run mesurait sa qualité sur SON bloc de test,
+découpé dans SA fenêtre d'apprentissage : deux entraînements espacés d'une
+semaine produisaient deux MAE que rien n'autorisait à mettre côte à côte — ce
+qu'on faisait pourtant en les regardant dans l'interface. Le **banc
+d'arbitrage** est une fenêtre de journées retirée de l'apprentissage, sur
+laquelle tout candidat est réévalué : le modèle qu'on vient d'apprendre, les
+familles concurrentes, les baselines naïves. Ses mesures sont préfixées
+`arbitrage_` dans le run, et la fenêtre elle-même y est journalisée sous
+`arbitrage_window`.
+
+Il est glissant par défaut — les `training.arbitration.days` derniers jours de
+la fenêtre demandée — ce qui suffit à comparer entre eux les candidats d'un
+même run. Le figer rend les mesures comparables **d'un entraînement à
+l'autre** :
+
+```yaml
+training:
+  arbitration:
+    start: "2026-08-01"
+    end: "2026-08-14"
+```
+
+**Une référence gratuite.** ADR-010 décide que XGBoost est « comparé
+systématiquement à une baseline naïve » et que « la baseline est un livrable
+permanent, pas une étape jetable ». Les persistances — la consommation d'il y
+a 1 h, 24 h, 168 h — sont mesurées sur le même banc, et c'est la meilleure des
+trois, donc la plus dure à battre, qui sert de barre (`naif_mae`).
+
+`--promote` passe désormais par une règle, dans cet ordre :
+
+1. **battre la persistance** — un modèle qui ne bat pas la recopie de la
+   veille ne paie ni son entraînement, ni son registre, ni sa surveillance ;
+2. **être comparable** — deux mesures faites sur des bancs différents ne se
+   comparent pas, et le refus est franc plutôt que masqué par un classement
+   que personne ne pourrait défendre ;
+3. **ne pas dégrader** — `training.promotion.margin` dit ce qu'on tolère, et
+   vaut zéro par défaut : le candidat doit au moins égaler le champion.
+
+Un refus sort en **code 3**, distinct du 1 : le modèle a été appris et
+enregistré en challenger, seule sa mise en service a été refusée. Il n'y a
+rien à réparer, il y a quelque chose à lire.
+
+```bash
+# refusé si la version dégrade le service, ou ne bat pas la persistance
+python -m training --feature-version v1 --promote
+
+# passer outre : décision d'exploitation, journalisée comme telle
+python -m training --feature-version v1 --promote --force
+```
+
+`--force` existe parce qu'un exploitant peut avoir une raison que la règle n'a
+pas — un champion entraîné sur une période aberrante, un banc qu'on sait
+faussé. Il porte sur ce seul geste et n'assouplit rien pour les suivants. Une
+version enregistrée **avant** l'existence du banc n'en porte aucune mesure :
+la promouvoir demande `--force`, et c'est exactement ce qu'elle est, une
+décision prise sans comparaison.
+
+### Opposer les familles : `--challenge`
+
+Un seul algorithme était câblé. ADR-010 tranche entre trois options — baseline
+simple, XGBoost, réseau séquentiel — et la comparaison n'existait que dans le
+document.
+
+```bash
+make challenge HISTORY_DAYS=90
+# ou
+python -m training --challenge --feature-version v1 --history-days 90
+```
+
+Chaque famille déclarée dans `training.candidates`, plus XGBoost (qui tire ses
+hyperparamètres de `training.params`, pour qu'ils ne soient pas écrits deux
+fois), plus chaque persistance, est ajustée puis mesurée sur le banc. Chacune
+a son run dans MLflow, taguée `challenge`, et le classement sort dans le
+journal :
+
+```
+classement sur le banc 2026-08-21/2026-09-03 (14 journée(s), glissant, 672 heure(s)) :
+  1. foret-aleatoire    MAE     2.30 kW   RMSE     2.93   R2  1.000
+  2. xgboost            MAE     2.31 kW   RMSE     2.93   R2  1.000
+  3. ridge              MAE     3.16 kW   RMSE     3.97   R2  0.999
+  4. persistance-24h    MAE     4.57 kW   RMSE     5.84   R2  0.999
+```
+
+Le challenge **n'enregistre rien et ne promeut rien**, et ce n'est pas une
+limite : un classement dit quelle famille convient au problème, mettre en
+service est une autre décision, qui se prend après l'avoir lu et passe par
+`--promote-version`. Enregistrer chaque candidat remplirait le registre de
+versions qu'aucun alias ne désigne — et la version que `serving` résout porte
+le nom d'une famille, `enervision_xgboost` : y déposer une forêt serait un
+contresens de nommage avant d'être un contresens d'exploitation.
+
 C'est aussi le `loader` qui sait *comment* parler au modèle. Sa signature dit
 les colonnes, leur ordre et leurs types, et MLflow refuse une conversion qu'il
 ne peut pas garantir sans perte — un `hour` en `int64` présenté à un modèle
@@ -506,6 +659,99 @@ partielles, des dépendances entre journées ou un calendrier, ces trois cibles
 se transposeront telles quelles — parce qu'elles sont déjà des processus
 indépendants, datés et idempotents.
 
+## Accès au service d'inférence
+
+Le service est routé publiquement et relaie `POST /api/v1/simulate/spike`, qui
+**écrit sur la source**. L'API métier protège la même opération derrière le
+rôle `writer` : un service ouvert rendait ce contrôle contournable, il
+suffisait de l'appeler directement.
+
+Les routes du contrat exigent donc une clé de service, présentée en en-tête
+`X-API-Key`. Restent servies sans clé : `/health`, la sonde de vivacité de
+l'hébergeur, et `/openapi.json` / `/docs`, dont part le scan DAST de la CI.
+`/ready` est fermée — elle nomme la version servie et l'âge des variables.
+
+```bash
+# Générer la clé, puis la poser des deux côtés : ici, et dans le .env de
+# l'API métier, qui la présente à chaque appel.
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Sans `SERVING_API_KEY`, le service **refuse de démarrer**, comme l'API métier
+refuse de démarrer sans `JWT_SECRET` : un service qui partirait ouvert
+servirait la simulation de pic à qui la demande, et il aurait l'air sain.
+Poser `SERVING_AUTH_ENABLED=false` ouvre les routes pour le poste de
+développement — le service le journalise en avertissement à chaque démarrage,
+et cela ne doit jamais être déployé.
+
+La clé n'est pas déclarée dans le contrat gelé : l'y ajouter ferait échouer
+`contract-drift` sur une PR qui n'a rien changé au contrat métier. C'est la
+bonne cible, en patch semver, par une PR sur `enervision/docs/contracts`.
+
+## La grille à la minute
+
+`mesure` est une grille : **au plus une ligne par site et par minute**, et
+`(site_id, ts)` en est la clé. La minute est la résolution la plus fine que la
+chaîne produise — c'est la cadence du poller.
+
+Les deux points d'entrée n'apportent pas la même granularité, et c'est la
+source qui le décide :
+
+| Route | Ce qu'elle sert | Horodatage |
+| --- | --- | --- |
+| `.../{id}/current` | l'instantané | l'instant de l'appel, sub-seconde |
+| `/api/v1/readings` | l'historique, par pas de 30 min | aligné à la minute |
+
+La cadence à la minute vient donc du **poller**, pas du rattrapage :
+l'historique de la source n'existe qu'à 30 minutes, et aucune option de
+`/readings` ne le raffine. Rattraper un mois donne 48 points par jour et par
+site ; les 1440 ne s'obtiennent qu'en polling, à partir du moment où il tourne.
+
+## Le rattrapage au démarrage
+
+Un poller qui redémarre reprenait **au présent** : tout ce que la coupure
+avait laissé passer restait un trou, et rien ne le signalait — `mesure` n'a
+pas de ligne à montrer pour une minute jamais collectée. Le trou ne se voyait
+qu'au moment où l'ETL produisait une journée creuse.
+
+Le poller comble donc ce qui manque avant d'entrer dans sa boucle, par
+`/api/v1/readings` — la seule route qui serve du passé. La profondeur n'est
+pas fixée : elle est **déduite de la dernière mesure de chaque site**, donc de
+la durée réelle de la coupure.
+
+```bash
+python -m collector.poller                  # rattrape puis boucle (défaut)
+python -m collector.poller --no-catch-up    # boucle seule
+python -m collector --catch-up              # rattrapage seul, à la main
+```
+
+| État de la base | Ce qui est collecté |
+| --- | --- |
+| vide | `collector.catch_up_days` journées (30 par défaut) |
+| arrêt de 5 jours | les 5 journées, et celle de la reprise |
+| redémarrage à chaud | la journée courante seulement |
+| un site jamais collecté | retour au plancher, pour tous les sites |
+
+La journée de la dernière mesure est **incluse** : c'est celle où le
+collecteur s'est arrêté, elle est donc presque toujours incomplète. Et la
+fenêtre est commune à tous les sites plutôt que découpée par site —
+`ON CONFLICT DO NOTHING` rend le recouvrement gratuit en base, et une journée
+coûte une requête par site à la source.
+
+L'échec du rattrapage n'empêche pas la boucle de démarrer : collecter le
+présent a plus de valeur que le passé, et le passé se relance à la main.
+
+`collector.sink.snap_to_grid` ramène l'horodatage sur la grille au moment de
+l'écriture, et **seulement là** : le retard d'ingestion se mesure sur
+l'horodatage brut, sans quoi il serait quantifié à la minute et ferait
+paraître en retard un site à l'heure.
+
+Sans ce calage, une minute couverte par les deux routes entrait en base sous
+deux clés — le poller à `14:30:14.620789`, le rattrapage à `14:30:00` — et
+`ON CONFLICT DO NOTHING` n'avait aucun conflit à arbitrer. Cela se produit sur
+les minutes `:00` et `:30` de chaque heure, soit 48 doublons par jour et par
+site.
+
 ## Pile Docker
 
 ```bash
@@ -550,6 +796,11 @@ make storage        # démarre garage, crée le seau, affiche la clé générée
 Le script d'amorçage relève une clé et un secret : les reporter dans `.env`
 (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), puis poser
 `PREDICT_STORAGE_ROOT=s3://enervision` et `AWS_ENDPOINT_URL=http://garage:3900`.
+
+Il pose DEUX seaux. `enervision` porte les partitions de variables, que
+l'ETL réécrit à chaque run ; `enervision-datasets` porte l'historique de
+référence, figé et irremplaçable, désigné par `PREDICT_DATASETS_ROOT`. Voir
+« Poser l'historique de référence ».
 
 Les quatre services traversent exactement le même code : `predict_common.io`
 résout un chemin nu vers le disque et une URI `s3://` vers le stockage objet.

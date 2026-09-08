@@ -18,6 +18,20 @@ storage:
   # La couche brute n'est pas ici : c'est la table `mesure`, plus bas.
   root: ${PREDICT_STORAGE_ROOT:-data}
 
+  # Racine de l'historique de référence — les CSV par site, deux années
+  # horaires, lus une seule fois par `python -m collector.datasets`.
+  #
+  # Séparée de `root` et non dérivée d'elle : ce sont deux couches de nature
+  # opposée. `root` porte des partitions PRODUITES, réécrites à chaque run et
+  # jetables ; celle-ci porte une donnée FIGÉE et irremplaçable, que rien dans
+  # la chaîne ne sait régénérer. Les mettre sous le même préfixe exposerait
+  # l'historique aux effacements d'un rejeu.
+  #
+  # Ces fichiers ne sont ni dans le dépôt ni dans l'image : vingt-quatre
+  # mégaoctets figés n'ont à grossir ni les clones ni les couches publiées.
+  # Voir README, « Poser l'historique de référence ».
+  datasets_root: ${PREDICT_DATASETS_ROOT:-datasets}
+
 database:
   # Couche brute de la chaîne. Le collecteur y écrit les mesures de la source,
   # l'ETL les y relit et y repose ce qu'il en déduit. La base est fournie par
@@ -51,9 +65,19 @@ source:
   # État de santé des capteurs, par site. Dit quel capteur est tombé et
   # jusqu'à quand, ce qu'aucune mesure ne porte.
   sensors_status_path: /api/v1/sensors/status
-  # Taille de page du rattrapage, plafonnée à 1000 par la source. La
-  # pagination avance par le temps et non par un rang : une page pleine fait
-  # repartir la requête du dernier horodatage reçu.
+  # Largeur maximale d'une fenêtre de rattrapage, EN MINUTES, plafonnée à
+  # 1000 par la source.
+  #
+  # C'est la même valeur que le `limit` envoyé, et ce n'est pas un hasard :
+  # `/api/v1/readings` définit `limit` comme le nombre de résultats rendus,
+  # répartis uniformément sur la fenêtre demandée. Un résultat par minute
+  # exige donc autant de résultats que de minutes, et la fenêtre ne peut pas
+  # être plus large que le plafond de la source.
+  #
+  # Une journée fait 1440 minutes : elle est demandée en deux fenêtres, jamais
+  # en une. La demander d'un bloc avec limit=1000 rendrait mille points étalés
+  # sur 1440 minutes — un point toutes les 86 secondes, sans qu'aucune erreur
+  # ne le signale.
   page_size: 1000
   timeout_s: 30
   # Reprises immédiates d'un appel avant abandon, et attente entre deux
@@ -77,6 +101,19 @@ collector:
   # Trois cadences manquées : en deçà, un à-coup de la source alerterait sans
   # qu'aucune donnée ne soit perdue.
   lag_warning_s: 180
+  # Fenêtre dans laquelle le rattrapage automatique (`--catch-up`) cherche les
+  # trous, en journées.
+  #
+  # 2 et non 35, parce que la source ne sert pas d'historique : son
+  # `/api/v1/readings` ne remonte qu'à 48 heures, et au-delà elle répond des
+  # mesures nulles plutôt qu'une erreur. Une fenêtre plus large ne collectait
+  # donc rien, mais interrogeait quand même la source pour chaque journée et
+  # chaque site, et écrivait des nuls que le `ON CONFLICT DO NOTHING` fige
+  # ensuite définitivement.
+  #
+  # 2 journées couvrent les 48 heures utiles. L'historique d'apprentissage ne
+  # vient pas de là : il est chargé depuis les jeux de données de référence.
+  catch_up_days: ${COLLECTOR_CATCH_UP_DAYS:-2}
 
 etl:
   # Version du jeu de variables. Elle est dans le chemin des partitions, donc
@@ -113,6 +150,47 @@ training:
     random_state: 42
   # Arrêt anticipé sur le jeu de validation, en nombre de tours sans gain.
   early_stopping_rounds: 50
+
+  # Banc d'arbitrage : la fenêtre où TOUS les candidats sont réévalués, et
+  # qu'aucun n'apprend. Sans elle, chaque run mesurait sa qualité sur son
+  # propre bloc de test, découpé dans sa propre fenêtre : deux entraînements
+  # espacés d'une semaine produisaient deux MAE que rien n'autorisait à
+  # comparer, ce qu'on faisait pourtant en les regardant côte à côte.
+  arbitration:
+    # Bornes figées, vides par défaut. Renseignées ENSEMBLE, elles rendent les
+    # mesures comparables d'un entraînement à l'autre — c'est ce que la
+    # promotion exige pour opposer un challenger au champion en place. Les
+    # laisser vides donne un banc glissant, qui ne compare que les candidats
+    # d'un même run entre eux.
+    start: ${TRAINING_BENCH_START:-}
+    end: ${TRAINING_BENCH_END:-}
+    # Profondeur du banc glissant, en journées. Deux semaines : assez pour que
+    # la mesure ne dépende pas d'une seule journée atypique, assez court pour
+    # ne pas amputer l'apprentissage de sa période la plus récente, qui est
+    # aussi la plus proche de ce qu'il faudra prédire.
+    days: 14
+
+  # Familles opposées par `--challenge`, avec leurs hyperparamètres. XGBoost
+  # n'y figure pas : c'est le candidat que l'entraînement ordinaire apprend,
+  # ses hyperparamètres sont dans `params` ci-dessus, et les écrire deux fois
+  # les ferait diverger. ADR-010 compare trois options — une baseline simple,
+  # XGBoost, un réseau séquentiel ; les deux premières sont ici, la troisième
+  # a été écartée pour son coût sur le serveur on-premise.
+  candidates:
+    foret-aleatoire:
+      n_estimators: 300
+      max_depth: 12
+      random_state: 42
+      n_jobs: -1
+    ridge:
+      alpha: 1.0
+
+  promotion:
+    # Dégradation tolérée sur le banc, en proportion de l'erreur du champion.
+    # 0 : le candidat doit au moins l'égaler. Monter ce seuil accepte de
+    # servir un modèle moins bon, ce qui ne se décide pas à la légère — d'où
+    # la valeur la plus stricte par défaut.
+    margin: ${PROMOTION_MARGIN:-0.0}
 
 monitoring:
   # Expérience où atterrissent les mesures d'écart. Séparée de celle des
@@ -152,13 +230,55 @@ monitoring:
   min_rows_per_site: 24
 
 serving:
+  # Clé de service exigée sur les routes du contrat. Le service relaie la
+  # simulation de pic, qui ÉCRIT sur la source : l'API métier protège la même
+  # opération derrière le rôle `writer`, et un service ouvert rendait ce
+  # contrôle contournable. Voir services/serving/src/serving/auth.py pour ce
+  # qui reste servi sans clé — la sonde de vivacité et la spécification.
+  #
+  # Sans repli, et volontairement : le service refuse de démarrer sans elle,
+  # comme l'API métier refuse de démarrer sans JWT_SECRET. Générer avec
+  #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+  api_key: ${SERVING_API_KEY:-}
+  # false ouvre les routes. C'est le mode du poste de développement et de la
+  # CI, où aucun secret n'est distribué ; il est journalisé en avertissement à
+  # chaque démarrage et ne doit jamais être déployé.
+  auth_enabled: ${SERVING_AUTH_ENABLED:-true}
   # Alias et non version figée : promouvoir un modèle se fait en déplaçant
   # l'alias dans MLflow, sans redéployer le service, et le retour arrière est
   # le même geste en sens inverse.
   model_uri: ${SERVING_MODEL_URI:-models:/enervision_xgboost@champion}
+  # Durée de conservation des partitions de variables en mémoire, en secondes.
+  # Le service relisait le stockage objet à CHAQUE prévision : une fenêtre de
+  # dix journées, décompressée et triée, pour en extraire un seul site. L'ETL
+  # ne publie qu'une fois par cycle, la relire plus souvent ne peut rien
+  # apprendre de neuf. 0 désactive le cache.
+  feature_cache_ttl_s: ${SERVING_FEATURE_CACHE_TTL_S:-300}
   # Le service reconstruit les décalages depuis la dernière partition de
   # variables produite par l'ETL. Nombre de jours remontés pour la trouver.
   feature_lookback_days: 10
+
+  # Repli sur l'historique de référence, en nombre d'années remontées.
+  #
+  # Le modèle réclame 168 heures CONTINUES avant l'heure prédite. La source ne
+  # remontant qu'à 48 heures, aucun site ne les a avant une semaine pleine de
+  # collecte : le service refusait alors toute prévision, le dashboard restait
+  # vide, et les recommandations n'avaient aucune série à lire. Un démarrage
+  # de chaîne ressemblait à une panne.
+  #
+  # Faute d'heures récentes, le service rejoue donc celles de l'historique de
+  # référence, décalées d'un nombre entier d'années de 52 SEMAINES — 364 jours,
+  # ni 365 ni 366. C'est ce qui fait retomber sur le même jour de la semaine,
+  # que le modèle lit par `day_of_week`, `is_weekend` et son décalage de 168 h.
+  #
+  # Ce repli ne se déclenche JAMAIS quand des heures récentes suffisent, et la
+  # réponse le déclare en clair : `history_source: reference` et la date
+  # d'origine dans `history_origin`. Un consommateur qui l'ignore afficherait
+  # un profil de l'an dernier comme une mesure de cette semaine.
+  #
+  # 0 désactive le repli, et le service se tait à nouveau tant que la collecte
+  # récente ne suffit pas. 2 couvre les deux années du jeu de référence.
+  reference_years: ${SERVING_REFERENCE_YEARS:-2}
 
 mlflow:
   tracking_uri: ${MLFLOW_TRACKING_URI:-http://localhost:5000}

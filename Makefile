@@ -16,6 +16,10 @@ FV   ?= v1
 DAYS ?= 1
 HISTORY_DAYS ?= 90
 
+# Destination de l'historique de référence. Le seau du profil `garage` par
+# défaut ; sur un déploiement, la racine que porte applications_predict_datasets_root.
+DATASETS_DEST ?= s3://enervision-datasets
+
 # Bornes du rattrapage. Un mois par défaut : de quoi renseigner le décalage de
 # 168 heures et laisser à l'entraînement une fenêtre exploitable.
 START ?= $(shell date -u -d "30 days ago" +%F)
@@ -25,7 +29,7 @@ END   ?= $(DATE)
 # ne crée aucun couplage : le seul état partagé, ce sont les partitions et le
 # registre MLflow.
 .PHONY: help install lint test check collect poll etl train promote serve run-day \
-        backfill drift openapi up down clean storage
+        backfill drift openapi up down clean storage datasets-push
 
 help:  ## Liste les cibles disponibles
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -55,6 +59,10 @@ train:  ## Entraîne un modèle : make train FV=v1 HISTORY_DAYS=90
 	uv run python -m training --feature-version $(FV) \
 		--history-days $(HISTORY_DAYS) --until $(DATE)
 
+challenge:  ## Oppose les familles et les baselines sur le banc, sans rien promouvoir
+	uv run python -m training --challenge --feature-version $(FV) \
+		--history-days $(HISTORY_DAYS) --until $(DATE)
+
 promote:  ## Met une version en service et l'inscrit dans `modele` : make promote V=7
 	uv run python -m training --promote-version $(V)
 
@@ -81,9 +89,12 @@ openapi:  ## Régénère la spécification OpenAPI sur stdout
 up:  ## Démarre MLflow et le service d'inférence
 	docker compose up -d mlflow serving
 
-storage:  ## Démarre Garage et prépare le seau (relève la clé dans les logs)
-	docker compose --profile garage up -d garage garage-init
-	docker compose logs garage-init
+storage:  ## Démarre Garage et prépare les seaux (relève la clé en sortie)
+	docker compose --profile garage up -d garage
+	sh deploy/garage-init.sh
+
+datasets-push:  ## Dépose l'historique de référence sur le stockage objet
+	uv run python deploy/push-datasets.py datasets $(DATASETS_DEST)
 
 down:  ## Arrête la pile
 	docker compose down

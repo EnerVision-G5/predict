@@ -14,7 +14,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
-from conftest import FakeEngine
+from collector_fakes import FakeEngine
 from sqlalchemy.dialects import postgresql
 
 from collector.sink import (
@@ -24,6 +24,7 @@ from collector.sink import (
     deduplicate,
     drop_unplaceable,
     select_day,
+    snap_to_grid,
     sync_sites,
     to_measures,
     to_records,
@@ -32,6 +33,7 @@ from collector.sink import (
     write,
 )
 from predict_common.db import DERIVED_COLUMNS, SOURCE_COLUMNS
+from predict_common.schemas import TIMESTAMP_COLUMN
 
 DAY = date(2026, 9, 2)
 
@@ -320,3 +322,105 @@ def test_write_refuses_a_batch_breaking_the_contract(make_reading) -> None:
     frame = to_measures([make_reading("2026-09-02T08:00:00Z", site_id="S" * 21)])
     with pytest.raises(Exception, match="site_id"):
         write(engine, frame, batch_size=10)
+
+
+# --- Grille à la minute -----------------------------------------------------
+#
+# `mesure` est une grille : une ligne par site et par minute. Le rattrapage lit
+# `/readings`, servi sur des minutes pleines ; le poller lit `/current`, daté de
+# l'instant de l'appel. Sans normalisation, la même minute entrait en base sous
+# deux clés et `ON CONFLICT DO NOTHING` n'avait aucun conflit à arbitrer.
+
+
+def test_une_mesure_datee_dans_la_minute_est_ramenee_sur_la_grille() -> None:
+    """C'est ce que sert `/current` : l'instant de l'appel, pas la minute."""
+    snapped = snap_to_grid(
+        pd.Series(pd.to_datetime(["2026-09-05T13:53:31.587801Z"], utc=True))
+    )
+
+    assert snapped.iloc[0] == pd.Timestamp("2026-09-05T13:53:00Z")
+
+
+def test_l_arrondi_est_vers_le_bas() -> None:
+    """Une mesure appartient à la minute commencée, pas à la suivante.
+
+    Arrondir au plus proche daterait une mesure de 13:53:59 à 13:54,
+    c'est-à-dire d'une minute qui n'a pas encore eu lieu.
+    """
+    snapped = snap_to_grid(
+        pd.Series(pd.to_datetime(["2026-09-05T13:53:59.999Z"], utc=True))
+    )
+
+    assert snapped.iloc[0] == pd.Timestamp("2026-09-05T13:53:00Z")
+
+
+def test_les_deux_routes_ecrivent_la_meme_cle(make_reading) -> None:
+    """Le rejeu d'une journée déjà collectée au fil de l'eau ne double rien.
+
+    C'est la propriété qui manquait : le poller écrivait `13:53:31.587801` et
+    le rattrapage `13:53:00`, deux clés primaires distinctes pour la même
+    minute. Rattraper une journée déjà collectée doublait ses lignes, et
+    `ON CONFLICT DO NOTHING` n'avait aucun conflit à arbitrer.
+    """
+    du_poller = to_measures([make_reading("2026-09-05T13:53:31.587801Z")])
+    du_rattrapage = to_measures([make_reading("2026-09-05T13:53:00Z")])
+
+    poller_engine, rattrapage_engine = FakeEngine(), FakeEngine()
+    write(poller_engine, du_poller, batch_size=10)
+    write(rattrapage_engine, du_rattrapage, batch_size=10)
+
+    assert _submitted_keys(poller_engine) == _submitted_keys(rattrapage_engine)
+
+
+def test_deux_relevés_de_la_même_minute_ne_font_qu_une_ligne(make_reading) -> None:
+    """Un poller redémarré deux fois dans la minute n'en écrit pas deux.
+
+    La déduplication a lieu APRÈS le calage : avant, les deux horodatages
+    étaient distincts et aucune des deux lignes n'était vue comme un doublon.
+    """
+    frame = to_measures(
+        [
+            make_reading("2026-09-05T13:53:05.100000Z"),
+            make_reading("2026-09-05T13:53:48.900000Z"),
+        ]
+    )
+    engine = FakeEngine()
+
+    assert write(engine, frame, batch_size=10).rows == 1
+
+
+def test_le_retard_mesure_n_est_pas_quantifie_par_la_grille(make_reading) -> None:
+    """`to_measures` ne cale pas : le poller y lit l'âge réel de la mesure.
+
+    La grille appartient à la TABLE, pas à la mesure. Caler avant de mesurer
+    ferait paraître en retard de cinquante secondes un site à l'heure, et
+    `ingestion_etat.last_data_lag_s` deviendrait illisible.
+    """
+    frame = to_measures([make_reading("2026-09-05T13:53:31.587801Z")])
+
+    assert frame[TIMESTAMP_COLUMN].iloc[0] == pd.Timestamp(
+        "2026-09-05T13:53:31.587801Z"
+    )
+
+
+def test_un_horodatage_illisible_reste_ecarte(make_reading) -> None:
+    """Le calage ne rattrape pas ce que la source n'a pas su dater."""
+    frame = to_measures([make_reading("pas une date")])
+
+    assert frame[TIMESTAMP_COLUMN].isna().all()
+
+
+def _submitted_keys(engine: FakeEngine) -> list[tuple]:
+    """Clés (site_id, ts) que les instructions soumises portent.
+
+    Lues dans les paramètres liés de l'instruction compilée : c'est ce qui
+    part réellement vers la base, et non ce que le tableau portait avant.
+    """
+    keys = []
+    for statement in engine.executed:
+        params = statement.compile(dialect=postgresql.dialect()).params
+        index = 0
+        while f"site_id_m{index}" in params:
+            keys.append((params[f"site_id_m{index}"], params[f"ts_m{index}"]))
+            index += 1
+    return keys

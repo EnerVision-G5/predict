@@ -43,14 +43,24 @@ from datetime import UTC, date, datetime, time, timedelta
 from sqlalchemy.exc import SQLAlchemyError
 
 from collector.sink import (
+    DayCoverage,
     IngestionState,
+    day_coverage,
     sync_sites,
     to_measures,
     write,
     write_state,
 )
 from predict_common.config import ConfigError, load_config
-from predict_common.db import INGESTION_SOURCE_BACKFILL, DatabaseError, open_engine
+from predict_common.db import (
+    INGESTION_SOURCE_BACKFILL,
+    DatabaseError,
+    ingestion_etat,
+    mesure,
+    open_engine,
+    site,
+    verify_schema,
+)
 from predict_common.paths import PathError, date_range, parse_date
 from predict_common.source import (
     MAX_PAGE_SIZE,
@@ -61,21 +71,47 @@ from predict_common.source import (
 
 DEFAULT_DAYS = 1
 
+# Profondeur du rattrapage automatique, en journées. C'est la fenêtre dans
+# laquelle les trous sont cherchés — pas la quantité recollectée : une fenêtre
+# sans trou ne coûte qu'une requête d'agrégation.
+#
+# 35 et non 30 : « il y a un mois » doit tomber DANS la fenêtre et non sur son
+# bord. Une profondeur de 30 partant du 5 septembre ne remonte qu'au 7 août, et
+# laisserait dehors les deux premières journées d'un trou qui commence le 5.
+DEFAULT_CATCH_UP_DAYS = 35
+
+# Écart toléré entre les bornes d'une journée et ce que la base en porte, de
+# part et d'autre. Voir `covers_full_day` : elle absorbe le pas de la source
+# sans avoir à le connaître.
+COVERAGE_TOLERANCE = timedelta(hours=1)
+
 EXIT_OK = 0
 EXIT_FAILED = 1
 
 logger = logging.getLogger(__name__)
 
 
-def day_window(day: date) -> tuple[datetime, datetime]:
-    """Retourne la fenêtre UTC `[minuit, minuit du lendemain[` d'une journée.
+def day_window(day: date, now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Retourne la fenêtre UTC d'une journée, JAMAIS au-delà de maintenant.
 
     Les mesures rendues par la source sont ensuite filtrées sur le jour
     demandé : une source qui déborderait d'une seconde ne serait pas comptée
     dans une journée qu'elle ne concerne pas.
+
+    La borne haute est ramenée à l'instant courant, et ce n'est pas un détail
+    d'exactitude : sans elle, rattraper la journée EN COURS demande à la
+    source les heures qui n'ont pas encore eu lieu. Elle ne répond pas une
+    erreur — elle répond des mesures nulles, que le collecteur écrit, et que
+    son `ON CONFLICT DO NOTHING` rend alors DÉFINITIVES.
+
+    Le poller collecte ensuite ces minutes-là pour de vrai, une par une, et
+    ses valeurs sont silencieusement rejetées : la ligne existe déjà, vide. Un
+    rattrapage lancé à 02:30 stérilisait ainsi les vingt et une heures
+    suivantes, chaque jour, sans qu'aucun journal ne le dise.
     """
     start = datetime.combine(day, time.min, tzinfo=UTC)
-    return start, start + timedelta(days=1)
+    end = start + timedelta(days=1)
+    return start, min(end, now or datetime.now(UTC))
 
 
 def collect_day(
@@ -221,6 +257,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Site à collecter. Répétable. Par défaut : tout le référentiel.",
     )
     parser.add_argument(
+        "--catch-up",
+        action="store_true",
+        help=(
+            "Rattrape ce qui manque en base, sans période à fournir : la"
+            " reprise part de la dernière mesure de chaque site. Destiné au"
+            " redémarrage du collecteur."
+        ),
+    )
+    parser.add_argument(
+        "--catch-up-days",
+        type=int,
+        default=None,
+        help=(
+            "Profondeur maximale du rattrapage automatique, en journées."
+            f" Défaut : collector.catch_up_days, sinon {DEFAULT_CATCH_UP_DAYS}."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -230,6 +284,102 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     return parser.parse_args(argv)
+
+
+def check_period_arguments(args: argparse.Namespace) -> None:
+    """Refuse une période donnée deux fois, ou donnée à qui la déduit.
+
+    Vérifiée dans les deux modes, et depuis `main` plutôt que depuis
+    `requested_days` : cette dernière n'est pas appelée en mode rattrapage,
+    et le contrôle n'y serait donc jamais exécuté dans le seul cas où il
+    compte.
+    """
+    if not args.catch_up:
+        return
+    given = [
+        name
+        for name, value in (
+            ("--start", args.start),
+            ("--end", args.end),
+            ("--date", args.date),
+        )
+        if value is not None
+    ]
+    if given:
+        raise ValueError(
+            "--catch-up déduit sa période de la base :"
+            f" {', '.join(given)} n'a alors aucun effet et prête à confusion."
+        )
+
+
+def catch_up_days(
+    engine,
+    sites: Sequence[str],
+    depth_days: int,
+    today: date | None = None,
+) -> list[date]:
+    """Retourne les journées à rattraper, déduites des TROUS de la base.
+
+    C'est le mode du redéploiement : personne ne sait ce qui manque, et
+    demander une période reviendrait à le faire deviner à l'exploitant.
+
+    La détection porte sur les trous et non sur la dernière mesure, et c'est
+    la seule chose qui compte ici. Un serveur où le poller tourne déjà a une
+    dernière mesure à « maintenant » quelle que soit l'ampleur de ce qui
+    manque derrière : un repère de reprise ne verrait rien à combler, alors
+    qu'il peut manquer un mois entier plus tôt dans la fenêtre.
+
+    Une journée est retenue dès qu'UN site ne la couvre pas entièrement. Trois
+    cas la rendent incomplète, et le troisième est celui qu'un simple comptage
+    manquerait :
+
+    - aucune ligne — la journée n'a jamais été collectée ;
+    - la première mesure arrive trop tard — le poller a démarré en cours de
+      journée, la matinée manque ;
+    - la dernière arrive trop tôt — le poller s'est arrêté en cours de
+      journée.
+
+    La journée courante est toujours retenue : elle est incomplète par
+    construction, puisqu'elle n'est pas finie.
+
+    La fenêtre est commune à tous les sites plutôt que découpée par site :
+    `ON CONFLICT DO NOTHING` rend le recouvrement gratuit en base, et une
+    journée coûte UNE requête par site à la source, `/readings` servant 48
+    points là où `limit` en autorise 1000.
+    """
+    end = today or datetime.now(UTC).date()
+    first = end - timedelta(days=max(depth_days, 1) - 1)
+    covered = {
+        (entry.site_id, entry.day)
+        for entry in day_coverage(engine, sites, first, end)
+        if covers_full_day(entry, end)
+    }
+    return [
+        day
+        for day in date_range(first, end)
+        if any((site_id, day) not in covered for site_id in sites)
+    ]
+
+
+def covers_full_day(entry: DayCoverage, today: date) -> bool:
+    """Dit si ce que la base porte couvre la journée d'un bout à l'autre.
+
+    La tolérance absorbe le pas de la source sans avoir à le connaître :
+    `/readings` sert 48 points par journée, de 00:00 à 23:30, quand le poller
+    en dépose 1440, de 00:00 à 23:59. Les deux couvrent la journée ; exiger
+    une dernière mesure à 23:59 ferait rattraper indéfiniment toutes les
+    journées venues du seul rattrapage.
+
+    La journée courante n'est jamais couverte : elle n'est pas finie.
+    """
+    if entry.day >= today:
+        return False
+    day_start = datetime.combine(entry.day, time.min, tzinfo=UTC)
+    day_end = day_start + timedelta(days=1)
+    return (
+        entry.first_at <= day_start + COVERAGE_TOLERANCE
+        and entry.last_at >= day_end - COVERAGE_TOLERANCE
+    )
 
 
 def requested_days(args: argparse.Namespace) -> list[date]:
@@ -288,11 +438,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         config = load_config()
-        days = requested_days(args)
+        # En mode rattrapage la période vient de la base, pas de la ligne de
+        # commande : elle est calculée plus bas, une fois le moteur ouvert et
+        # le référentiel résolu.
+        check_period_arguments(args)
+        days = [] if args.catch_up else requested_days(args)
         settings = SourceSettings.from_config(config)
         if args.limit is not None:
             settings = settings.with_page_size(args.limit)
         engine = open_engine(config.get_optional_str("database.url"))
+        # Avant la première page : un rattrapage d'un mois qui échouerait
+        # au chargement aurait relu la source pour rien.
+        verify_schema(engine, (mesure, site, ingestion_etat))
         batch_size = config.get_int("database.batch_size")
     except (ConfigError, DatabaseError, PathError, ValueError) as exc:
         logger.error("configuration invalide : %s", exc)
@@ -302,6 +459,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with SourceClient(settings) as client:
             sites = resolve_sites(client, engine, batch_size, args.sites)
+            if args.catch_up:
+                days = catch_up_days(
+                    engine,
+                    sites,
+                    args.catch_up_days
+                    or config.get_int(
+                        "collector.catch_up_days", DEFAULT_CATCH_UP_DAYS
+                    ),
+                )
             logger.info(
                 "collecte de %d site(s) du %s au %s, %d mesure(s) par requête",
                 len(sites),

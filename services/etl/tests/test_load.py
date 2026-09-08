@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-from conftest import FakeEngine
+from etl_fakes import FakeEngine
 from sqlalchemy.dialects import postgresql
 
 from etl.clean import to_measures

@@ -59,6 +59,7 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    inspect,
 )
 from sqlalchemy.engine import Engine
 
@@ -362,6 +363,55 @@ def open_engine(database_url: str, pool_pre_ping: bool = False) -> Engine:
             " modèles. Copier .env.example en .env et la renseigner."
         )
     return create_engine(database_url, pool_pre_ping=pool_pre_ping)
+
+
+def verify_schema(engine: Engine, tables: Sequence[Table]) -> None:
+    """Vérifie que la base porte les colonnes que la chaîne va écrire.
+
+    Le schéma vit dans un autre dépôt — les migrations Alembic de l'API — et
+    rien ne garantit qu'une base rencontrée sur un poste ou un environnement
+    de démonstration soit à jour. Quand elle ne l'est pas, l'échec arrivait au
+    milieu du chargement, sous la forme brute que remonte le driver :
+
+        UndefinedColumn: column "quality_source" of relation "mesure" does
+        not exist
+
+    Ce message ne dit ni quelle migration manque, ni combien de colonnes sont
+    concernées, ni que le reste de la chaîne fonctionnera de nouveau une fois
+    la base remise à niveau. Il arrive en plus APRÈS le calcul complet de la
+    journée, qui est alors perdu.
+
+    Le contrôle est une seule requête sur `information_schema`, faite au
+    démarrage. Il ne vérifie que ce que la chaîne écrit : une colonne ajoutée
+    au schéma et qu'aucun service ne remplit n'a pas à faire échouer un run.
+    """
+    expected: dict[str, set[str]] = {
+        table.name: {column.name for column in table.columns} for table in tables
+    }
+    # L'introspection de SQLAlchemy plutôt qu'une requête sur
+    # `information_schema` : elle dit la même chose, et elle la dit sur
+    # n'importe quel dialecte — ce qui rend ce contrôle éprouvable sur un
+    # SQLite en mémoire, sans monter un PostgreSQL pour un test.
+    inspector = inspect(engine)
+    present = set(inspector.get_table_names())
+
+    absent_tables = sorted(name for name in expected if name not in present)
+    absent_columns = sorted(
+        f"{name}.{column}"
+        for name, columns in expected.items()
+        if name in present
+        for column in columns
+        - {info["name"] for info in inspector.get_columns(name)}
+    )
+    if not absent_tables and not absent_columns:
+        return
+
+    missing = ", ".join([*absent_tables, *absent_columns])
+    raise DatabaseError(
+        f"La base ne porte pas le schéma attendu par la chaîne : {missing}."
+        " Appliquer les migrations avant de relancer — elles vivent dans le"
+        " dépôt api (`alembic upgrade head`), qui détient le schéma."
+    )
 
 
 def write_batches(

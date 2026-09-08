@@ -160,6 +160,38 @@ def select(
     return kept.reset_index(drop=True)
 
 
+def exclude_window(
+    frame: pd.DataFrame,
+    start: date,
+    end: date,
+) -> pd.DataFrame:
+    """Retire les journées réservées au banc d'arbitrage, bornes comprises.
+
+    Le banc ne vaut que s'il est tenu hors de l'apprentissage. Un modèle
+    évalué sur des heures qu'il a apprises annonce la qualité de sa mémoire,
+    et le classement mettrait alors en tête celui qui a le mieux retenu, pas
+    celui qui prédit le mieux.
+
+    Le retrait est journalisé parce qu'il coûte : sur une fenêtre courte, un
+    banc de deux semaines peut emporter une part appréciable de ce qu'il y
+    avait à apprendre, et le run doit dire ce qu'il a payé.
+    """
+    if frame.empty:
+        return frame
+    days = frame[TIMESTAMP_COLUMN].dt.date
+    kept = frame[(days < start) | (days > end)].reset_index(drop=True)
+    removed = len(frame) - len(kept)
+    if removed:
+        logger.info(
+            "%d heure(s) retirée(s) de l'apprentissage : réservées au banc"
+            " d'arbitrage du %s au %s",
+            removed,
+            start,
+            end,
+        )
+    return kept
+
+
 def split_by_time(
     frame: pd.DataFrame,
     valid_ratio: float,

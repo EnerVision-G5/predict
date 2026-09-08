@@ -21,6 +21,7 @@ from predict_common.paths import features_partition
 from predict_common.schemas import feature_columns, features_arrow_schema
 from training.dataset import (
     DatasetError,
+    exclude_window,
     matrices,
     read_features,
     select,
@@ -213,3 +214,37 @@ def test_matrices_follow_the_shared_column_order() -> None:
 def test_matrices_refuse_a_partition_missing_a_variable() -> None:
     with pytest.raises(DatasetError):
         matrices(features(END).drop(columns=["lag_24h"]), COLUMNS)
+
+
+class TestExcludeWindow:
+    """Le banc d'arbitrage ne vaut que s'il est tenu hors de l'apprentissage."""
+
+    def frame(self) -> pd.DataFrame:
+        """Trois journées consécutives, une partition par jour."""
+        return pd.concat(
+            [features(END - timedelta(days=offset)) for offset in range(3)],
+            ignore_index=True,
+        )
+
+    def test_the_reserved_days_are_removed(self) -> None:
+        # Un modèle évalué sur des heures qu'il a apprises annonce la qualité
+        # de sa mémoire, pas celle de ses prévisions.
+        kept = exclude_window(self.frame(), END - timedelta(days=1), END)
+        assert len(kept) == 24
+        assert kept["ts"].dt.date.max() == END - timedelta(days=2)
+
+    def test_a_bench_outside_the_window_removes_nothing(self) -> None:
+        kept = exclude_window(
+            self.frame(), date(2026, 1, 1), date(2026, 1, 31)
+        )
+        assert len(kept) == 72
+
+    def test_an_empty_frame_stays_empty(self) -> None:
+        assert exclude_window(pd.DataFrame(), END, END).empty
+
+    def test_what_the_bench_costs_is_said(self, caplog) -> None:
+        # Sur une fenêtre courte, le banc peut emporter une part appréciable de
+        # ce qu'il y avait à apprendre : le run doit dire ce qu'il a payé.
+        with caplog.at_level(logging.INFO, logger="training.dataset"):
+            exclude_window(self.frame(), END, END)
+        assert "24 heure(s) retirée(s)" in caplog.text
