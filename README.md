@@ -130,8 +130,21 @@ ce qui s'efface.
 Les y déposer une première fois, depuis un poste qui les a :
 
 ```bash
-aws --endpoint-url http://localhost:3900 s3 cp datasets/     s3://enervision-datasets/ --recursive --exclude "*" --include "SITE*.csv"
+make storage                                    # démarre Garage, pose seaux et clé
+# reporter AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY dans .env, puis
+# AWS_ENDPOINT_URL=http://localhost:3900
+make datasets-push                              # dépose les sept CSV
 ```
+
+Ou directement, vers n'importe quelle racine :
+
+```bash
+uv run python deploy/push-datasets.py datasets s3://enervision-datasets
+```
+
+L'envoi n'exige aucun client S3 sur le poste : il passe par la même
+`predict_common.io` que la lecture, si bien qu'une machine qui sait lancer la
+chaîne sait déposer les fichiers.
 
 Seuls les fichiers par site sont lus. `all_sites_combined.csv` porte
 exactement les mêmes lignes pour 11 Mo de plus, et les `*_metadata.json`

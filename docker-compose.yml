@@ -254,7 +254,7 @@ services:
     # traversent exactement le même code que sur le disque : seule la valeur de
     # storage.root change, de `data` à `s3://enervision`. Derrière un profil,
     # parce que le disque suffit au développement courant.
-    image: dxflrs/garage:v1.0.1
+    image: dxflrs/garage:v2.0.0
     container_name: enervision-garage
     profiles: ["garage"]
     restart: unless-stopped
@@ -273,24 +273,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-
-  garage-init:
-    # Un nœud Garage neuf n'a ni disposition, ni seau, ni clé : il faut les
-    # poser une fois. Le script est idempotent, donc relançable après un
-    # `docker compose down` qui aurait gardé les volumes.
-    image: dxflrs/garage:v1.0.1
-    container_name: enervision-garage-init
-    profiles: ["garage"]
-    depends_on:
-      garage:
-        condition: service_healthy
-    volumes:
-      - ./deploy/garage.toml:/etc/garage.toml:ro
-      - ./deploy/garage-init.sh:/garage-init.sh:ro
-    entrypoint: ["/bin/sh", "/garage-init.sh"]
-    environment:
-      GARAGE_BUCKET: ${GARAGE_BUCKET:-enervision}
-      GARAGE_KEY_NAME: ${GARAGE_KEY_NAME:-predict}
 
 volumes:
   # Volumes nommés : le backend store MLflow et le stockage objet survivent à

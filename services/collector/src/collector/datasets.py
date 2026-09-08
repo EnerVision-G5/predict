@@ -59,6 +59,7 @@ from predict_common.db import (
     open_engine,
     verify_schema,
 )
+from predict_common.paths import join
 from predict_common.schemas import (
     QUALITY_CRITICAL,
     QUALITY_DEGRADED,
@@ -115,6 +116,11 @@ def find_files(root: str) -> list[str]:
 
     Le filtrage est fait ici et non par le stockage : S3 ne connaît pas les
     motifs de shell, il ne sait que lister un préfixe.
+
+    Les URI rendues sont RECONSTRUITES sur la racine reçue, et non reprises
+    de l'inventaire : `get_file_info` rend le chemin tel que le système de
+    fichiers le connaît, donc `enervision-datasets/SITE001.csv` sans son
+    schéma. Le relire ferait chercher un répertoire de ce nom sur le disque.
     """
     try:
         filesystem, path = io.resolve(str(root))
@@ -124,7 +130,7 @@ def find_files(root: str) -> list[str]:
     except (OSError, io.StorageError) as exc:
         raise DatasetError(f"Stockage des jeux de données injoignable : {exc}") from exc
     files = sorted(
-        entry.path
+        join(str(root), entry.base_name)
         for entry in entries
         if entry.type == pyarrow.fs.FileType.File
         and fnmatch(entry.base_name, FILE_PATTERN)

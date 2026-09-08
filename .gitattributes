@@ -1,0 +1,20 @@
+# Fins de ligne normalisées.
+#
+# Un script shell en CRLF ne s'exécute pas sous Linux : le retour chariot fait
+# partie du dernier argument de chaque ligne, si bien que `set -e` devient
+# `set -e\r` et que le shell répond « illegal option ». C'est exactement ce
+# qui est arrivé à deploy/garage-init.sh, checkouté en CRLF sur un poste
+# Windows puis copié tel quel dans une image : le nœud Garage partait sans
+# disposition, sans seau et sans clé, et les écritures S3 échouaient ensuite
+# sur un « Could not reach quorum » qui ne nommait pas la cause.
+#
+# eol=lf et non `text` seul : `text` laisse le poste décider de la forme du
+# fichier de travail, et c'est ce fichier-là que Docker copie.
+*.sh text eol=lf
+
+# Même raison pour ce qui entre dans une image ou s'exécute dans un conteneur.
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf

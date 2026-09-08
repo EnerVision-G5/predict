@@ -13,6 +13,7 @@ c'est-à-dire trop tard.
 from __future__ import annotations
 
 import pandas as pd
+import pyarrow.fs
 import pytest
 
 from collector import datasets
@@ -200,3 +201,42 @@ class TestBaseName:
     def test_un_chemin_windows_rend_son_dernier_segment(self) -> None:
         # Le chemin d'un poste traverse la même fonction que celui d'un seau.
         assert datasets.base_name(r"D:\jeux\SITE001.csv") == "SITE001.csv"
+
+
+class TestUriRendues:
+    """Ce que `find_files` rend doit pouvoir repasser dans `read_file`.
+
+    `get_file_info` rend le chemin tel que le système de fichiers le connaît,
+    donc SANS son schéma : `enervision-datasets/SITE001.csv` pour un seau S3.
+    Le rendre tel quel faisait chercher un répertoire de ce nom sur le disque,
+    et l'import échouait sur un `WinError 3` qui ne nommait pas la cause.
+    """
+
+    def liste_factice(self, monkeypatch, noms: list[str]) -> None:
+        """Remplace l'inventaire du stockage par des entrées sans schéma."""
+
+        class Entree:
+            def __init__(self, nom: str) -> None:
+                self.base_name = nom
+                self.path = f"enervision-datasets/{nom}"
+                self.type = pyarrow.fs.FileType.File
+
+        class Systeme:
+            def get_file_info(self, selector):
+                return [Entree(nom) for nom in noms]
+
+        monkeypatch.setattr(
+            datasets.io, "resolve", lambda uri: (Systeme(), "enervision-datasets")
+        )
+
+    def test_le_schema_s3_survit_a_la_liste(self, monkeypatch) -> None:
+        self.liste_factice(monkeypatch, ["SITE001.csv", "SITE002.csv"])
+        assert datasets.find_files("s3://enervision-datasets") == [
+            "s3://enervision-datasets/SITE001.csv",
+            "s3://enervision-datasets/SITE002.csv",
+        ]
+
+    def test_le_motif_filtre_toujours(self, monkeypatch) -> None:
+        self.liste_factice(monkeypatch, ["SITE001.csv", "all_sites_combined.csv"])
+        found = datasets.find_files("s3://enervision-datasets")
+        assert found == ["s3://enervision-datasets/SITE001.csv"]
