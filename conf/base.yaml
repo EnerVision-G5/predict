@@ -88,6 +88,13 @@ source:
   # borne protège la source, pas le collecteur : un rattrapage sur 7 sites
   # et 90 jours envoie des milliers de pages.
   rate_limit_rps: 10
+  # Fuseau dans lequel lire les horodatages que la source envoie sans en
+  # déclarer aucun. Depuis le 8 septembre 2026, /current sert l'heure locale
+  # de sa machine et ne la nomme pas ; /readings, elle, répond toujours en
+  # UTC et n'est pas concernée — un horodatage daté est cru sur parole.
+  # Remettre UTC le jour où la source datera de nouveau ses réponses : la
+  # valeur décrit ce que la source fait, pas ce qu'on voudrait afficher.
+  timezone: ${SOURCE_TIMEZONE:-Europe/Paris}
 
 collector:
   # Cadence d'interrogation de /current en mode continu. La source produit

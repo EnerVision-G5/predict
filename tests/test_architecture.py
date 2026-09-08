@@ -127,12 +127,26 @@ def test_the_shared_library_carries_only_its_declared_modules() -> None:
     # d'inférence relaie le référentiel et la simulation de pic pour l'API
     # métier, qui ne connaît pas la source. Deux clients auraient donné deux
     # façons de lire la même API, et un service ne peut pas importer l'autre.
+    #
+    # `timestamps` les a rejoints le jour où la source a cessé de dater ses
+    # réponses. La règle qui décide dans quel fuseau lire un horodatage nu ne
+    # peut pas vivre dans le collecteur : `source` en a besoin pour ses
+    # réglages, et `source` est ici. Une seconde copie de cette règle, c'est
+    # une mesure et une alerte du même tick datées différemment.
     modules = {
         path.stem
         for path in (ROOT / "libs" / SHARED / "src" / SHARED).glob("*.py")
         if path.stem != "__init__"
     }
-    assert modules == {"config", "paths", "schemas", "io", "db", "source"}
+    assert modules == {
+        "config",
+        "paths",
+        "schemas",
+        "io",
+        "db",
+        "source",
+        "timestamps",
+    }
 
 
 def test_every_partition_path_is_built_by_the_shared_module() -> None:
