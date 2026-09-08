@@ -21,6 +21,8 @@ l'horizon à quarante-huit heures.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -75,6 +77,10 @@ class ForecastSpec:
     lag_hours: tuple[int, ...]
     rolling_window_h: int
     lookback_days: int
+    # Nombre maximal de décalages annuels tentés pour trouver un historique de
+    # référence. 0 désactive le repli, et le service redevient muet tant que
+    # la collecte récente n'a pas de quoi nourrir les décalages du modèle.
+    reference_years: int = 0
 
     @property
     def deepest_lag_h(self) -> int:
@@ -99,6 +105,143 @@ def read_history(spec: ForecastSpec, today: date | None = None) -> pd.DataFrame:
     if frame.empty:
         return frame
     return frame.sort_values([SITE_COLUMN, TIMESTAMP_COLUMN]).reset_index(drop=True)
+
+
+@dataclass
+class _HistoryCache:
+    """Dernière fenêtre de variables lue, et l'instant où elle l'a été.
+
+    Le service relisait le stockage à chaque prévision : `lookback_days`
+    partitions journalières téléchargées, décompressées, concaténées et
+    triées, pour n'en extraire ensuite qu'un seul site. Le job de
+    rafraîchissement boucle sur les sept sites, donc sept lectures complètes
+    de la même fenêtre par cycle — et, le service étant ouvert avant
+    `serving.auth`, autant d'amplification offerte à qui voulait le saturer.
+
+    L'ETL ne publie qu'une fois par cycle : relire plus souvent ne peut rien
+    apprendre de neuf. Le cache est donc une fenêtre de temps, pas une
+    invalidation fine — une partition republiée entre deux expirations sera
+    vue au plus tard au bout du TTL, ce qui est exactement la fraîcheur que
+    `PredictionOut.feature_lag_hours` publie déjà par ailleurs.
+    """
+
+    key: tuple[str, str, int, date] | None = None
+    frame: pd.DataFrame | None = None
+    read_at: float = 0.0
+
+
+_cache = _HistoryCache()
+# uvicorn sert plusieurs requêtes de front et `predict` est un `def` synchrone,
+# donc exécuté dans un fil du pool : deux requêtes peuvent entrer ici ensemble.
+_cache_lock = threading.Lock()
+
+
+def cached_history(
+    spec: ForecastSpec,
+    ttl_s: float,
+    today: date | None = None,
+) -> pd.DataFrame:
+    """Rend la fenêtre de variables, relue seulement si elle a vieilli.
+
+    Un TTL nul ou négatif désactive le cache et rend le comportement d'avant :
+    c'est ce que règle `serving.feature_cache_ttl_s`, et ce que les tests qui
+    éprouvent la lecture elle-même utilisent.
+
+    Le tableau rendu est partagé entre appelants et ne doit jamais être muté.
+    Aucun consommateur ne le fait — `site_history` filtre puis trie, ce qui
+    copie — mais la règle vaut d'être écrite.
+    """
+    if ttl_s <= 0:
+        return read_history(spec, today)
+    day = today or datetime.now(UTC).date()
+    key = (spec.root, spec.feature_version, spec.lookback_days, day)
+    now = time.monotonic()
+    with _cache_lock:
+        fresh = (
+            _cache.frame is not None
+            and _cache.key == key
+            and (now - _cache.read_at) < ttl_s
+        )
+        if fresh:
+            return _cache.frame
+    # La lecture se fait HORS du verrou : elle peut durer des secondes sur un
+    # stockage objet, et la tenir bloquerait toutes les requêtes du service.
+    # Deux lectures concurrentes au même instant sont possibles et sans
+    # conséquence — elles produisent le même tableau, la dernière gagne.
+    frame = read_history(spec, day)
+    with _cache_lock:
+        _cache.key, _cache.frame, _cache.read_at = key, frame, time.monotonic()
+    return frame
+
+
+def reset_history_cache() -> None:
+    """Vide le cache. Point de reprise des tests, et rien d'autre."""
+    with _cache_lock:
+        _cache.key, _cache.frame, _cache.read_at = None, None, 0.0
+
+
+# Décalage d'un an, exprimé en SEMAINES ENTIÈRES : 52 semaines, soit 364 jours.
+#
+# Ni 365 ni 366. Le modèle lit `day_of_week`, `is_weekend` et un décalage de
+# 168 h : décaler d'une année civile ferait glisser les jours de la semaine
+# d'un ou deux crans, et un lundi de bureau irait nourrir la prévision d'un
+# samedi. 364 jours tombent toujours sur le même jour de la semaine, au prix
+# d'une dérive saisonnière d'un jour et quart par an — négligeable devant un
+# profil de consommation.
+REFERENCE_SHIFT_DAYS = 364
+
+
+def reference_history(
+    spec: ForecastSpec,
+    site_id: str,
+    today: date | None = None,
+) -> tuple[pd.Series, date]:
+    """Rejoue l'historique de référence à la place de l'historique récent.
+
+    À quoi ça sert. La source ne remonte qu'à 48 heures : au démarrage de la
+    chaîne, aucun site n'a les 168 heures continues que le modèle réclame, et
+    le service refuse toute prévision. Il ne s'agit pas d'une panne, mais d'un
+    manque qui se comblera tout seul en une semaine de collecte — sauf que
+    d'ici là le dashboard n'affiche rien et les recommandations n'ont aucune
+    série sur laquelle raisonner.
+
+    Ce que ça fait. Faute d'observations récentes, on rejoue celles de
+    l'historique de référence, décalées d'un nombre entier d'années de
+    52 semaines pour retomber sur le même jour de la semaine ET dans la même
+    saison. Les heures prédites, elles, sont bien celles qui viennent.
+
+    Ce que ça ne fait pas. La série rendue ne décrit PAS ce que le site a
+    consommé cette semaine, et le prétendre serait grave : c'est ce qu'il
+    consommait à la même période il y a un ou deux ans. L'appelant reçoit la
+    date d'origine et doit la faire suivre — voir `history_source` dans le
+    contrat du service.
+    """
+    end = today or datetime.now(UTC).date()
+    for years in range(1, spec.reference_years + 1):
+        origin = end - timedelta(days=REFERENCE_SHIFT_DAYS * years)
+        frame = read_history(spec, today=origin)
+        try:
+            history = site_history(frame, site_id, spec)
+        except NoHistory:
+            continue
+        shifted = history.copy()
+        shifted.index = shifted.index + timedelta(
+            days=REFERENCE_SHIFT_DAYS * years
+        )
+        # Tronqué à l'heure courante. Sans cela la journée de référence est
+        # rejouée ENTIÈRE : ses heures du soir atterrissent dans le futur, la
+        # prévision démarre après elles au lieu de démarrer maintenant, et
+        # `feature_lag_hours` devient négatif — un âge de variables négatif ne
+        # veut rien dire et ferait douter du reste de la réponse.
+        now = pd.Timestamp(datetime.now(UTC)).floor("h")
+        shifted = shifted[shifted.index <= now]
+        if shifted.empty:
+            continue
+        return shifted, origin
+    raise NoHistory(
+        f"Aucun historique de référence pour {site_id} sur les"
+        f" {spec.reference_years} année(s) précédentes."
+    )
 
 
 def site_history(frame: pd.DataFrame, site_id: str, spec: ForecastSpec) -> pd.Series:

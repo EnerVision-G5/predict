@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from conftest import FakeEngine
+from collector_fakes import FakeEngine
 from sqlalchemy.dialects import postgresql
 
 from collector.sink import (

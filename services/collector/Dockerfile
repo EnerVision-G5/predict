@@ -61,6 +61,13 @@ WORKDIR /app
 COPY --from=builder --chown=predict:predict /app/.venv /app/.venv
 COPY --chown=predict:predict conf/ conf/
 
+# L'historique de référence n'entre PAS dans l'image. Vingt-quatre mégaoctets
+# de CSV figés pesaient sur chaque couche publiée et sur chaque clone du
+# dépôt, pour une donnée que `python -m collector.datasets` lit une seule fois
+# à l'installation. Elle vit sur le stockage objet, et la commande la lit là
+# où `storage.datasets_root` la désigne — voir le module, qui traverse le même
+# `predict_common.io` que les partitions.
+
 USER predict
 
 # ENTRYPOINT et non CMD : les arguments passés à `docker compose run` viennent

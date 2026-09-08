@@ -43,6 +43,12 @@ _REQUIRED = object()
 # barres obliques d'une URL.
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
+# Écritures admises d'un booléen venu de l'environnement. La liste est fermée :
+# tout ce qui n'y figure pas est une faute de frappe, et une faute de frappe
+# sur un drapeau de sécurité doit s'entendre.
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
 
 class ConfigError(RuntimeError):
     """La configuration est absente, illisible, ou incomplète."""
@@ -92,6 +98,31 @@ class Config:
     def get_float(self, path: str, default: Any = _REQUIRED) -> float:
         """Retourne un décimal, en signalant une saisie illisible."""
         return _parse_number(path, self.get(path, default), float)
+
+    def get_bool(self, path: str, default: Any = _REQUIRED) -> bool:
+        """Retourne un booléen, en refusant une valeur qu'on ne sait pas lire.
+
+        Nécessaire parce qu'une valeur venue de l'environnement est TOUJOURS
+        une chaîne : `${SERVING_AUTH_ENABLED:-true}` produit `"true"`, jamais
+        `True`, et `if config.get(...)` serait alors vrai pour `"false"` comme
+        pour `"true"`. C'est le genre d'inversion silencieuse qui ouvre un
+        contrôle d'accès en croyant le fermer.
+
+        Une valeur illisible échoue plutôt que de retomber sur un défaut :
+        `SERVING_AUTH_ENABLED=oui` doit se voir, pas se deviner.
+        """
+        value = self.get(path, default)
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _TRUE_WORDS:
+            return True
+        if text in _FALSE_WORDS:
+            return False
+        raise ConfigError(
+            f"{path} doit être un booléen, reçu {value!r}."
+            f" Valeurs admises : {', '.join(sorted(_TRUE_WORDS | _FALSE_WORDS))}."
+        )
 
     def get_int_list(self, path: str, default: Any = _REQUIRED) -> list[int]:
         """Retourne une liste d'entiers, en refusant une valeur seule.

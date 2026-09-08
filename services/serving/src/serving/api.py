@@ -17,9 +17,19 @@ service calcule et répond ; ce qu'on fait de sa réponse ne le regarde pas.
 Source de vérité du contrat. Toute modification exige une PR sur
 enervision/docs/contracts et la relecture des trois consommateurs.
 
-Note : `CONTRACT_VERSION` est passée en 1.3.1. La description du service
-annonçait un déploiement sur Azure, abandonné par la décision d'architecture
-V2 ; aucune forme de donnée ne change.
+Note : `CONTRACT_VERSION` est passée en 1.4.0. Deux champs OPTIONNELS s'ajoutent
+à `PredictionOut`, `history_source` et `history_origin`. Ils disent d'où
+viennent les observations qui ont nourri les décalages du modèle : de la
+fenêtre courante, ou — faute d'heures récentes continues — de l'historique de
+référence rejoué. Sans eux le repli serait muet, et un consommateur afficherait
+un profil de l'an dernier comme s'il mesurait cette semaine.
+
+Minor et non major : rien n'est retiré ni renommé, `required` ne bouge pas, et
+un consommateur qui ignore ces deux champs lit la réponse comme avant.
+
+Note précédente : `CONTRACT_VERSION` était passée en 1.3.1. La description du
+service annonçait un déploiement sur Azure, abandonné par la décision
+d'architecture V2 ; aucune forme de donnée ne change.
 
 Note précédente : `CONTRACT_VERSION` était passée en 1.3.0. Deux routes additives
 l'imposent, `GET /api/v1/sites` et `POST /api/v1/simulate/spike/{site_id}`.
@@ -43,11 +53,13 @@ Le contrat gelé doit être régénéré et relu :
 """
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from typing import Annotated, Any
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
@@ -63,11 +75,14 @@ from predict_common.source import (
     SourceError,
     SourceSettings,
 )
+from serving.auth import build_middleware, check_api_key
 from serving.forecast import (
     ForecastSpec,
     NoHistory,
+    cached_history,
     predict_series,
     read_history,
+    reference_history,
     site_history,
 )
 from serving.loader import ModelRegistry, ModelUnavailable
@@ -86,19 +101,69 @@ from serving.schemas import (
 # Version du contrat gelé dans enervision/docs/contracts/openapi-predict.json.
 # Incrémentée en semver : patch pour une description, minor pour un champ
 # optionnel ajouté, major pour un champ retiré ou renommé.
-CONTRACT_VERSION = "1.3.1"
+CONTRACT_VERSION = "1.4.0"
 
 API_PREFIX = "/api/v1"
 
 SECONDS_PER_HOUR = 3600.0
 
+# Repli du TTL du cache des variables, pour une application montée sans passer
+# par `configure` — c'est le cas de plusieurs tests. La valeur d'exploitation
+# vient de `serving.feature_cache_ttl_s`.
+DEFAULT_FEATURE_CACHE_TTL_S = 300.0
+
+# Forme admise d'un identifiant de site. Le paramètre voyage jusque dans le
+# CHEMIN de l'appel sortant vers la source (`simulate_spike_path.format(...)`),
+# et Starlette décode `%2F` avant de remplir le paramètre : sans cette borne,
+# un identifiant peut porter des segments de chemin et faire émettre au
+# service des requêtes vers des routes de la source qu'il n'expose pas.
+#
+# Le motif est celui du référentiel — `SITE001` — élargi de ce qu'un
+# identifiant technique peut raisonnablement porter, et de rien d'autre : ni
+# barre oblique, ni point, ni pourcentage.
+#
+# La vérification est faite EN CODE et non par `Path(pattern=...)`, qui
+# publierait le motif dans la spécification et ferait dériver le contrat gelé.
+# Le refus est le même — 422, que le contrat documente déjà sur cette route —
+# et déclarer le motif au contrat reste la bonne cible, en patch semver, par
+# une PR sur enervision/docs/contracts.
+SITE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
+
+INVALID_SITE_ID = (
+    "site_id ne respecte pas la forme d'un identifiant de site :"
+    " 1 à 20 caractères parmi les lettres, les chiffres, le tiret et le"
+    " tiret bas."
+)
+
+
+def ensure_site_id(site_id: str) -> str:
+    """Refuse un identifiant qui ne peut pas être un site du référentiel."""
+    if not SITE_ID_PATTERN.match(site_id):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=INVALID_SITE_ID,
+        )
+    return site_id
+
 logger = logging.getLogger(__name__)
+
+# Valeurs du champ `history_source` du contrat. Nommées ici plutôt qu'écrites
+# en clair aux deux endroits qui les posent : une faute de frappe sur l'une
+# des deux ferait passer une prévision de repli pour une prévision ordinaire.
+HISTORY_RECENT = "recent"
+HISTORY_REFERENCE = "reference"
 
 # Ni le modèle ni la configuration ne sont chargés à l'import : un module qui
 # joint un registre au moment où on l'importe rend le service intestable et
 # fait échouer la génération de la spécification OpenAPI en CI, où aucun
 # MLflow ne tourne.
-state: dict[str, Any] = {"registry": None, "spec": None, "source": None}
+state: dict[str, Any] = {
+    "registry": None,
+    "spec": None,
+    "source": None,
+    "api_key": "",
+    "feature_cache_ttl_s": DEFAULT_FEATURE_CACHE_TTL_S,
+}
 
 
 @asynccontextmanager
@@ -120,8 +185,17 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
 
 def configure() -> None:
-    """Lit la configuration et tente un premier chargement du modèle."""
+    """Lit la configuration et tente un premier chargement du modèle.
+
+    La clé de service est validée AVANT tout le reste : un service qui
+    démarrerait sans elle servirait la simulation de pic à qui la demande, et
+    l'échec doit arriver au démarrage plutôt qu'à la première requête.
+    """
     config = load_config()
+    state["api_key"] = check_api_key(
+        config.get_optional_str("serving.api_key"),
+        auth_enabled=config.get_bool("serving.auth_enabled", True),
+    )
     state["registry"] = ModelRegistry(
         tracking_uri=config.get_str("mlflow.tracking_uri"),
         model_uri=config.get_str("serving.model_uri"),
@@ -132,12 +206,27 @@ def configure() -> None:
         lag_hours=tuple(config.get_int_list("etl.lag_hours")),
         rolling_window_h=config.get_int("etl.rolling_window_h"),
         lookback_days=config.get_int("serving.feature_lookback_days"),
+        reference_years=config.get_int("serving.reference_years", 0),
     )
     # Le client de la source est construit ici, pas à chaque requête : il tient
     # sa connexion ouverte, et le relais du référentiel est appelé à chaque
     # démarrage de l'API métier.
     state["source"] = SourceClient(SourceSettings.from_config(config))
+    state["feature_cache_ttl_s"] = config.get_float(
+        "serving.feature_cache_ttl_s",
+        DEFAULT_FEATURE_CACHE_TTL_S,
+    )
     state["registry"].load()
+
+
+def _feature_cache_ttl_s() -> float:
+    """Durée de vie du cache des variables, telle que la configuration la pose.
+
+    Lue dans `state` et non capturée : le service peut être reconfiguré, et un
+    test qui monte l'application sans passer par `configure` doit trouver un
+    défaut plutôt qu'une clé absente.
+    """
+    return float(state.get("feature_cache_ttl_s", DEFAULT_FEATURE_CACHE_TTL_S))
 
 
 app = FastAPI(
@@ -151,6 +240,11 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+# Monté à l'import et non dans le `lifespan` : Starlette fige la pile de
+# middlewares au premier démarrage, et en ajouter un après lève. La clé, elle,
+# est relue dans `state` à chaque requête — c'est `configure()` qui l'y pose.
+app.middleware("http")(build_middleware(lambda: str(state.get("api_key") or "")))
 
 
 @app.exception_handler(RequestValidationError)
@@ -215,24 +309,57 @@ def predict(payload: PredictionRequest) -> PredictionOut:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
+    # Deux tentatives, dans cet ordre, et jamais l'inverse : les heures
+    # réellement observées cette semaine priment toujours sur un profil de
+    # l'an dernier. Le repli ne se déclenche que là où le service se taisait.
+    history_source = HISTORY_RECENT
+    history_origin: datetime | None = None
+    history: pd.Series | None = None
+    points: list = []
     try:
-        history = site_history(read_history(spec), payload.site_id, spec)
-    except NoHistory as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    points = predict_series(
-        model.predict,
-        history,
-        payload.horizon_hours,
-        spec,
-        columns,
-        residual_std=model.residual_std,
-    )
+        history = site_history(
+            cached_history(spec, _feature_cache_ttl_s()),
+            payload.site_id,
+            spec,
+        )
+    except NoHistory:
+        history = None
+    if history is not None:
+        points = predict_series(
+            model.predict,
+            history,
+            payload.horizon_hours,
+            spec,
+            columns,
+            residual_std=model.residual_std,
+        )
+    # `not points` autant que `history is None` : un site peut avoir des heures
+    # récentes sans avoir les 168 h continues que réclame le décalage le plus
+    # profond. C'est même le cas ordinaire au démarrage de la collecte, et le
+    # refus était alors identique à celui d'un site totalement absent.
+    if not points and spec.reference_years > 0:
+        try:
+            history, origin = reference_history(spec, payload.site_id)
+        except NoHistory:
+            history = None
+        else:
+            history_source = HISTORY_REFERENCE
+            history_origin = datetime.combine(origin, time.min, tzinfo=UTC)
+            points = predict_series(
+                model.predict,
+                history,
+                payload.horizon_hours,
+                spec,
+                columns,
+                residual_std=model.residual_std,
+            )
     if not points:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             detail=(
                 f"Historique insuffisant pour {payload.site_id} : les décalages"
-                " demandés par le modèle ne sont pas tous disponibles."
+                " demandés par le modèle ne sont pas tous disponibles, et"
+                " l'historique de référence n'a pas pu les fournir non plus."
             ),
         )
     generated_at = datetime.now(UTC)
@@ -247,6 +374,8 @@ def predict(payload: PredictionRequest) -> PredictionOut:
         # service est le seul à savoir sur quoi il vient de s'appuyer.
         history_end=history_end,
         feature_lag_hours=feature_lag_hours(generated_at, history_end),
+        history_source=history_source,
+        history_origin=history_origin,
         points=[
             PredictionPoint(
                 timestamp=point.stamp.to_pydatetime(),
@@ -307,7 +436,12 @@ def list_source_sites() -> list[SourceSiteOut]:
     client = _source()
     try:
         payload = client.fetch_sites()
-    except SourceError as exc:
+    # ValueError couvre le corps JSON illisible : `response.json()` lève une
+    # JSONDecodeError, qui en dérive et que le client ne traduit pas en
+    # SourceError. Sans elle, une source qui répond 200 avec du HTML sortait
+    # en 500 — soit « la panne est chez moi », l'inverse de ce que le 502
+    # établit, et l'API métier partait chercher l'incident du mauvais côté.
+    except (SourceError, ValueError) as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
     # Une entrée sans identifiant n'est pas un site : la relayer ferait
     # échouer la validation et emporterait tout le référentiel avec elle.
@@ -355,10 +489,15 @@ def simulate_spike(
     Son échec ne fait pas échouer la réponse : le pic est déclenché, le dire
     en erreur inviterait à rejouer l'appel et à superposer deux pics.
     """
+    # Avant tout appel sortant : l'identifiant part dans le chemin de la
+    # requête vers la source, un refus tardif l'aurait déjà émise.
+    ensure_site_id(site_id)
     client = _source()
     try:
         payload = client.simulate_spike(site_id, duration_minutes)
-    except SourceError as exc:
+    # ValueError pour la même raison qu'au relais du référentiel : un corps
+    # illisible est une panne de la source, pas du service.
+    except (SourceError, ValueError) as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
     return SpikeSimulationOut(
@@ -379,7 +518,7 @@ def _reading_after_spike(
     """Relit la mesure courante, ou rend None sans faire échouer l'appelant."""
     try:
         readings = client.fetch_current(site_id)
-    except SourceError as exc:
+    except (SourceError, ValueError) as exc:
         logger.warning("pic déclenché sur %s, mesure illisible : %s", site_id, exc)
         return None
     if not readings:

@@ -13,17 +13,34 @@ dictionnaires tels que la source les sert.
 
 Trois mécanismes, et une raison pour chacun.
 
-La pagination est un générateur. Une fenêtre de rattrapage de trois mois sur
+La lecture est un générateur. Une fenêtre de rattrapage de trois mois sur
 sept sites à la minute dépasse le million de lignes : les matérialiser toutes
 avant d'en écrire une seule ferait sortir le processus sur un défaut de
 mémoire, très loin de la ligne qui l'a causé.
 
-Elle avance par le temps, et non par un rang. La source ne connaît pas
-d'`offset` : elle rend au plus `limit` mesures à partir de `start_time`.
-Réclamer la page suivante consiste donc à redemander la même fenêtre à partir
-du dernier horodatage reçu. Une pagination par rang, ici, redemanderait
-indéfiniment la même page — la boucle ne s'arrêterait jamais, et rien dans le
-journal ne dirait pourquoi.
+Elle découpe le temps, et ne pagine pas. `/api/v1/readings` n'est pas une API
+paginée : sa documentation définit `limit` comme le NOMBRE DE RÉSULTATS
+(1–1000), et la source rend toujours ce nombre-là, réparti uniformément entre
+`start_time` et `end_time` puis arrondi à la minute. `limit` est donc une
+RÉSOLUTION, pas une taille de page.
+
+Deux conséquences, et le code découle des deux.
+
+Demander une journée avec `limit=1000` ne rend pas les mille premières minutes,
+mais mille points étalés sur 1440 minutes — une série trouée, à un point toutes
+les 86 secondes, qu'aucune erreur ne signale. Une fenêtre ne peut donc pas être
+plus large que `limit` minutes, et `limit` doit valoir exactement le nombre de
+minutes demandées.
+
+Et comme la source rend toujours `limit` résultats, une réponse n'est JAMAIS
+incomplète : « page pleine, donc il en reste » est une condition qui ne devient
+jamais fausse. Une pagination par curseur redemandait alors la même fenêtre en
+la divisant par mille à chaque tour, jusqu'à ramper d'une microseconde par
+requête sans plus rien collecter.
+
+Le découpage supprime les deux problèmes : chaque fenêtre est demandée une
+fois, à sa résolution native, et les fenêtres pavent la période sans se
+recouvrir.
 
 Les reprises absorbent la micro-coupure, et elle seule. L'attente croît avec le
 rang de la tentative : une coupure qui dure ne se règle pas en insistant à la
@@ -58,10 +75,6 @@ MAX_PAGE_SIZE = 1000
 MIN_SPIKE_MINUTES = 1
 MAX_SPIKE_MINUTES = 240
 DEFAULT_SPIKE_MINUTES = 30
-
-# Nom de l'horodatage tel que la source le sert. Le collecteur le traduit à
-# l'écriture ; ici, il ne sert qu'à savoir où reprendre la pagination.
-SOURCE_TIMESTAMP_FIELD = "timestamp"
 
 logger = logging.getLogger(__name__)
 
@@ -207,50 +220,56 @@ class SourceClient:
         start_time: datetime,
         end_time: datetime,
     ) -> Iterator[dict[str, Any]]:
-        """Itère les mesures d'un site sur une fenêtre, page par page.
+        """Itère les mesures d'un site, fenêtre par fenêtre.
 
-        Une page pleine signifie que la source a tronqué : la suivante repart
-        du dernier horodatage reçu. Une page incomplète signifie qu'il n'y a
-        plus rien, et la boucle s'arrête là.
+        La période est découpée en tranches d'au plus `page_size` minutes, et
+        chaque tranche est demandée avec `limit` égal à son nombre de minutes.
+        C'est ce qui rend la série à sa résolution native : la source répartit
+        `limit` points sur la fenêtre, donc `limit` minutes sur une fenêtre de
+        `limit` minutes font exactement un point par minute.
+
+        Les tranches pavent la période sans se recouvrir. La source pose son
+        premier point sur `start_time` et espace les suivants de
+        (fin - début) / limit : la dernière minute d'une tranche est donc celle
+        qui précède le début de la suivante.
         """
         path = self.settings.readings_path
-        limit = self.settings.page_size
+        span = timedelta(minutes=self.settings.page_size)
         cursor = start_time
-        previous: datetime | None = None
-        while cursor <= end_time:
+        while cursor < end_time:
+            window_end = min(cursor + span, end_time)
+            minutes = _minutes_between(cursor, window_end)
+            if minutes < 1:
+                # Reliquat de moins d'une minute : la source ne sait pas le
+                # servir, et `limit=0` lui vaudrait un 422.
+                return
             payload = self._get_json(
                 path,
                 params={
                     "site_id": site_id,
                     "start_time": cursor.isoformat(),
-                    "end_time": end_time.isoformat(),
-                    "limit": limit,
+                    "end_time": window_end.isoformat(),
+                    "limit": minutes,
                 },
-                label=f"site {site_id} depuis {cursor.isoformat()}",
+                label=f"site {site_id} de {cursor.isoformat()}",
             )
             items = _as_readings(payload, path)
-            if not items:
-                return
-            yield from items
-            if len(items) < limit:
-                return
-            latest = _latest_timestamp(items)
-            if latest is None or (previous is not None and latest <= previous):
-                # Sans avance stricte, la même fenêtre serait redemandée sans
-                # fin. Mieux vaut une journée incomplète, et le dire, qu'un
-                # processus qui tourne indéfiniment sans rien produire.
+            if len(items) < minutes:
+                # La source rend normalement autant de résultats que demandé.
+                # En rendre moins n'est pas fatal — la journée sera simplement
+                # trouée — mais doit se voir, sans quoi un changement de
+                # comportement de la source produirait une série amputée que
+                # seul un compte en aval finirait par trahir.
                 logger.warning(
-                    "site %s : la source ne progresse plus à %s, page"
-                    " abandonnée",
+                    "site %s : %d mesure(s) reçue(s) pour %d minute(s)"
+                    " demandée(s) à partir de %s",
                     site_id,
+                    len(items),
+                    minutes,
                     cursor.isoformat(),
                 )
-                return
-            previous = latest
-            # Une microseconde après la dernière mesure reçue : la source
-            # borne inclusivement, et repartir d'elle la renverrait en double.
-            # Le doublon serait absorbé plus loin, mais autant ne pas le créer.
-            cursor = latest + timedelta(microseconds=1)
+            yield from items
+            cursor = window_end
 
     def fetch_current(self, site_id: str) -> list[dict[str, Any]]:
         """Retourne la mesure courante d'un site, toujours sous forme de liste.
@@ -393,22 +412,14 @@ class SourceClient:
         return response.json()
 
 
-def _latest_timestamp(items: list[dict[str, Any]]) -> datetime | None:
-    """Retourne l'horodatage le plus récent d'une page, pour la reprendre.
+def _minutes_between(start: datetime, end: datetime) -> int:
+    """Nombre de minutes ENTIÈRES d'une fenêtre, soit le `limit` à demander.
 
-    Une mesure sans horodatage lisible n'est pas un point de reprise : elle
-    est ignorée ici, et c'est l'écriture qui la comptera comme écartée.
+    Tronqué et non arrondi : demander une minute de plus que la fenêtre n'en
+    porte resserrerait l'espacement sous la minute, et la source rendrait deux
+    points dans la même minute plutôt qu'un par minute.
     """
-    stamps: list[datetime] = []
-    for item in items:
-        raw = item.get(SOURCE_TIMESTAMP_FIELD)
-        if not raw:
-            continue
-        try:
-            stamps.append(datetime.fromisoformat(str(raw).replace("Z", "+00:00")))
-        except ValueError:
-            continue
-    return max(stamps) if stamps else None
+    return int((end - start).total_seconds() // 60)
 
 
 def _as_readings(payload: Any, path: str) -> list[dict[str, Any]]:

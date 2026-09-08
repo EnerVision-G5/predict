@@ -205,3 +205,68 @@ def test_un_service_sans_source_le_dit_en_503(monkeypatch) -> None:
         response = http.get("/api/v1/sites")
 
     assert response.status_code == 503
+
+
+def test_un_site_id_porteur_de_query_est_refuse_avant_tout_appel(client) -> None:
+    """Un identifiant hors forme n'atteint jamais la source.
+
+    L'identifiant repartait tel quel dans le CHEMIN de l'appel sortant
+    (`simulate_spike_path.format(...)`). Starlette décode le paramètre avant
+    de le passer : `SITE001%3Fadmin=1` devient `SITE001?admin=1`, et httpx
+    lit alors le `?` comme le début d'une chaîne de requête. L'appelant
+    choisissait donc les paramètres de la requête que le service émet vers la
+    source, en plus de ceux que le service y met lui-même.
+
+    `%23` est le second vecteur, et il est plus sournois : le `#` tronque
+    l'URL, `duration_minutes` disparaît, et la source applique sa durée par
+    défaut sans que personne ne l'ait demandée.
+
+    La traversée de chemin, elle, n'a jamais été possible : le routeur de
+    Starlette ne fait pas correspondre `%2F` à un paramètre de segment.
+
+    Le refus est un 422, que le contrat documente déjà sur cette route : la
+    spécification gelée n'a pas à bouger pour que le trou soit fermé.
+    """
+    seen: list[str] = []
+
+    def spying(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return route(request)
+
+    with client(spying) as http:
+        injected = http.post("/api/v1/simulate/spike/SITE001%3Fadmin=1")
+        truncated = http.post("/api/v1/simulate/spike/SITE001%23frag")
+
+    assert injected.status_code == 422
+    assert truncated.status_code == 422
+    assert "site_id" in injected.json()["detail"]
+    # Le point du test : rien n'est parti vers la source.
+    assert seen == []
+
+
+def test_un_site_id_du_referentiel_passe(client) -> None:
+    """La borne refuse ce qui n'est pas un identifiant, et rien d'autre."""
+    with client(route) as http:
+        response = http.post(f"/api/v1/simulate/spike/{SITE}")
+
+    assert response.status_code == 200
+    assert response.json()["site_id"] == SITE
+
+
+def test_un_corps_illisible_de_la_source_donne_502_et_non_500(client) -> None:
+    """Une source qui répond 200 avec du HTML est une panne de la source.
+
+    `response.json()` lève alors une JSONDecodeError, qui dérive de
+    ValueError et que le client ne traduit pas en SourceError : elle
+    traversait jusqu'à FastAPI, qui rendait 500. L'API métier lisait ce 500
+    comme « le service d'inférence est tombé » et envoyait chercher
+    l'incident du mauvais côté.
+    """
+
+    def broken(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>portail captif</html>")
+
+    with client(broken) as http:
+        response = http.get("/api/v1/sites")
+
+    assert response.status_code == 502

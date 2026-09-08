@@ -16,9 +16,23 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from conftest import FakeEngine
+from etl_fakes import FakeEngine
+from sqlalchemy.exc import OperationalError
 
-from etl.__main__ import feature_spec, of_day, parse_args, publish, run, transform
+from etl import __main__ as main_module
+from etl.__main__ import (
+    DEFAULT_DAYS,
+    EXIT_FAILED,
+    db_error_line,
+    feature_spec,
+    is_db_warming_up,
+    main,
+    of_day,
+    parse_args,
+    publish,
+    run,
+    transform,
+)
 from etl.extract import window
 from predict_common import io
 from predict_common.config import Config
@@ -259,9 +273,17 @@ def test_the_features_carry_no_excluded_measure(
 class TestParseArgs:
     """La ligne de commande dit ce que le run produit."""
 
-    def test_the_date_is_required(self) -> None:
-        with pytest.raises(SystemExit):
-            parse_args([])
+    def test_the_date_defaults_to_today(self) -> None:
+        # La boucle du conteneur appelle `python -m etl` sans argument : une
+        # date obligatoire la faisait sortir en erreur à chaque cycle, donc
+        # ne publiait jamais rien.
+        assert parse_args([]).date is None
+
+    def test_a_single_day_is_produced_by_default(self) -> None:
+        assert parse_args([]).days == DEFAULT_DAYS
+
+    def test_the_window_can_be_widened(self) -> None:
+        assert parse_args(["--days", "2"]).days == 2
 
     def test_the_version_can_be_forced(self) -> None:
         args = parse_args(["--date", "2026-09-10", "--feature-version", "v2"])
@@ -272,3 +294,77 @@ class TestParseArgs:
         # l'écriture de retour n'est plus optionnelle.
         with pytest.raises(SystemExit):
             parse_args(["--date", "2026-09-10", "--load-db"])
+
+
+class TestADatabaseStillStartingUp:
+    """Le conteneur repart avant que TimescaleDB ait rejoué son WAL.
+
+    Au redémarrage du poste, le démon Docker relance tous les conteneurs
+    ensemble sans lire les `depends_on` du compose — ceux-ci n'ordonnent que
+    `compose up`. Le cycle suivant passera ; la trace du driver à cet endroit
+    faisait chercher un bug là où il n'y a qu'un ordre de démarrage.
+    """
+
+    def failing_open(self, monkeypatch, tmp_path: Path, error: Exception) -> None:
+        """Fait échouer l'ouverture du moteur sur l'erreur donnée."""
+
+        def refuse(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(main_module, "load_config", lambda: config_for(tmp_path))
+        monkeypatch.setattr(main_module, "open_engine", refuse)
+
+    def test_it_is_one_information_line_without_a_trace(
+        self, monkeypatch, tmp_path: Path, caplog
+    ) -> None:
+        origin = Exception(
+            'connection failed: connection to server at "172.24.0.4", port'
+            " 5432 failed: FATAL:  the database system is starting up"
+        )
+        self.failing_open(monkeypatch, tmp_path, OperationalError("", {}, origin))
+
+        with caplog.at_level("INFO", logger="etl.__main__"):
+            code = main([])
+
+        assert code == EXIT_FAILED
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelname == "INFO"
+        assert caplog.records[0].exc_info is None
+        assert "base en attente" in caplog.text
+
+    def test_an_unreachable_database_stays_an_error_on_one_line(
+        self, monkeypatch, tmp_path: Path, caplog
+    ) -> None:
+        # Injoignable n'est pas « en train de démarrer » : une base absente
+        # pendant des heures doit se voir, sinon la boucle tourne à vide en
+        # silence. Une ligne suffit, le lien de SQLAlchemy n'en fait pas
+        # partie.
+        origin = Exception("connection refused\nseconde ligne du driver")
+        self.failing_open(monkeypatch, tmp_path, OperationalError("", {}, origin))
+
+        with caplog.at_level("INFO", logger="etl.__main__"):
+            code = main([])
+
+        assert code == EXIT_FAILED
+        assert caplog.records[0].levelname == "ERROR"
+        assert "base injoignable : connection refused" in caplog.text
+        assert "sqlalche.me" not in caplog.text
+        assert "seconde ligne" not in caplog.text
+
+
+class TestDatabaseErrorReading:
+    """Les deux prédicats qui décident du ton du journal."""
+
+    def test_the_startup_states_of_postgres_are_recognised(self) -> None:
+        assert is_db_warming_up(Exception("FATAL: the database system is starting up"))
+        assert is_db_warming_up(Exception("The Database System Is Shutting Down"))
+
+    def test_a_refused_connection_is_not_a_startup(self) -> None:
+        assert not is_db_warming_up(Exception("connection refused"))
+
+    def test_the_driver_reason_fits_on_one_line(self) -> None:
+        origin = Exception("connection failed\nseconde ligne")
+        assert db_error_line(OperationalError("", {}, origin)) == "connection failed"
+
+    def test_an_error_without_a_message_is_named_by_its_type(self) -> None:
+        assert db_error_line(TimeoutError()) == "TimeoutError"

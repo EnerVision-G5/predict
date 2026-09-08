@@ -26,6 +26,11 @@ x-artifacts: &artifacts
   # déploiement, cette valeur devient une URI s3:// vers Garage et le montage
   # disparaît.
   PREDICT_STORAGE_ROOT: ${PREDICT_STORAGE_ROOT:-/app/data}
+  # Racine de l'historique de référence. Elle ne suit plus le code : les CSV
+  # ne sont ni dans le dépôt ni dans l'image, et le défaut désigne le montage
+  # posé sur le service `collector` ci-dessous. En déploiement, cette valeur
+  # devient une URI s3:// et le montage disparaît, comme pour les partitions.
+  PREDICT_DATASETS_ROOT: ${PREDICT_DATASETS_ROOT:-/app/datasets}
   PREDICT_ENV: ${PREDICT_ENV:-local}
   MLFLOW_TRACKING_URI: http://mlflow:5000
   AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
@@ -88,6 +93,13 @@ services:
     environment:
       <<: [*artifacts, *database]
       MOCK_API_URL: ${MOCK_API_URL_CONTAINER:?definir MOCK_API_URL_CONTAINER dans .env}
+    volumes:
+      # Historique de référence, monté en lecture seule depuis le poste. Il ne
+      # rentre plus dans l'image, et sans Garage local c'est le seul chemin
+      # par lequel `python -m collector.datasets` le trouve. Avec Garage
+      # (profil `garage`), poser PREDICT_DATASETS_ROOT=s3://... rend ce
+      # montage sans effet.
+      - ./datasets:/app/datasets:ro
     extra_hosts:
       # Linux ne résout pas host.docker.internal par défaut, contrairement à
       # Docker Desktop. La ligne ne sert que si la base ou l'API Mock tournent
@@ -208,6 +220,23 @@ services:
     environment:
       <<: *artifacts
       SERVING_MODEL_URI: ${SERVING_MODEL_URI:-models:/enervision_xgboost@champion}
+      # Clé de service exigée par le contrôle d'accès. Le `:?` fait échouer le
+      # démarrage en nommant la variable : le service relaie la simulation de
+      # pic, qui écrit sur la source, et un conteneur qui partirait ouvert le
+      # servirait à qui le demande.
+      #
+      # Sur un poste où l'on ne veut pas gérer de clé, poser
+      # SERVING_AUTH_ENABLED=false dans .env — jamais en déploiement, le
+      # service le journalise en avertissement à chaque démarrage.
+      SERVING_API_KEY: ${SERVING_API_KEY:-}
+      SERVING_AUTH_ENABLED: ${SERVING_AUTH_ENABLED:-true}
+      SERVING_FEATURE_CACHE_TTL_S: ${SERVING_FEATURE_CACHE_TTL_S:-300}
+      # La source, que le service relaie pour le compte de l'API métier. Sans
+      # elle, GET /api/v1/sites et POST /api/v1/simulate/spike répondent 502 —
+      # elle manquait à ce service alors que ses deux routes en dépendent.
+      MOCK_API_URL: ${MOCK_API_URL_CONTAINER:?definir MOCK_API_URL_CONTAINER dans .env}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${SERVING_PORT:-8000}:8000"
     volumes:
@@ -225,7 +254,7 @@ services:
     # traversent exactement le même code que sur le disque : seule la valeur de
     # storage.root change, de `data` à `s3://enervision`. Derrière un profil,
     # parce que le disque suffit au développement courant.
-    image: dxflrs/garage:v1.0.1
+    image: dxflrs/garage:v2.0.0
     container_name: enervision-garage
     profiles: ["garage"]
     restart: unless-stopped
@@ -244,24 +273,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-
-  garage-init:
-    # Un nœud Garage neuf n'a ni disposition, ni seau, ni clé : il faut les
-    # poser une fois. Le script est idempotent, donc relançable après un
-    # `docker compose down` qui aurait gardé les volumes.
-    image: dxflrs/garage:v1.0.1
-    container_name: enervision-garage-init
-    profiles: ["garage"]
-    depends_on:
-      garage:
-        condition: service_healthy
-    volumes:
-      - ./deploy/garage.toml:/etc/garage.toml:ro
-      - ./deploy/garage-init.sh:/garage-init.sh:ro
-    entrypoint: ["/bin/sh", "/garage-init.sh"]
-    environment:
-      GARAGE_BUCKET: ${GARAGE_BUCKET:-enervision}
-      GARAGE_KEY_NAME: ${GARAGE_KEY_NAME:-predict}
 
 volumes:
   # Volumes nommés : le backend store MLflow et le stockage objet survivent à
