@@ -13,5 +13,3 @@ et la duplication de quinze lignes est le prix de la frontière.
 from __future__ import annotations
 
 
-
-

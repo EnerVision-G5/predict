@@ -54,16 +54,12 @@ def test_check_measures_refuses_a_broken_contract(make_raw, make_reading) -> Non
 
 
 def test_the_failure_names_the_faulty_column(make_raw, make_reading) -> None:
-    # Un message qui ne dirait que « schéma invalide » obligerait à rejouer le
-    # lot à la main pour trouver la colonne.
     raw = make_raw([make_reading("2026-09-02T08:00:00Z", data_quality="excellent")])
     with pytest.raises(ContractError, match="data_quality"):
         check_measures(raw)
 
 
 def test_the_failure_counts_every_violation(make_raw, make_reading) -> None:
-    # `lazy=True` rassemble tout le lot : réparer un schéma une colonne par
-    # exécution serait une perte de temps pure.
     raw = make_raw(
         [
             make_reading(f"2026-09-02T0{hour}:00:00Z", data_quality="ok")
@@ -75,8 +71,6 @@ def test_the_failure_counts_every_violation(make_raw, make_reading) -> None:
 
 
 def test_an_empty_batch_is_accepted(make_raw) -> None:
-    # Une journée sans mesure exploitable est un fait d'exploitation — une
-    # source arrêtée, un site neuf — pas une rupture de contrat.
     assert check_measures(make_raw([])).empty
 
 
@@ -100,8 +94,6 @@ def test_check_features_refuses_a_missing_lag_column() -> None:
 
 
 def test_check_features_refuses_a_partition_of_another_version() -> None:
-    # Les colonnes d'une version ne sont pas celles d'une autre : publier v2
-    # sous le préfixe v1 rendrait la partition illisible pour l'entraînement.
     features = conforming_features()
     other = FeatureSpec("v2", "1h", (1, 24), rolling_window_h=2)
     with pytest.raises(ContractError):

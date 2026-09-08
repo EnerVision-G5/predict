@@ -34,18 +34,10 @@ ENV_VARIABLE = "PREDICT_ENV"
 CONF_DIRECTORY_VARIABLE = "PREDICT_CONF_DIR"
 BASE_LAYER = "base"
 
-# Absence de défaut, distincte de None : une clé peut légitimement porter
-# None, et un défaut None doit alors rester un défaut fourni.
 _REQUIRED = object()
 
-# ${NOM} ou ${NOM:-valeur de repli}. Le repli s'arrête à l'accolade fermante,
-# il peut donc contenir n'importe quoi d'autre, y compris deux-points et
-# barres obliques d'une URL.
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
-# Écritures admises d'un booléen venu de l'environnement. La liste est fermée :
-# tout ce qui n'y figure pas est une faute de frappe, et une faute de frappe
-# sur un drapeau de sécurité doit s'entendre.
 _TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
 _FALSE_WORDS = frozenset({"0", "false", "no", "off"})
 

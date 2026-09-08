@@ -41,8 +41,6 @@ from predict_common.schemas import (
 
 WEEKEND_FIRST_DAY = 5
 
-# Quantile normal bilatéral à 95 %. Nommé plutôt qu'écrit dans le calcul : la
-# largeur de l'intervalle servi est une décision, et une décision se relit.
 CONFIDENCE_Z = 1.96
 
 logger = logging.getLogger(__name__)
@@ -77,9 +75,6 @@ class ForecastSpec:
     lag_hours: tuple[int, ...]
     rolling_window_h: int
     lookback_days: int
-    # Nombre maximal de décalages annuels tentés pour trouver un historique de
-    # référence. 0 désactive le repli, et le service redevient muet tant que
-    # la collecte récente n'a pas de quoi nourrir les décalages du modèle.
     reference_years: int = 0
 
     @property
@@ -131,8 +126,6 @@ class _HistoryCache:
 
 
 _cache = _HistoryCache()
-# uvicorn sert plusieurs requêtes de front et `predict` est un `def` synchrone,
-# donc exécuté dans un fil du pool : deux requêtes peuvent entrer ici ensemble.
 _cache_lock = threading.Lock()
 
 
@@ -164,10 +157,6 @@ def cached_history(
         )
         if fresh:
             return _cache.frame
-    # La lecture se fait HORS du verrou : elle peut durer des secondes sur un
-    # stockage objet, et la tenir bloquerait toutes les requêtes du service.
-    # Deux lectures concurrentes au même instant sont possibles et sans
-    # conséquence — elles produisent le même tableau, la dernière gagne.
     frame = read_history(spec, day)
     with _cache_lock:
         _cache.key, _cache.frame, _cache.read_at = key, frame, time.monotonic()
@@ -180,14 +169,6 @@ def reset_history_cache() -> None:
         _cache.key, _cache.frame, _cache.read_at = None, None, 0.0
 
 
-# Décalage d'un an, exprimé en SEMAINES ENTIÈRES : 52 semaines, soit 364 jours.
-#
-# Ni 365 ni 366. Le modèle lit `day_of_week`, `is_weekend` et un décalage de
-# 168 h : décaler d'une année civile ferait glisser les jours de la semaine
-# d'un ou deux crans, et un lundi de bureau irait nourrir la prévision d'un
-# samedi. 364 jours tombent toujours sur le même jour de la semaine, au prix
-# d'une dérive saisonnière d'un jour et quart par an — négligeable devant un
-# profil de consommation.
 REFERENCE_SHIFT_DAYS = 364
 
 
@@ -228,11 +209,6 @@ def reference_history(
         shifted.index = shifted.index + timedelta(
             days=REFERENCE_SHIFT_DAYS * years
         )
-        # Tronqué à l'heure courante. Sans cela la journée de référence est
-        # rejouée ENTIÈRE : ses heures du soir atterrissent dans le futur, la
-        # prévision démarre après elles au lieu de démarrer maintenant, et
-        # `feature_lag_hours` devient négatif — un âge de variables négatif ne
-        # veut rien dire et ferait douter du reste de la réponse.
         now = pd.Timestamp(datetime.now(UTC)).floor("h")
         shifted = shifted[shifted.index <= now]
         if shifted.empty:
@@ -252,11 +228,6 @@ def site_history(frame: pd.DataFrame, site_id: str, spec: ForecastSpec) -> pd.Se
     un trou, il n'est pas comblé ici — l'imputation appartient à l'ETL, et la
     refaire dans le service en donnerait deux versions.
     """
-    # Le tableau peut être vide et sans colonnes : c'est ce que rend la lecture
-    # quand aucune partition n'existe sur la fenêtre. Le cas n'est pas
-    # distingué de celui du site inconnu, parce qu'il donne la même réponse au
-    # consommateur — il n'y a rien à prédire — et que le journal du service
-    # dira laquelle des deux causes l'a produit.
     rows = (
         frame[frame[SITE_COLUMN] == site_id]
         if SITE_COLUMN in frame.columns
@@ -323,15 +294,6 @@ def build_row(
     inventer sa valeur donnerait une prévision dont rien ne dirait qu'elle
     repose sur du vide.
     """
-    # Les variables calendaires sont entières, et pas seulement par élégance :
-    # la signature du modèle les déclare `integer`, et MLflow refuse une
-    # conversion float64 vers int32 qu'il ne peut pas garantir sans perte.
-    # La température n'est pas ici, et le modèle ne l'attend pas : elle a été
-    # sortie des variables explicatives dans `predict_common.schemas`. Le
-    # service ne connaît pas la météo des heures à venir, et un modèle entraîné
-    # sur une colonne toujours vide en production apprend un biais, pas un
-    # signal. La partition la porte toujours : le jour où une prévision météo
-    # alimentera l'inférence, elle est déjà là.
     row: dict[str, float | int] = {
         "hour": int(stamp.hour),
         "day_of_week": int(stamp.dayofweek),

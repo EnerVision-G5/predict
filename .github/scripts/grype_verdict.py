@@ -29,8 +29,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Du plus grave au moins grave, tel que Grype les nomme. L'ordre sert deux
-# fois : à trier le tableau, et à décider ce qui entre dans chaque niveau.
 SEVERITIES = ("Critical", "High", "Medium", "Low", "Negligible", "Unknown")
 
 BLOCKING = ("Critical",)

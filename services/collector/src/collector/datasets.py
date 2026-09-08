@@ -69,10 +69,6 @@ from predict_common.schemas import (
 
 logger = logging.getLogger(__name__)
 
-# Colonnes exigées du CSV. Les autres qu'il porte — consumption_euros,
-# solar_irradiance_wm2, hour, day_of_week, is_weekend… — sont ignorées : les
-# unes n'ont pas de colonne dans `mesure`, les autres sont des variables que
-# l'ETL recalcule, et les figer ici en donnerait deux versions.
 REQUIRED_COLUMNS = (
     "timestamp",
     "site_id",
@@ -81,24 +77,13 @@ REQUIRED_COLUMNS = (
     "humidity_percent",
 )
 
-# Motif des fichiers par site. `all_sites_combined.csv` porte exactement les
-# mêmes lignes et n'est volontairement pas lu : le charger en plus doublerait
-# le travail pour un résultat identique, le `ON CONFLICT DO NOTHING` absorbant
-# la seconde passe.
 FILE_PATTERN = "SITE*.csv"
 
-# Vocabulaire des causes, aligné sur celui que la source emploie dans
-# `null_reasons`. Le jeu de données n'en fournit pas : elles sont déduites de
-# ce qui manque, et doivent se lire comme celles du fil de l'eau, sans quoi une
-# analyse de fiabilité aurait deux vocabulaires à connaître.
 REASON_CONSUMPTION = "consumption_sensor_failure"
 REASON_TEMPERATURE = "temperature_sensor_failure"
 REASON_HUMIDITY = "humidity_sensor_failure"
 REASON_NETWORK = "network_loss"
 
-# Lots d'insertion. Repris de la configuration quand elle le dit, sinon cette
-# valeur : sept fichiers de 17 521 lignes font 122 647 mesures, qu'il ne faut
-# pas soumettre d'un bloc.
 DEFAULT_BATCH_SIZE = 1000
 
 
@@ -182,7 +167,6 @@ def to_readings(frame: pd.DataFrame) -> Iterator[dict[str, Any]]:
             "site_id": row["site_id"],
             "consumption_kw": consumption,
             "consumption_kwh": consumption,
-            # Absentes du jeu de données. Laissées NULL plutôt que déduites.
             "voltage_v": None,
             "current_a": None,
             "power_factor": None,
@@ -325,10 +309,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config()
         root = args.root or _datasets_root(config)
         engine = open_engine(config.get_optional_str("database.url"))
-        # Avant le premier fichier : cent vingt mille lignes lues et
-        # transformées pour échouer au chargement seraient du travail perdu,
-        # et l'erreur brute du driver ne dirait pas que le schéma est en
-        # retard sur les migrations de l'API.
         verify_schema(engine, (mesure,))
         batch_size = args.batch_size or _batch_size(config)
         logger.info("jeux de données lus depuis %s", root)

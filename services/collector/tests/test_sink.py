@@ -45,8 +45,6 @@ def test_to_measures_returns_the_table_columns_on_an_empty_batch() -> None:
 
 
 def test_to_measures_renames_timestamp_to_ts(make_reading) -> None:
-    # La table s'appelle `ts` : c'est la seule frontière de renommage de la
-    # chaîne, et elle est traversée une fois.
     frame = to_measures([make_reading("2026-09-02T08:00:00Z")])
     assert "ts" in frame.columns
     assert "timestamp" not in frame.columns
@@ -61,9 +59,6 @@ def test_to_measures_normalizes_the_timestamp_to_utc(make_reading) -> None:
 def test_to_measures_reads_a_bare_timestamp_in_the_source_timezone(
     make_reading,
 ) -> None:
-    # `/current` sert l'heure locale de sa machine sans la nommer. La prendre
-    # pour de l'UTC écrirait la mesure deux heures dans le futur, où le
-    # dashboard, qui borne ses lectures à l'instant présent, ne la verrait pas.
     frame = to_measures([make_reading("2026-09-02T08:30:00")], "Europe/Paris")
     assert str(frame.loc[0, "ts"].tz) == "UTC"
     assert frame.loc[0, "ts"].hour == 6
@@ -72,14 +67,11 @@ def test_to_measures_reads_a_bare_timestamp_in_the_source_timezone(
 def test_to_measures_leaves_a_dated_timestamp_where_the_source_put_it(
     make_reading,
 ) -> None:
-    # Le fuseau prêté ne vaut que pour les horodatages nus : `/readings`
-    # répond en UTC, et le rattrapage ne doit pas glisser pour autant.
     frame = to_measures([make_reading("2026-09-02T08:30:00Z")], "Europe/Paris")
     assert frame.loc[0, "ts"].hour == 8
 
 
 def test_to_measures_keeps_a_null_measure(make_reading) -> None:
-    # Une valeur nulle porte une panne capteur : la filtrer perdrait la panne.
     frame = to_measures(
         [
             make_reading(
@@ -96,7 +88,6 @@ def test_to_measures_keeps_a_null_measure(make_reading) -> None:
 
 
 def test_to_measures_writes_no_derived_column(make_reading) -> None:
-    # `consumption_kw_imputed` et `imputation_method` appartiennent à l'ETL.
     frame = to_measures([make_reading("2026-09-02T08:00:00Z")])
     assert not set(frame.columns) & {"consumption_kw_imputed", "imputation_method"}
 
@@ -104,17 +95,11 @@ def test_to_measures_writes_no_derived_column(make_reading) -> None:
 def test_an_unqualified_measure_falls_back_on_the_column_default(
     make_reading,
 ) -> None:
-    # `NOT NULL DEFAULT 'good'` : le schéma figé ne sait pas dire « non
-    # qualifiée ». Le collecteur écrit donc le défaut, et l'ETL repose la
-    # qualification à son passage — un `good` sur une puissance absente
-    # redevient `critical`.
     frame = to_measures([make_reading("2026-09-02T08:00:00Z", data_quality=None)])
     assert frame.loc[0, "data_quality"] == UNQUALIFIED
 
 
 def test_a_quality_the_check_would_reject_falls_back_too(make_reading) -> None:
-    # 'excellent' n'est pas dans le CHECK : le soumettre ferait échouer
-    # l'insertion du lot entier, pas seulement de sa ligne.
     reading = make_reading("2026-09-02T08:00:00Z", data_quality="excellent")
     frame = to_measures([reading])
     assert frame.loc[0, "data_quality"] == UNQUALIFIED
@@ -128,7 +113,6 @@ def test_to_measures_normalizes_a_lone_motive_to_a_list(make_reading) -> None:
 def test_to_measures_normalizes_an_absent_motive_to_an_empty_list(
     make_reading,
 ) -> None:
-    # `TEXT[] NOT NULL` : l'absence de motif s'écrit par une liste vide.
     frame = to_measures([make_reading("2026-09-02T08:00:00Z", null_reasons=None)])
     assert frame.loc[0, "null_reasons"] == []
 
@@ -141,8 +125,6 @@ def test_to_measures_turns_an_unreadable_value_into_a_null(make_reading) -> None
 def test_drop_unplaceable_removes_a_measure_without_a_timestamp(
     make_reading,
 ) -> None:
-    # (site_id, ts) est la clé : sans l'un des deux, la base refuse la ligne
-    # sans dire laquelle du lot est fautive.
     frame = to_measures(
         [make_reading("pas une date"), make_reading("2026-09-02T08:00:00Z")]
     )
@@ -158,8 +140,6 @@ def test_drop_unplaceable_removes_a_measure_without_a_site(make_reading) -> None
 
 
 def test_deduplicate_keeps_the_last_of_a_duplicated_key(make_reading) -> None:
-    # ON CONFLICT arbitre entre le lot et la table, pas à l'intérieur d'un
-    # même lot : un doublon ferait échouer l'insertion entière.
     frame = to_measures(
         [
             make_reading("2026-09-02T08:00:00Z", consumption_kw=10.0),
@@ -196,8 +176,6 @@ def test_validate_accepts_a_conforming_batch(make_reading) -> None:
 
 
 def test_to_records_converts_missing_values_to_none(make_reading) -> None:
-    # Un NaN flottant dans une colonne NUMERIC est accepté par PostgreSQL et
-    # pollue silencieusement les agrégats en aval.
     frame = to_measures([make_reading("2026-09-02T08:00:00Z", consumption_kw=None)])
     record = to_records(frame)[0]
     assert record["consumption_kw"] is None
@@ -205,8 +183,6 @@ def test_to_records_converts_missing_values_to_none(make_reading) -> None:
 
 
 def test_the_insert_never_overwrites(make_reading) -> None:
-    # La ligne présente peut déjà porter les colonnes que l'ETL a déduites :
-    # une recollecte n'a aucune raison de les effacer.
     frame = to_measures([make_reading("2026-09-02T08:00:00Z")])
     statement = build_insert(to_records(frame))
     compiled = str(statement.compile(dialect=postgresql.dialect()))
@@ -234,7 +210,6 @@ def test_write_splits_the_batch(make_reading) -> None:
     )
     engine = FakeEngine()
     assert write(engine, frame, batch_size=2).rows == 5
-    # 5 lignes par lots de 2 : trois instructions, la dernière incomplète.
     assert len(engine.executed) == 3
 
 
@@ -281,9 +256,6 @@ class TestSiteSync:
         assert sites[0]["capacity_kw"] == 200
 
     def test_a_half_described_site_is_left_out(self) -> None:
-        # Trois colonnes de `site` sont NOT NULL sans défaut : un site
-        # incomplet ferait rejeter le lot entier, et le seed en a déjà posé
-        # une version placeholder qui vaut mieux qu'un échec.
         assert to_sites([{"site_id": "SITE009", "site_type": "office"}]) == []
 
     def test_an_absent_status_takes_the_usual_one(self) -> None:
@@ -300,8 +272,6 @@ class TestSiteSync:
         assert sites[0]["status"] == "active"
 
     def test_the_upsert_replaces_the_seed_placeholders(self) -> None:
-        # `02_seed_sites.sql` pose des capacités « à synchroniser » : c'est
-        # précisément le rôle de cette écriture de les remplacer.
         records = to_sites(
             [
                 {
@@ -337,19 +307,10 @@ class TestSiteSync:
 
 
 def test_write_refuses_a_batch_breaking_the_contract(make_reading) -> None:
-    # Un identifiant que le VARCHAR(20) tronquerait n'entre pas en base.
     engine = FakeEngine()
     frame = to_measures([make_reading("2026-09-02T08:00:00Z", site_id="S" * 21)])
     with pytest.raises(Exception, match="site_id"):
         write(engine, frame, batch_size=10)
-
-
-# --- Grille à la minute -----------------------------------------------------
-#
-# `mesure` est une grille : une ligne par site et par minute. Le rattrapage lit
-# `/readings`, servi sur des minutes pleines ; le poller lit `/current`, daté de
-# l'instant de l'appel. Sans normalisation, la même minute entrait en base sous
-# deux clés et `ON CONFLICT DO NOTHING` n'avait aucun conflit à arbitrer.
 
 
 def test_une_mesure_datee_dans_la_minute_est_ramenee_sur_la_grille() -> None:

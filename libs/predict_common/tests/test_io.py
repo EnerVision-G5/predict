@@ -43,8 +43,6 @@ def test_write_frame_creates_a_readable_partition(tmp_path: Path) -> None:
 
 
 def test_write_frame_replaces_instead_of_appending(tmp_path: Path) -> None:
-    # Le rejeu est le mode d'exploitation normal : relancer --date reproduit
-    # la journée, il ne la double pas.
     target = partition(tmp_path)
     io.write_frame(frame(1.0, 2.0), target, schema=SCHEMA)
     io.write_frame(frame(3.0), target, schema=SCHEMA)
@@ -59,8 +57,6 @@ def test_write_frame_leaves_no_working_directory_behind(tmp_path: Path) -> None:
 
 
 def test_write_frame_accepts_an_empty_partition(tmp_path: Path) -> None:
-    # Une journée sans mesure exploitable est un fait d'exploitation, pas une
-    # panne : la partition existe et elle est vide.
     target = partition(tmp_path)
     io.write_frame(frame(), target, schema=SCHEMA)
     assert io.read_frames([target]).empty
@@ -75,8 +71,6 @@ def test_read_frames_concatenates_several_partitions(tmp_path: Path) -> None:
 
 
 def test_read_frames_skips_an_absent_partition(tmp_path: Path) -> None:
-    # Au démarrage de la chaîne, la semaine qui précède le premier jour
-    # collecté n'existe pas : ce n'est pas une panne.
     present = join(str(tmp_path), "features/v1/dt=2026-09-02")
     io.write_frame(frame(1.0), present, schema=SCHEMA)
     absent = join(str(tmp_path), "features/v1/dt=2026-08-01")
@@ -103,8 +97,6 @@ def test_read_frames_projects_the_requested_columns(tmp_path: Path) -> None:
 
 
 def test_the_imposed_schema_survives_an_all_null_column(tmp_path: Path) -> None:
-    # Sans schéma imposé, une colonne entièrement nulle s'écrirait en type
-    # `null`, et la lecture conjointe des deux journées échouerait.
     empty_day = join(str(tmp_path), "features/v1/dt=2026-09-01")
     full_day = join(str(tmp_path), "features/v1/dt=2026-09-02")
     io.write_frame(
@@ -137,7 +129,6 @@ def test_metadata_travels_with_the_partition(tmp_path: Path) -> None:
 
 
 def test_resolve_makes_a_relative_path_absolute() -> None:
-    # Le répertoire courant d'un conteneur n'est pas celui d'un poste.
     _, path = io.resolve("data/features")
     assert Path(path).is_absolute()
 
@@ -190,17 +181,12 @@ def test_a_storage_without_grouped_delete_still_empties_the_partition(
 
     assert storage.grouped_attempts == 1
     assert storage.deleted
-    # Vidée de ses fichiers, la partition doit être vue comme absente : c'est
-    # ce que `_replace` attend avant d'y déposer la nouvelle.
     assert not io.exists(target)
 
 
 def test_a_storage_with_grouped_delete_keeps_the_single_call(
     tmp_path: Path,
 ) -> None:
-    # Le repli est une détection de capacité, pas un remplacement : un
-    # stockage qui sait supprimer un lot ne doit pas se mettre à émettre une
-    # requête par fichier.
     target = partition(tmp_path)
     io.write_frame(frame(1.0), target, schema=SCHEMA)
     filesystem, path = io.resolve(target)

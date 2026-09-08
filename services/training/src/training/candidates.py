@@ -38,10 +38,6 @@ from sklearn.preprocessing import StandardScaler
 from training.model import ModelParams
 from training.model import fit as fit_boosted
 
-# Nom du candidat qu'un entraînement ordinaire apprend et enregistre. Le
-# challenge en oppose d'autres, mais c'est celui-là que le registre porte :
-# changer de famille en production est une décision, pas le résultat d'un
-# classement.
 DEFAULT_LEARNER = "xgboost"
 
 
@@ -61,9 +57,6 @@ class Learner:
 
     name: str
     fit: Callable[..., Any]
-    # Vrai quand l'ajustement consomme le bloc de validation. Seul l'arrêt
-    # anticipé en a besoin ; les autres n'ont rien à en faire, et le leur
-    # passer serait leur laisser voir des données qu'ils n'apprennent pas.
     uses_validation: bool
 
 

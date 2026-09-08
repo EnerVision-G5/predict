@@ -34,12 +34,8 @@ from predict_common.schemas import (
     TARGET_COLUMN,
 )
 
-# Suffixe des motifs ajoutés par l'ETL faute de motif de la source. Il dit ce
-# qu'il est : un constat de l'ETL, et non une cause remontée du terrain.
 DERIVED_REASON_SUFFIX = ":undeclared"
 
-# Au-delà de ce nombre de capteurs muets, la mesure ne décrit plus le site :
-# elle décrit la panne. En deçà, il reste de quoi l'exploiter partiellement.
 DEGRADED_NULL_COUNT = 3
 
 

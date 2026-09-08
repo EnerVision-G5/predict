@@ -43,14 +43,10 @@ def test_format_date_round_trips() -> None:
 
 
 def test_partition_segment_uses_hive_partitioning() -> None:
-    # `dt=` n'est pas décoratif : c'est ce que pyarrow, DuckDB et Spark savent
-    # élaguer sans lire les fichiers.
     assert partition_segment(DAY) == "dt=2026-09-02"
 
 
 def test_features_partition_places_the_version_before_the_day() -> None:
-    # La version est dans le chemin : c'est ce qui permet à v1 et v2 de
-    # coexister sans se recouvrir.
     assert features_partition("data", "v1", DAY) == "data/features/v1/dt=2026-09-02"
 
 
@@ -61,14 +57,11 @@ def test_partitions_keep_an_s3_uri_intact() -> None:
 
 
 def test_partitions_normalize_a_windows_root() -> None:
-    # Un chemin système avec des antislashs donnerait deux formes du même
-    # chemin selon l'hôte, et un stockage objet n'en lirait aucune.
     built = features_partition("D:\\lac", "v1", DAY)
     assert built == "D:/lac/features/v1/dt=2026-09-02"
 
 
 def test_a_version_with_a_slash_is_refused() -> None:
-    # Une barre oblique déplacerait la partition d'un niveau sans rien dire.
     with pytest.raises(PathError):
         features_partition("data", "v1/essai", DAY)
 
@@ -99,15 +92,11 @@ def test_lookback_range_refuses_an_empty_window() -> None:
 
 
 def test_part_file_is_unique_between_two_writes() -> None:
-    # Deux écritures concurrentes de la même partition ne doivent pas se
-    # recouvrir : des noms égaux feraient perdre la première.
     names = {part_file() for _ in range(100)}
     assert len(names) == 100
 
 
 def test_temporary_sibling_stays_outside_the_partition() -> None:
-    # Un répertoire de travail à l'intérieur de la partition serait vu d'un
-    # lecteur qui la liste pendant l'écriture.
     staging = temporary_sibling("data/features/v1/dt=2026-09-02")
     assert staging.startswith("data/features/v1/_tmp-dt=2026-09-02-")
 

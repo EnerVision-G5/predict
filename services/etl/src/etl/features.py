@@ -232,8 +232,6 @@ def _derive_site(group: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
     target = frame[TARGET_COLUMN]
     for hours in spec.lag_hours:
         frame[lag_column(hours)] = target.shift(hours * spec.periods_per_hour)
-    # Décalée d'un pas avant d'être moyennée : sans cela, la fenêtre
-    # contiendrait la cible de l'instant courant.
     window = spec.rolling_window_h * spec.periods_per_hour
     frame[rolling_column(spec.rolling_window_h)] = (
         target.shift(1).rolling(window=window, min_periods=window).mean()

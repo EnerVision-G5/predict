@@ -39,7 +39,6 @@ def test_openapi_spec_is_generable() -> None:
 
 
 def test_the_health_probe_is_not_versioned() -> None:
-    # C'est la sonde de disponibilité de l'hébergeur, pas une route métier.
     assert "/health" in spec()["paths"]
     assert "/api/v1/health" not in spec()["paths"]
 
@@ -50,9 +49,6 @@ def test_predict_declares_its_error_responses() -> None:
 
 
 def test_every_error_response_uses_the_shared_model() -> None:
-    # Le gestionnaire renvoie toujours un ErrorResponse : annoncer le
-    # HTTPValidationError de FastAPI, dont `detail` est une liste, mentirait
-    # aux trois consommateurs du contrat.
     generated = spec()
     responses = generated["paths"]["/api/v1/predict"]["post"]["responses"]
     for code in ("404", "422", "503"):
@@ -73,8 +69,6 @@ def test_the_dto_are_declared_in_the_contract() -> None:
 
 
 def test_the_horizon_keeps_its_bounds() -> None:
-    # 48 h est la borne du contrat : au-delà, l'erreur de la récurrence
-    # dépasse ce que la prévision vaut encore.
     horizon = spec()["components"]["schemas"]["PredictionRequest"]["properties"][
         "horizon_hours"
     ]

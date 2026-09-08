@@ -45,10 +45,6 @@ from predict_common.db import (
 )
 from predict_common.schemas import QUALITY_SOURCE_COLUMN
 
-# Le lot soumis porte toutes les colonnes, parce qu'une insertion en a besoin
-# si la ligne n'existait pas. Seules celles de DERIVED_COLUMNS sont réécrites
-# quand elle existe — et c'est toujours le cas ici, puisque le lot vient d'être
-# lu dans cette même table.
 STORED_COLUMNS = (*SOURCE_COLUMNS, *IMPUTATION_COLUMNS, QUALITY_SOURCE_COLUMN)
 
 logger = logging.getLogger(__name__)

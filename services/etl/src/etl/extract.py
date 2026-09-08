@@ -30,9 +30,6 @@ from predict_common.db import SOURCE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
-# Les colonnes de la source, et elles seules : les colonnes déduites sont ce
-# que ce run va recalculer, les relire reviendrait à partir du résultat de la
-# fois précédente.
 SELECTED = ", ".join(f"m.{name}" for name in SOURCE_COLUMNS)
 
 MEASURES_QUERY = text(

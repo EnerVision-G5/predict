@@ -48,18 +48,10 @@ from collections.abc import Awaitable, Callable
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
 
-# En-tête portant la clé. `X-API-Key` plutôt que `Authorization: Bearer` :
-# ce n'est pas un jeton porteur d'identité, et le confondre avec le JWT de
-# l'API métier inviterait à présenter l'un là où l'autre est attendu.
 API_KEY_HEADER = "X-API-Key"
 
-# Chemins servis sans clé. Comparés en préfixe pour couvrir les sous-chemins
-# que FastAPI ajoute à sa documentation (`/docs/oauth2-redirect`).
 PUBLIC_PREFIXES = ("/health", "/openapi.json", "/docs", "/redoc")
 
-# Message unique. Clé absente et clé fausse répondent la même chose : les
-# distinguer dirait à l'appelant s'il a trouvé le bon en-tête, ce qui est
-# précisément ce qu'on ne veut pas confirmer.
 UNAUTHORIZED = "Clé de service absente ou invalide."
 
 logger = logging.getLogger(__name__)
@@ -131,9 +123,6 @@ def build_middleware(
         if not secret or is_public(request.url.path):
             return await call_next(request)
         presented = request.headers.get(API_KEY_HEADER, "")
-        # compare_digest et non `==` : une comparaison qui s'arrête au premier
-        # octet différent laisse mesurer combien d'octets sont bons, et la clé
-        # se retrouve octet par octet.
         if not presented or not secrets.compare_digest(presented, secret):
             logger.warning(
                 "accès refusé sur %s %s", request.method, request.url.path

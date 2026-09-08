@@ -33,13 +33,8 @@ import mlflow
 import mlflow.pyfunc
 import pandas as pd
 
-# Préfixe des URI du registre. Un modèle désigné autrement — un chemin
-# d'artefact, un run — n'a pas de version de registre à résoudre.
 ALIAS_PREFIX = "models:/"
 
-# Nom du tag posé par `training.tracking` sur chaque version enregistrée. Écrit
-# des deux côtés, il est la frontière entre l'entraînement et le service : le
-# changer d'un seul côté ferait servir des prévisions sans bornes, en silence.
 RESIDUAL_STD_TAG = "residual_std"
 
 logger = logging.getLogger(__name__)
@@ -175,9 +170,6 @@ def _describe(model: Any, model_uri: str) -> LoadedModel:
             " quelles variables lui présenter, ni dans quel ordre."
         )
     inputs = signature.inputs
-    # Une seule interrogation du registre pour la version et les tags : deux
-    # appels pourraient tomber de part et d'autre d'une promotion et décrire
-    # deux versions différentes dans un même modèle chargé.
     entry = _registry_entry(model_uri)
     return LoadedModel(
         model=model,

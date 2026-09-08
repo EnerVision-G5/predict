@@ -89,14 +89,9 @@ from predict_common.schemas import TIMESTAMP_COLUMN
 from predict_common.source import SourceClient, SourceError, SourceSettings
 from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
-# Le démarrage n'a pas le luxe d'attendre le tick suivant : sans référentiel
-# des sites, il n'y a rien à interroger. On insiste donc plus longuement
-# qu'en régime établi, où l'échec d'un site est absorbé par la cadence.
 STARTUP_ATTEMPTS = 3
 STARTUP_BACKOFF_S = 5.0
 
-# Au-delà de cet écart entre l'instant prévu d'un tick et son démarrage réel,
-# le poller ne tient plus la cadence : c'est un symptôme, pas un détail.
 SCHEDULE_SKEW_WARNING_S = 5.0
 
 EXIT_OK = 0
@@ -112,10 +107,6 @@ class PollSettings:
     interval_s: float
     lag_warning_s: float
     batch_size: int
-    # Fuseau prêté aux horodatages que la source envoie sans le leur. Il est
-    # lu du bloc `source`, qui le décrit, mais il est porté ici : la boucle en
-    # a besoin à chaque tick, et l'aller chercher dans le client ferait
-    # dépendre l'écriture de la façon dont la lecture est branchée.
     source_timezone: str = DEFAULT_SOURCE_TIMEZONE
 
     @classmethod
@@ -156,9 +147,6 @@ class TickReport:
 
     rows: int
     lags_s: tuple[float, ...]
-    # Un état par site interrogé, succès comme échec. Le journal en tire son
-    # résumé, `ingestion_etat` en tire ses lignes : les deux disent la même
-    # chose du même tick, ce qui n'est vrai que parce qu'ils partent d'ici.
     states: tuple[IngestionState, ...]
 
     @property
@@ -454,8 +442,6 @@ def resolve_targets(
     referential = _fetch_referential(context, required=not requested)
     if referential is None:
         return list(requested or ())
-    # Entretient `site`, que `mesure.site_id` référence : un site absent ferait
-    # rejeter ses mesures sans que rien n'explique pourquoi.
     sync_sites(context.engine, referential, context.settings.batch_size)
     if requested:
         return list(requested)
@@ -558,15 +544,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config()
         settings = PollSettings.from_config(config)
         source_settings = SourceSettings.from_config(config)
-        # pool_pre_ping : le poller vit des jours, et une connexion coupée par
-        # la base entre deux ticks échouerait sur la première écriture au lieu
-        # d'être renouvelée.
         engine = open_engine(
             config.get_optional_str("database.url"), pool_pre_ping=True
         )
-        # Le poller est un processus long : une base en retard de migration
-        # doit l'empêcher de démarrer, pas le laisser journaliser le même
-        # échec toutes les minutes pendant des jours.
         verify_schema(
             engine,
             (mesure, site, ingestion_etat, alerte, capteur_etat, capteur_panne),
@@ -607,9 +587,6 @@ def _with_interval(settings: PollSettings, interval_s: float) -> PollSettings:
     """Retourne les réglages avec la cadence imposée en ligne de commande."""
     if interval_s <= 0:
         raise ValueError("--interval doit être strictement positif.")
-    # `replace` et non une reconstruction champ par champ : celle-ci laissait
-    # silencieusement tomber tout réglage ajouté depuis, et `--interval` aurait
-    # suffi à faire relire la source dans un autre fuseau que celui configuré.
     return replace(settings, interval_s=interval_s)
 
 

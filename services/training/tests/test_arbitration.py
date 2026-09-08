@@ -71,8 +71,6 @@ class TestResolveBench:
         assert bench.pinned
 
     def test_a_half_written_bench_is_refused(self) -> None:
-        # Deviner la seconde borne produirait un banc que personne n'a décidé,
-        # donc des comparaisons qu'on croirait figées.
         with pytest.raises(ArbitrationError, match="ensemble"):
             resolve_bench(config_for(start="2026-08-01"), END)
 
@@ -96,17 +94,12 @@ class TestBench:
 
 
 def test_score_measures_any_predictor() -> None:
-    # Un modèle appris et une persistance passent par le même appel : deux
-    # chemins laisseraient un écart de traitement s'installer entre la
-    # référence et ce qu'elle arbitre.
     result = score(Persistence(hours=24), bench_frame(), COLUMNS, "p24", BENCH)
     assert result.window == BENCH.label
     assert result.metrics["mae"] == pytest.approx(0.0)
 
 
 def test_the_naive_reference_is_the_hardest_to_beat() -> None:
-    # La meilleure et non la première : une référence qu'on choisirait serait
-    # une barre qu'on pourrait s'arranger pour placer bas.
     baselines = (Persistence(hours=1), Persistence(hours=24))
     reference = naive_reference(baselines, bench_frame(), COLUMNS, BENCH)
     assert reference.name == "persistance-24h"
@@ -118,8 +111,6 @@ def test_no_baseline_at_all_is_refused() -> None:
 
 
 def test_bench_metrics_do_not_collide_with_the_test_block() -> None:
-    # Sans préfixe, la mesure du banc écraserait celle du bloc de test dans le
-    # même run, alors qu'elles ne disent pas la même chose.
     candidate = BenchResult(name="xgboost", window=BENCH.label, metrics={"mae": 3.0})
     naive = BenchResult(
         name="persistance-24h", window=BENCH.label, metrics={"mae": 5.0}
@@ -144,8 +135,6 @@ class TestReadBack:
         assert result.window == BENCH.label
 
     def test_a_run_without_bench_metrics_reads_back_as_nothing(self) -> None:
-        # Inventer une valeur ferait passer une promotion pour une décision
-        # alors qu'elle serait un pari.
         assert read_bench({"mae": 9.0}, {BENCH_WINDOW_PARAM: "x"}, "v1") is None
 
     def test_a_run_without_bench_window_reads_back_as_nothing(self) -> None:

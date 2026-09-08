@@ -27,10 +27,6 @@ from datetime import date, datetime, timedelta
 DATE_FORMAT = "%Y-%m-%d"
 PARTITION_KEY = "dt"
 
-# Préfixe des répertoires de travail d'une écriture atomique. Il commence par
-# un tiret bas pour que les moteurs de lecture, qui ignorent les entrées
-# commençant par `_` ou `.`, ne prennent jamais une écriture en cours pour une
-# partition publiée.
 TEMPORARY_PREFIX = "_tmp"
 
 

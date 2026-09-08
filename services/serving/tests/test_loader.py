@@ -79,8 +79,6 @@ class FakeVersion:
         self.tags = dict(tags or {})
 
 
-# Entrée par défaut des tests qui ne s'intéressent pas au registre : une
-# version résolue, avec sa dispersion, comme un entraînement en pose une.
 SERVED_ENTRY = FakeVersion("3", {"residual_std": "2.5"})
 
 
@@ -109,8 +107,6 @@ def test_a_resolvable_alias_makes_the_service_ready(monkeypatch) -> None:
 
 
 def test_an_unreachable_registry_does_not_raise(monkeypatch) -> None:
-    # Un conteneur qui sortirait au démarrage redémarrerait en boucle, et
-    # l'hébergeur lirait une panne du service là où la panne est chez MLflow.
     registry = registry_serving(monkeypatch, None)
     assert registry.load() is None
     assert not registry.is_ready
@@ -124,8 +120,6 @@ def test_serving_without_a_model_is_refused_explicitly(monkeypatch) -> None:
 
 
 def test_a_model_without_a_signature_is_not_served(monkeypatch) -> None:
-    # Rien ne dirait quelles variables lui présenter : le refus est immédiat,
-    # au chargement, plutôt qu'à la première requête.
     registry = registry_serving(monkeypatch, FakeModel(signed=False))
     assert registry.load() is None
 
@@ -134,7 +128,6 @@ def test_the_input_columns_come_from_the_signature(monkeypatch) -> None:
     registry = registry_serving(monkeypatch, FakeModel())
     registry.load()
     assert registry.input_columns() == list(COLUMNS)
-
 
 
 class TestConform:
@@ -146,8 +139,6 @@ class TestConform:
         assert list(loaded(model).conform(frame).columns) == list(COLUMNS)
 
     def test_the_types_follow_the_signature(self) -> None:
-        # Une colonne entière construite en int64 par pandas serait refusée par
-        # un modèle entraîné sur de l'int32, alors que la valeur est la bonne.
         model = FakeModel()
         frame = pd.DataFrame({"hour": [8], "lag_1h": [50.0]})
         conformed = loaded(model).conform(frame)
@@ -180,8 +171,6 @@ class TestAliasParsing:
         assert loader._parse_alias("models:/enervision_xgboost/3") == ("", "")
 
     def test_the_internal_identifier_takes_over_without_a_registry(self) -> None:
-        # Moins précis qu'une version, mais c'est une trace, là où une chaîne
-        # vide n'en serait pas une.
         assert loader._version_of(None, FakeModel(), "runs:/abc/model") == "uuid-1"
 
     def test_the_registry_version_wins_over_the_identifier(self) -> None:
@@ -199,8 +188,6 @@ class TestResidualStd:
         assert registry.load().residual_std == 4.25
 
     def test_a_version_without_the_tag_serves_without_bounds(self, monkeypatch) -> None:
-        # Un modèle enregistré avant cette mesure reste servable : il rend une
-        # prévision sans bornes, pas une bande inventée.
         registry = registry_serving(monkeypatch, FakeModel(), FakeVersion("3", {}))
         assert registry.load().residual_std is None
 
@@ -211,7 +198,6 @@ class TestResidualStd:
         assert registry.load().residual_std is None
 
     def test_a_null_spread_is_refused(self, monkeypatch) -> None:
-        # Une bande de largeur nulle annoncerait une prévision certaine.
         registry = registry_serving(
             monkeypatch, FakeModel(), FakeVersion("3", {"residual_std": "0"})
         )

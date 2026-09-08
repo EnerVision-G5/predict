@@ -87,32 +87,15 @@ from predict_common.timestamps import (
     to_utc,
 )
 
-# Qualification écrite faute de mieux quand la source se tait. C'est le DEFAULT
-# de la colonne, repris explicitement plutôt que laissé à la base : un lot
-# soumis en une instruction porte les mêmes clés pour toutes ses lignes, et
-# omettre la colonne pour certaines n'est pas possible.
 UNQUALIFIED = QUALITY_GOOD
 
 logger = logging.getLogger(__name__)
 
 
-# Colonnes que le seed `02_seed_sites.sql` marque « à synchroniser » : il pose
-# sept sites dont quatre avec des capacités placeholders, et attend que le
-# premier passage de la chaîne les remplace par ce que sert la source.
 SITE_REQUIRED = ("site_id", "site_type", "site_name", "capacity_kw")
 
 DEFAULT_SITE_STATUS = "active"
 
-# Pas de la grille de `mesure` : au plus une ligne par site et par minute.
-#
-# La minute est la résolution la plus fine que la chaîne produise — c'est la
-# cadence du poller, que `collector.poll_interval_s` fixe à 60 s. Elle n'est
-# pas celle de l'historique : `GET /api/v1/readings` sert la source par pas de
-# 30 minutes (voir sa documentation), donc sur des horodatages déjà alignés à
-# la minute. Les deux points d'entrée tiennent ainsi dans la même grille sans
-# qu'aucun n'ait à connaître le pas de l'autre.
-#
-# Voir `snap_to_grid` pour ce que cette constante fait respecter.
 GRID_RESOLUTION = "1min"
 
 
@@ -268,8 +251,6 @@ def write(
     placeable = placeable.assign(
         **{TIMESTAMP_COLUMN: snap_to_grid(placeable[TIMESTAMP_COLUMN])}
     )
-    # Après le calage, et pas avant : deux relevés de la même minute ne
-    # deviennent des doublons qu'une fois ramenés sur la grille.
     selected = deduplicate(placeable)
     if day is not None:
         selected = select_day(selected, day)
@@ -368,8 +349,6 @@ def build_state_success_upsert(records: list[dict[str, Any]]) -> Any:
             "last_success_at": statement.excluded.last_success_at,
             "last_rows": statement.excluded.last_rows,
             "last_data_lag_s": statement.excluded.last_data_lag_s,
-            # Remis à zéro et non décrémenté : le compteur distingue l'à-coup
-            # de la panne installée, et un succès clôt la série.
             "consecutive_failures": 0,
             "source": statement.excluded.source,
         },
@@ -426,14 +405,8 @@ def write_state(
     return rows
 
 
-# Colonnes sans lesquelles une alerte ne veut rien dire. La source les sert
-# toutes, mais une réponse tronquée ferait échouer le lot entier : l'alerte
-# incomplète est écartée seule.
 ALERTE_REQUIRED = ("alert_id", "site_id", "timestamp", "severity", "type", "message")
 
-# Capteurs décrits par la source. La liste est fermée à dessein : un capteur
-# inconnu apparaîtrait en base sans que personne ne sache l'interpréter, et le
-# journal est un meilleur endroit pour le signaler qu'une ligne muette.
 CAPTEURS = ("consumption", "electrical", "temperature", "humidity", "network")
 
 
@@ -559,10 +532,6 @@ def build_capteur_etat_upsert(records: list[dict[str, Any]]) -> Any:
         name: getattr(statement.excluded, name)
         for name in ("statut", "failing_until", "overall")
     }
-    # `releve_le` est laissée au DEFAULT now() à l'insertion, mais une table du
-    # présent doit dire quand elle a été rafraîchie : sans ce repos explicite,
-    # la ligne garderait la date de son premier tick pour toujours, et un
-    # collecteur arrêté depuis trois jours paraîtrait à jour.
     updated["releve_le"] = func.now()
     return statement.on_conflict_do_update(
         index_elements=list(CAPTEUR_ETAT_KEY),

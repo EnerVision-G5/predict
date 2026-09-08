@@ -35,13 +35,8 @@ import pyarrow.parquet
 
 from predict_common.paths import join, normalize, part_file, temporary_sibling
 
-# Compression : zstd plutôt que snappy, au même coût de décompression pour un
-# tiers de volume en moins sur des séries temporelles très répétitives.
 COMPRESSION = "zstd"
 
-# Entrées ignorées à la lecture. Un répertoire de travail d'écriture atomique
-# commence par un tiret bas : le lire reviendrait à lire une partition en
-# cours de production.
 IGNORED_PREFIXES = ("_", ".")
 
 S3_SCHEME = "s3"

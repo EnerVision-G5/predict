@@ -55,8 +55,6 @@ def test_complete_null_reasons_names_every_unexplained_column() -> None:
 
 
 def test_complete_null_reasons_keeps_the_source_motives_alone() -> None:
-    # `network_loss` explique aussi bien un capteur muet que sept : y ajouter
-    # un motif par colonne inventerait des causes distinctes.
     completed = complete_null_reasons(["network_loss"], ("voltage_v",))
     assert completed == ["network_loss"]
 
@@ -88,7 +86,6 @@ def test_qualify_never_lets_a_null_pass_without_a_reason(
 def test_qualify_keeps_a_source_alert_the_data_alone_would_not_show(
     make_raw, make_reading
 ) -> None:
-    # Un seul capteur muet ferait déduire 'partial' ; la source en sait plus.
     frame = to_measures(
         make_raw(
             [
@@ -106,8 +103,6 @@ def test_qualify_keeps_a_source_alert_the_data_alone_would_not_show(
 def test_qualify_refuses_a_qualification_kinder_than_the_data(
     make_raw, make_reading
 ) -> None:
-    # La source annonce 'good' en n'envoyant pas de puissance : la garder
-    # sortirait la panne de idx_mesure_quality, qui n'indexe que le non-'good'.
     frame = to_measures(
         make_raw(
             [
@@ -125,8 +120,6 @@ def test_qualify_refuses_a_qualification_kinder_than_the_data(
 def test_qualify_recomputes_a_qualification_the_base_would_reject(
     make_raw, make_reading
 ) -> None:
-    # 'ok' n'est pas dans le CHECK de la colonne : le soumettre tel quel
-    # ferait échouer l'insertion du lot entier, pas seulement de la ligne.
     frame = to_measures(
         make_raw([make_reading("2026-09-02T08:00:00Z", data_quality="ok")])
     )
@@ -165,8 +158,6 @@ class TestWorst:
         assert worst(["ok", QUALITY_PARTIAL]) == QUALITY_PARTIAL
 
     def test_an_hour_without_any_known_value_is_critical(self) -> None:
-        # Ne rien savoir de la qualité d'une heure n'est pas la même chose que
-        # la savoir bonne.
         assert worst([]) == QUALITY_CRITICAL
 
 
@@ -186,6 +177,4 @@ class TestQualitySource:
         assert frame.loc[0, QUALITY_SOURCE_COLUMN] == QUALITY_SOURCE_ETL
 
     def test_an_empty_batch_still_carries_the_column(self, make_raw) -> None:
-        # Le lot vide traverse `qualify` sans y passer : la colonne doit venir
-        # de la projection, sinon le chargement échouerait sur une absence.
         assert QUALITY_SOURCE_COLUMN in to_measures(make_raw([])).columns

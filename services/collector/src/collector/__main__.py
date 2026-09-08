@@ -72,18 +72,8 @@ from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
 DEFAULT_DAYS = 1
 
-# Profondeur du rattrapage automatique, en journées. C'est la fenêtre dans
-# laquelle les trous sont cherchés — pas la quantité recollectée : une fenêtre
-# sans trou ne coûte qu'une requête d'agrégation.
-#
-# 35 et non 30 : « il y a un mois » doit tomber DANS la fenêtre et non sur son
-# bord. Une profondeur de 30 partant du 5 septembre ne remonte qu'au 7 août, et
-# laisserait dehors les deux premières journées d'un trou qui commence le 5.
 DEFAULT_CATCH_UP_DAYS = 35
 
-# Écart toléré entre les bornes d'une journée et ce que la base en porte, de
-# part et d'autre. Voir `covers_full_day` : elle absorbe le pas de la source
-# sans avoir à le connaître.
 COVERAGE_TOLERANCE = timedelta(hours=1)
 
 EXIT_OK = 0
@@ -137,9 +127,6 @@ def collect_day(
         try:
             page = list(client.iter_readings(site_id, start_time, end_time))
         except SourceError as exc:
-            # L'état est posé avant que l'exception ne remonte : le rattrapage
-            # s'arrête sur un échec de source, mais ce qu'il savait à cet
-            # instant a plus de valeur écrit que perdu.
             states.append(
                 IngestionState(
                     site_id=site_id,
@@ -156,9 +143,6 @@ def collect_day(
                 site_id=site_id,
                 attempted_at=attempted_at,
                 rows=len(page),
-                # Aucun retard de données n'est mesuré ici, et c'en est le
-                # sens : un rattrapage relit une journée passée, l'âge de ce
-                # qu'il reçoit ne dit rien de la santé de la source.
                 data_lag_s=None,
             )
         )
@@ -410,8 +394,6 @@ def requested_days(args: argparse.Namespace) -> list[date]:
     if borne:
         if args.start is None:
             raise ValueError("--end demande --start.")
-        # Une borne haute absente vaut la borne basse : `--start` seul collecte
-        # cette journée, ce qui est la lecture naturelle.
         first = parse_date(args.start)
         last = parse_date(args.end) if args.end else first
         return date_range(first, last)
@@ -450,17 +432,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         config = load_config()
-        # En mode rattrapage la période vient de la base, pas de la ligne de
-        # commande : elle est calculée plus bas, une fois le moteur ouvert et
-        # le référentiel résolu.
         check_period_arguments(args)
         days = [] if args.catch_up else requested_days(args)
         settings = SourceSettings.from_config(config)
         if args.limit is not None:
             settings = settings.with_page_size(args.limit)
         engine = open_engine(config.get_optional_str("database.url"))
-        # Avant la première page : un rattrapage d'un mois qui échouerait
-        # au chargement aurait relu la source pour rien.
         verify_schema(engine, (mesure, site, ingestion_etat))
         batch_size = config.get_int("database.batch_size")
     except (ConfigError, DatabaseError, PathError, ValueError) as exc:
@@ -498,7 +475,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         engine.dispose()
     logger.info("collecte terminée : %d mesure(s) soumise(s)", total)
     return EXIT_OK
-
 
 
 if __name__ == "__main__":

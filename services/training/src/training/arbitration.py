@@ -41,19 +41,10 @@ from training.baseline import Persistence
 from training.dataset import matrices
 from training.model import DECISION_METRIC, evaluate
 
-# Préfixe des métriques mesurées sur le banc. Sans lui, elles porteraient le
-# même nom que celles du bloc de test et l'une écraserait l'autre dans le run,
-# alors qu'elles ne disent pas la même chose : le test juge le modèle dans sa
-# propre fenêtre, le banc le juge là où tous les autres sont jugés.
 BENCH_PREFIX = "arbitrage_"
 
-# Métrique de la meilleure baseline naïve sur le même banc. Journalisée avec
-# le run : sans elle, relire un run six mois plus tard ne dirait pas si le
-# modèle apportait quoi que ce soit sur une simple recopie de la veille.
 NAIVE_METRIC = f"naif_{DECISION_METRIC}"
 
-# Paramètre portant la fenêtre du banc. C'est lui que la promotion relit pour
-# savoir si deux mesures sont comparables.
 BENCH_WINDOW_PARAM = "arbitrage_window"
 
 logger = logging.getLogger(__name__)

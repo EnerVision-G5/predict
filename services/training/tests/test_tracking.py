@@ -90,8 +90,6 @@ class TestAliasSnapshot:
     def test_the_served_version_comes_back_with_them(
         self, client: FakeClient
     ) -> None:
-        # La promotion la nomme dans sa raison : « champion v7 » se relit six
-        # mois plus tard, « le champion » non.
         assert tracking.alias_snapshot("enervision_xgboost", "champion").version == "7"
 
     def test_the_alias_is_resolved_before_its_run(self, client: FakeClient) -> None:
@@ -100,16 +98,12 @@ class TestAliasSnapshot:
 
 
 def test_baseline_metrics_keeps_only_the_metrics(client: FakeClient) -> None:
-    # La surveillance n'a que faire des paramètres : lui rendre l'instantané
-    # entier l'obligerait à savoir ce qu'elle n'utilise pas.
     assert tracking.baseline_metrics("enervision_xgboost", "champion") == METRICS
 
 
 def test_a_numbered_version_is_read_like_an_aliased_one(
     client: FakeClient,
 ) -> None:
-    # C'est ce que --promote-version relit avant de mettre en service une
-    # version qu'il n'a pas produite.
     snapshot = tracking.version_snapshot("enervision_xgboost", "4")
     assert snapshot.version == "4"
     assert snapshot.params == PARAMS
@@ -117,8 +111,6 @@ def test_a_numbered_version_is_read_like_an_aliased_one(
 
 
 def test_tags_travel_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    # MLflow n'accepte que des chaînes : un booléen passé tel quel remonterait
-    # en erreur au milieu d'un run qui, lui, s'est bien passé.
     posted: dict[str, Any] = {}
     monkeypatch.setattr(tracking.mlflow, "set_tags", posted.update)
     tracking.set_tags({"challenge": True, "famille": "naive"})

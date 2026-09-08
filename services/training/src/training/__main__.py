@@ -38,7 +38,6 @@ perdre le run et servir un modèle que rien ne référence.
 
 `--promote-version` fait le même geste sur une version déjà enregistrée, sans
 rien réapprendre :
-
     python -m training --promote-version 7
 
 C'est la voie qui remet le miroir d'aplomb après un `mlflow models set-alias`,
@@ -94,10 +93,6 @@ DEFAULT_HISTORY_DAYS = 90
 
 EXIT_OK = 0
 EXIT_FAILED = 1
-# Distinct de EXIT_FAILED, comme le code 2 de la surveillance : un refus de
-# promotion est un résultat, pas une panne. Le modèle a été appris et
-# enregistré en challenger, seule sa mise en service a été refusée — les
-# confondre ferait chercher un incident là où la règle a simplement tranché.
 EXIT_REFUSED = 3
 
 logger = logging.getLogger(__name__)
@@ -350,9 +345,6 @@ def fit_and_measure(
     model = fit_candidate(
         name, params, train_x, train_y, valid_x, valid_y, early_stopping
     )
-    # Une seule prédiction sur le test, relue deux fois : la refaire pour
-    # l'écart-type ferait dépendre l'intervalle servi d'un second calcul que
-    # rien ne garantirait identique au premier.
     predicted = model.predict(test_x)
     measured = arbitration.score(
         model, fixtures.bench_frame, fixtures.columns, name, fixtures.bench
@@ -395,8 +387,6 @@ def run_params(
         "arbitrage_rows": len(fixtures.bench_frame),
         "reference_naive": fixtures.naive.name,
     }
-    # Seul l'arrêt anticipé produit ce nombre : l'inscrire pour les autres
-    # familles ferait lire une borne d'arbres à une régression.
     if hasattr(trained.model, "best_iteration"):
         values["best_iteration"] = best_iteration(trained.model)
     return values
@@ -413,9 +403,6 @@ def version_tags(fixtures: Fixtures, trained: Trained) -> dict[str, object]:
         "mae": round(trained.metrics["mae"], 4),
         "rmse": round(trained.metrics["rmse"], 4),
         "r2": round(trained.metrics["r2"], 4),
-        # Le service d'inférence lit ce tag pour borner sa prévision. Un tag et
-        # non une métrique de run : le service résout un alias, il n'a pas à
-        # remonter jusqu'au run qui l'a produit.
         "residual_std": round(trained.metrics["residual_std"], 4),
     }
 
@@ -455,9 +442,6 @@ def train(
         )
     report_bench(trained.bench, fixtures)
     if engine is not None and registered:
-        # Hors du contexte du run : promouvoir n'appartient pas à
-        # l'entraînement, c'est une décision d'exploitation que la ligne de
-        # commande exprime. Le run, lui, est clos dès que le modèle est écrit.
         enforce(
             decide_promotion(config, settings, trained.bench, fixtures.naive),
             force,
@@ -791,9 +775,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 " des familles, et la mise en service se décide après lecture"
                 " du classement."
             )
-        # Avant l'apprentissage : une DATABASE_URL absente doit se voir en
-        # quelques secondes, pas une heure plus tard, quand il ne resterait
-        # qu'à choisir entre perdre le run et servir un modèle non référencé.
         if args.promote or args.promote_version:
             engine = open_engine(config.get_optional_str("database.url"))
         if args.challenge:
@@ -811,10 +792,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.force,
             )
     except PromotionRefused as exc:
-        # Le modèle est appris et enregistré en challenger : seule sa mise en
-        # service a été refusée. Un code distinct pour que l'ordonnanceur ne
-        # traite pas une décision comme une panne — et parce que l'exploitant
-        # a quelque chose à lire, pas quelque chose à réparer.
         logger.warning(
             "promotion refusée — %s. La version reste challenger ; --force"
             " passe outre si la règle a tort.",
@@ -835,15 +812,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("promotion impossible : %s", exc)
         return EXIT_FAILED
     except MlflowException as exc:
-        # Une version inconnue du registre sort ici, et non par la trace
-        # complète : c'est la faute de saisie la plus courante sous
-        # --promote-version, et elle n'a rien d'un incident.
         logger.error("registre MLflow : %s", exc)
         return EXIT_FAILED
     except SQLAlchemyError as exc:
-        # L'alias est posé et le modèle est servi ; seul le miroir manque. Le
-        # run sort en échec pour que l'exploitant le sache, et un second
-        # `--promote` sur la même version rattrape sans rien réapprendre.
         logger.error(
             "alias champion posé, mais `modele` non mise à jour : %s."
             " Relancer --promote une fois la base joignable.",
@@ -851,10 +822,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_FAILED
     except ValueError as exc:
-        # Les erreurs de la chaîne ont leur type ; celles-ci viennent
-        # d'ailleurs — un hyperparamètre refusé par XGBoost, un encodage de
-        # console. Les ranger sous le même message enverrait chercher la panne
-        # du mauvais côté, alors on dit d'où elle sort.
         logger.error("erreur inattendue (%s) : %s", type(exc).__name__, exc)
         return EXIT_FAILED
     finally:

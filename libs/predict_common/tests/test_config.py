@@ -65,7 +65,6 @@ def test_load_config_applies_the_local_layer_by_default(conf_dir: Path) -> None:
 
 
 def test_load_config_merges_blocks_key_by_key(conf_dir: Path) -> None:
-    # local.yaml ne surcharge que n_estimators : max_depth doit survivre.
     config = load_config(env={}, directory=conf_dir)
     assert config.get_int("training.params.n_estimators") == 120
     assert config.get_int("training.params.max_depth") == 6
@@ -123,8 +122,6 @@ def test_get_str_refuses_an_empty_value() -> None:
 
 
 def test_get_optional_str_accepts_an_assumed_absence(conf_dir: Path) -> None:
-    # La sortie annexe TimescaleDB est désactivée par une URL vide, ce qui est
-    # une décision et non un oubli.
     config = load_config(env={}, directory=conf_dir)
     assert config.get_optional_str("etl.database_url") == ""
 
@@ -136,8 +133,6 @@ def test_get_int_refuses_an_unreadable_number() -> None:
 
 
 def test_get_int_refuses_a_boolean() -> None:
-    # YAML lit `yes` comme un booléen : le laisser passer donnerait 1 sans que
-    # personne n'ait demandé 1.
     config = Config(values={"a": True})
     with pytest.raises(ConfigError):
         config.get_int("a")
@@ -155,17 +150,11 @@ def test_get_int_list_refuses_a_lone_value() -> None:
 
 
 def test_get_int_list_splits_a_value_from_the_environment() -> None:
-    # `${ETL_LAG_HOURS:-1,24,168}` ne peut pas produire une liste YAML : une
-    # valeur venue de l'environnement est toujours une chaîne. Sans ce
-    # découpage, les décalages seraient la seule clé qu'un déploiement ne
-    # pourrait pas surcharger.
     assert Config(values={"a": "1, 24, 168"}).get_int_list("a") == [1, 24, 168]
     assert Config(values={"a": "24"}).get_int_list("a") == [24]
 
 
 def test_get_int_list_refuses_an_empty_environment_value() -> None:
-    # Une liste de décalages vide publierait des variables sans historique,
-    # au lieu de signaler la variable mal renseignée qui l'a produite.
     with pytest.raises(ConfigError, match="vide"):
         Config(values={"a": " , "}).get_int_list("a")
 
@@ -183,14 +172,6 @@ def test_section_refuses_a_leaf(conf_dir: Path) -> None:
 
 def test_config_directory_honours_the_override(tmp_path: Path) -> None:
     assert config_directory({"PREDICT_CONF_DIR": str(tmp_path)}) == tmp_path
-
-
-# --- Booléens venus de l'environnement --------------------------------------
-#
-# `_expand_text` rend TOUJOURS une chaîne : `${SERVING_AUTH_ENABLED:-true}`
-# produit `"true"`, jamais `True`. Un `if config.get(...)` serait donc vrai
-# pour `"false"` comme pour `"true"` — l'inversion silencieuse qui ouvre un
-# contrôle d'accès en croyant le fermer.
 
 
 @pytest.mark.parametrize("word", ["true", "TRUE", "1", "yes", "on"])

@@ -33,22 +33,12 @@ import mlflow.xgboost
 import pandas as pd
 from mlflow.models import infer_signature
 
-# Nom de l'artefact du modèle à l'intérieur du run. Il entre dans l'URI que le
-# service résout : le changer casse les modèles déjà enregistrés.
 ARTIFACT_NAME = "model"
 
-# Alias posé sur la version qui vient d'être enregistrée. `challenger` et non
-# `champion` : promouvoir est une décision, pas une conséquence automatique de
-# la fin d'un entraînement. Le service, lui, résout `champion`.
 STAGING_ALIAS = "challenger"
 
-# Alias de la version réellement servie. C'est lui que le service d'inférence
-# résout, et lui que la surveillance prend pour référence.
 PRODUCTION_ALIAS = "champion"
 
-# MLflow date ses runs en millisecondes depuis l'époque ; `date_entrainement`
-# est un TIMESTAMPTZ. La conversion est ici, à côté de ce qui produit la
-# valeur, et le diviseur est nommé plutôt que posé en clair dans le calcul.
 MILLISECONDS_PER_SECOND = 1000
 
 logger = logging.getLogger(__name__)

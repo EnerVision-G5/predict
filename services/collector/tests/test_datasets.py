@@ -59,16 +59,12 @@ def test_une_ligne_complete_donne_une_lecture_good(tmp_path) -> None:
 
 
 def test_la_consommation_horaire_sert_les_deux_champs(tmp_path) -> None:
-    # L'énergie d'une heure en kWh est numériquement la puissance moyenne de
-    # cette heure en kW. La source elle-même sert les deux champs égaux.
     reading = read_one(tmp_path, csv_line(consumption="89.18"))
     assert reading["consumption_kw"] == 89.18
     assert reading["consumption_kwh"] == 89.18
 
 
 def test_les_grandeurs_electriques_restent_nulles(tmp_path) -> None:
-    # Le jeu de données ne les porte pas. Les déduire d'une consommation
-    # horaire inventerait trois grandeurs à partir d'une seule.
     reading = read_one(tmp_path, csv_line())
     assert reading["voltage_v"] is None
     assert reading["current_a"] is None
@@ -76,8 +72,6 @@ def test_les_grandeurs_electriques_restent_nulles(tmp_path) -> None:
 
 
 def test_une_consommation_absente_degrade_la_ligne(tmp_path) -> None:
-    # C'est la consommation que le modèle apprend : sans elle l'heure est
-    # inapprenable, alors qu'une température manquante ne fait que gêner.
     reading = read_one(tmp_path, csv_line(consumption=""))
     assert reading["data_quality"] == "degraded"
     assert reading["null_reasons"] == ["consumption_sensor_failure"]
@@ -90,10 +84,6 @@ def test_une_temperature_absente_rend_la_ligne_partielle(tmp_path) -> None:
 
 
 def test_tout_absent_vaut_une_coupure_reseau(tmp_path) -> None:
-    # Et non trois pannes simultanées : trois capteurs qui tombent à la même
-    # seconde décrivent le réseau, pas les capteurs. C'est la qualification
-    # que la source emploie, et l'analyse de fiabilité n'a ainsi qu'un seul
-    # vocabulaire à connaître.
     reading = read_one(
         tmp_path, csv_line(consumption="", temperature="", humidity="")
     )
@@ -102,9 +92,6 @@ def test_tout_absent_vaut_une_coupure_reseau(tmp_path) -> None:
 
 
 def test_les_horodatages_naifs_sont_lus_en_utc(tmp_path) -> None:
-    # Les lire dans le fuseau du serveur décalerait tout l'historique d'une à
-    # deux heures selon la saison, et ferait apprendre au modèle des journées
-    # de travail commençant à 7 h.
     reading = read_one(tmp_path, csv_line(stamp="2023-06-15 08:00:00"))
     stamp = pd.Timestamp(reading["timestamp"])
     assert stamp.tzinfo is not None
@@ -112,9 +99,6 @@ def test_les_horodatages_naifs_sont_lus_en_utc(tmp_path) -> None:
 
 
 def test_le_pas_horaire_est_conserve(tmp_path) -> None:
-    # Une ligne par heure, et non soixante copies : l'ETL calcule son taux
-    # d'imputation sur les lignes présentes, donc une heure à une seule ligne
-    # non imputée vaut imputed_ratio = 0.
     write_dataset(
         tmp_path,
         "SITE001.csv",
@@ -131,8 +115,6 @@ def test_le_pas_horaire_est_conserve(tmp_path) -> None:
 
 
 def test_le_fichier_combine_n_est_pas_relu(tmp_path) -> None:
-    # Il porte exactement les mêmes lignes que les fichiers par site : le lire
-    # en plus doublerait le travail pour un résultat identique.
     write_dataset(tmp_path, "SITE001.csv", [csv_line()])
     write_dataset(tmp_path, "all_sites_combined.csv", [csv_line()])
     found = datasets.find_files(tmp_path)
@@ -140,8 +122,6 @@ def test_le_fichier_combine_n_est_pas_relu(tmp_path) -> None:
 
 
 def test_un_repertoire_sans_fichier_est_une_erreur(tmp_path) -> None:
-    # Et non un import de zéro ligne : la commande aurait l'air d'avoir
-    # réussi, et le défaut ne se verrait qu'à l'entraînement.
     with pytest.raises(datasets.DatasetError):
         datasets.find_files(tmp_path)
 
@@ -161,14 +141,6 @@ def test_une_colonne_attendue_absente_est_nommee(tmp_path) -> None:
     assert "consumption_kwh" in str(erreur.value)
 
 
-# --- Racine de stockage ------------------------------------------------------
-#
-# Les CSV ne sont plus dans le dépôt ni dans l'image : ils vivent sur le
-# stockage objet, et la racine est une valeur de configuration. Le disque et
-# une URI s3:// traversent le même code — celui de `predict_common.io` — donc
-# ce qui est éprouvé ici est le contrat de cette frontière, pas S3.
-
-
 class TestStorageRoot:
     """Ce que la commande accepte comme racine, et comment elle échoue."""
 
@@ -179,8 +151,6 @@ class TestStorageRoot:
     def test_une_racine_au_schema_inconnu_est_une_erreur_de_jeu_de_donnees(
         self,
     ) -> None:
-        # Et non une StorageError nue : l'opérateur qui lance l'import lit un
-        # message sur SON geste, pas sur la couche qui l'a refusé.
         with pytest.raises(datasets.DatasetError) as erreur:
             datasets.find_files("nulle-part://enervision-datasets")
         assert "nulle-part://" in str(erreur.value)
@@ -199,7 +169,6 @@ class TestBaseName:
         assert datasets.base_name(uri) == "SITE001.csv"
 
     def test_un_chemin_windows_rend_son_dernier_segment(self) -> None:
-        # Le chemin d'un poste traverse la même fonction que celui d'un seau.
         assert datasets.base_name(r"D:\jeux\SITE001.csv") == "SITE001.csv"
 
 

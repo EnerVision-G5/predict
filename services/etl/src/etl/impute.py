@@ -42,7 +42,6 @@ SOURCE_COLUMN = TARGET_COLUMN
 IMPUTED_COLUMN = "consumption_kw_imputed"
 METHOD_COLUMN = "imputation_method"
 
-# Colonnes ajoutées à la table `mesure` par la migration d'EV-08.
 IMPUTATION_COLUMNS = (IMPUTED_COLUMN, METHOD_COLUMN)
 
 

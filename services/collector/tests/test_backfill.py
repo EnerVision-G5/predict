@@ -58,12 +58,9 @@ class TestPeriode:
         ]
 
     def test_a_lone_start_collects_that_day(self) -> None:
-        # Lecture naturelle d'une borne basse sans borne haute.
         assert days_for("--start", "2026-09-02") == [date(2026, 9, 2)]
 
     def test_the_short_form_counts_backwards(self) -> None:
-        # Ce qu'un ordonnanceur écrit : la date est un paramètre, la
-        # profondeur une constante.
         days = days_for("--date", "2026-09-02", "--days", "3")
         assert days == [date(2026, 8, 31), date(2026, 9, 1), date(2026, 9, 2)]
 
@@ -71,7 +68,6 @@ class TestPeriode:
         assert days_for("--date", "2026-09-02") == [date(2026, 9, 2)]
 
     def test_the_two_forms_are_exclusive(self) -> None:
-        # Les mélanger laisserait deux périodes possibles pour un même appel.
         with pytest.raises(ValueError, match="une seule"):
             days_for("--date", "2026-09-02", "--start", "2026-08-01")
 
@@ -80,9 +76,6 @@ class TestPeriode:
             days_for("--end", "2026-09-02")
 
     def test_an_absent_period_is_refused(self) -> None:
-        # Sans période, il n'y a pas de défaut raisonnable : collecter « tout »
-        # demanderait des mois à la source, collecter « aujourd'hui » serait un
-        # choix que personne n'a exprimé.
         with pytest.raises(ValueError, match="Période absente"):
             days_for()
 
@@ -111,8 +104,6 @@ class TestLimite:
         assert _settings().with_page_size(MAX_PAGE_SIZE).page_size == 1000
 
     def test_beyond_the_bound_is_refused_here_and_not_by_a_422(self) -> None:
-        # Découvrir la borne dans une réponse enverrait chercher la panne du
-        # côté du réseau, après avoir lancé un rattrapage de trois mois.
         with pytest.raises(ValueError, match="1000"):
             _settings().with_page_size(MAX_PAGE_SIZE + 1)
 
@@ -121,8 +112,6 @@ class TestLimite:
             _settings().with_page_size(0)
 
     def test_the_original_settings_are_left_alone(self) -> None:
-        # Les réglages sont figés : une surcharge en rend d'autres, elle n'en
-        # modifie aucun. Deux appels ne peuvent donc pas se marcher dessus.
         settings = _settings()
         settings.with_page_size(500)
         assert settings.page_size == 1000
@@ -143,9 +132,6 @@ class TestIdempotence:
     def test_a_replay_never_overwrites_what_the_etl_deduced(
         self, make_reading
     ) -> None:
-        # `DO UPDATE` recouvrirait `consumption_kw_imputed` et
-        # `imputation_method` d'une ligne déjà transformée : rattraper un
-        # historique défairait la transformation faite depuis.
         frame = to_measures([make_reading("2026-09-02T08:00:00Z")])
         compiled = str(
             build_insert(to_records(frame)).compile(dialect=postgresql.dialect())
@@ -155,8 +141,6 @@ class TestIdempotence:
     def test_a_duplicated_key_within_one_batch_is_settled_first(
         self, make_reading
     ) -> None:
-        # ON CONFLICT arbitre entre le lot et la table, jamais à l'intérieur
-        # d'un même lot : deux fois la même clé ferait échouer l'insertion.
         engine = FakeEngine()
         frame = to_measures(
             [
@@ -175,8 +159,6 @@ class TestVolume:
         assert len(days_for("--date", "2026-09-02", "--days", "2")) == 2
 
     def test_every_site_is_collected_by_default(self) -> None:
-        # Sans `--site`, la liste vient du référentiel : les sept sites sont
-        # collectés sans avoir à les nommer.
         assert parse_args(["--date", "2026-09-02"]).sites is None
 
     def test_the_sites_can_be_narrowed(self) -> None:
@@ -188,8 +170,6 @@ class TestVolume:
     def test_a_two_day_batch_of_seven_sites_is_submitted_whole(
         self, make_reading
     ) -> None:
-        # 7 sites × 48 h à la demi-heure : le lot d'un rattrapage réel passe
-        # en entier, et le compte rendu porte sur ce qui a été soumis.
         readings = [
             make_reading(f"2026-09-0{day}T{hour:02d}:{minute}0:00Z", site_id=site)
             for site in SITES
@@ -256,9 +236,6 @@ class TestBackfillState:
     """Un rattrapage ne doit pas se faire passer pour une collecte vivante."""
 
     def test_a_replayed_day_is_recorded_as_a_backfill(self, make_reading) -> None:
-        # C'est précisément quand le poller est arrêté qu'on rejoue une
-        # journée à la main. Une ligne qui ne dirait pas d'où elle vient
-        # ferait alors paraître l'ingestion fraîche.
         engine = FakeEngine()
         source = _StubSource([make_reading("2026-09-02T07:59:00Z")])
         collect_day(source, engine, 1000, date(2026, 9, 2), ["SITE001"])
@@ -270,8 +247,6 @@ class TestBackfillState:
     def test_a_source_failure_is_recorded_before_it_propagates(
         self, make_reading
     ) -> None:
-        # Le rattrapage s'arrête sur un échec de source, mais ce qu'il savait
-        # à cet instant a plus de valeur écrit que perdu.
         engine = FakeEngine()
         source = _StubSource(
             [make_reading("2026-09-02T07:59:00Z")], failing="SITE002"
@@ -282,19 +257,8 @@ class TestBackfillState:
             )
 
         params = _state_params(engine)
-        # Un succès et un échec : deux formes, donc deux instructions.
         assert len(params) == 2
 
-
-# --- Rattrapage déduit des trous de la base ---------------------------------
-#
-# Le mode du redéploiement : personne ne sait ce qui manque, et demander une
-# période reviendrait à le faire deviner à l'exploitant.
-#
-# La détection porte sur les TROUS et non sur la dernière mesure. C'est la
-# seule chose qui compte sur un serveur où le poller tourne déjà : sa dernière
-# mesure est « maintenant » quelle que soit l'ampleur de ce qui manque
-# derrière, et un repère de reprise ne verrait rien à combler.
 
 TODAY = date(2026, 9, 5)
 
@@ -340,7 +304,6 @@ def test_un_trou_ancien_est_vu_alors_que_le_poller_tourne() -> None:
 
     assert date(2026, 8, 2) in days
     assert date(2026, 9, 3) in days
-    # Le 4 est couvert de bout en bout : il n'a pas à être redemandé.
     assert date(2026, 9, 4) not in days
 
 
@@ -419,13 +382,6 @@ def test_une_periode_explicite_reste_acceptee() -> None:
     check_period_arguments(parse_args(["--start", "2026-08-01"]))
 
 
-# --- Borne haute d'une journée rattrapée ------------------------------------
-#
-# Une journée en cours n'est pas une journée : la moitié n'a pas eu lieu. La
-# source ne le dit pas — elle répond des mesures nulles pour les heures à
-# venir — et le collecteur les écrivait, définitivement.
-
-
 def test_une_journee_passee_est_rattrapee_en_entier() -> None:
     from datetime import UTC, date, datetime
 
@@ -438,11 +394,6 @@ def test_une_journee_passee_est_rattrapee_en_entier() -> None:
 
 
 def test_la_journee_en_cours_s_arrete_a_maintenant() -> None:
-    # Sans cette borne, la source répond des NULS pour les heures à venir, le
-    # collecteur les écrit, et son ON CONFLICT DO NOTHING les rend définitifs.
-    # Le poller collecte ensuite ces minutes pour de vrai et ses valeurs sont
-    # rejetées : la ligne existe déjà, vide. Un rattrapage lancé à 02:30
-    # stérilisait les vingt et une heures suivantes.
     from datetime import UTC, date, datetime
 
     from collector.__main__ import day_window
@@ -454,8 +405,6 @@ def test_la_journee_en_cours_s_arrete_a_maintenant() -> None:
 
 
 def test_une_journee_future_donne_une_fenetre_vide() -> None:
-    # Demander demain n'est pas une erreur — un rattrapage `--days 2` lancé
-    # juste avant minuit y touche — mais il n'y a rien à collecter.
     from datetime import UTC, date, datetime
 
     from collector.__main__ import day_window

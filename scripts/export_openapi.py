@@ -28,8 +28,6 @@ def build_spec() -> dict:
 
 def main(argv: list[str]) -> int:
     payload = json.dumps(build_spec(), indent=2, sort_keys=True, ensure_ascii=False)
-    # Fins de ligne LF forcées : le contrat gelé est comparé par la CI Linux,
-    # une génération Windows en CRLF ferait échouer le diff sans dérive réelle.
     encoded = (payload + "\n").encode("utf-8")
     if len(argv) > 1:
         destination = Path(argv[1])

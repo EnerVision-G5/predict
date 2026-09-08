@@ -27,7 +27,6 @@ KEY = "cle-de-service-de-test-suffisamment-longue"
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """Application montée avec une clé connue, sans lifespan ni registre."""
     monkeypatch.setitem(serving_api.state, "api_key", KEY)
-    # Pas de `with` : le lifespan joindrait MLflow et la source.
     return TestClient(serving_api.app)
 
 

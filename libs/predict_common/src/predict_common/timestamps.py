@@ -35,14 +35,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-# Fuseau prêté aux horodatages nus quand la configuration n'en nomme aucun.
-# Neutre à dessein : sans consigne, le code ne déplace rien et se comporte
-# comme avant ce module. C'est le déploiement qui décrit sa source, dans
-# `conf/base.yaml`.
 DEFAULT_SOURCE_TIMEZONE = "UTC"
 
-# `Z`, `+02:00`, `+0200` ou `-05:00`, en fin de chaîne seulement : l'ancre
-# empêche de prendre les tirets d'une date pour un décalage négatif.
 _OFFSET = re.compile(r"(?:[Zz]|[+-]\d{2}:?\d{2})$")
 
 logger = logging.getLogger(__name__)
@@ -110,9 +104,6 @@ def to_utc(
     if parsed.empty:
         return parsed
 
-    # `utc=True` a déjà localisé les horodatages nus en UTC. Les distinguer
-    # demande donc de regarder la valeur d'origine, seule à savoir ce que la
-    # source avait écrit.
     naive = ~column.map(declares_offset)
     if not naive.any():
         return parsed

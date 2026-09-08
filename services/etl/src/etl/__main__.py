@@ -72,20 +72,11 @@ from predict_common.paths import (
 )
 from predict_common.schemas import TIMESTAMP_COLUMN, features_arrow_schema
 
-# Journées produites quand la ligne de commande n'en demande pas
-# davantage. Une seule : `--date 2026-09-02` reste ce qu'il était, et
-# demander une fenêtre est un geste explicite.
 DEFAULT_DAYS = 1
 
 EXIT_OK = 0
 EXIT_FAILED = 1
 
-# Ce que Postgres répond tant qu'il n'accepte pas encore de connexion : il
-# rejoue son WAL, ou il s'arrête. Au redémarrage du poste, les conteneurs
-# repartent tous ensemble et gagnent la course sur la base de quelques
-# secondes — `depends_on: service_healthy` n'ordonne que `compose up`, pas la
-# relance du démon Docker. Le cycle suivant passera ; laisser la trace du
-# driver ici ferait chercher un bug là où il n'y a qu'un ordre de démarrage.
 DB_WARMUP_MARKERS = (
     "the database system is starting up",
     "the database system is shutting down",
@@ -280,14 +271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config()
         end = parse_date(args.date) if args.date else datetime.now(UTC).date()
         engine = open_engine(config.get_optional_str("database.url"))
-        # Avant tout calcul : une base en retard de migration ferait
-        # échouer le chargement APRÈS avoir produit la journée entière,
-        # sous la forme brute que remonte le driver.
         verify_schema(engine, (mesure, mesure_exclu))
-        # Le rejeu d'une journée déjà produite est sans effet de bord : la
-        # partition est remplacée et l'écriture en base repose les colonnes
-        # déduites. Une fenêtre n'a donc pas à savoir où la précédente s'est
-        # arrêtée.
         for day in lookback_range(end, args.days):
             run(config, engine, day, args.feature_version)
     except (ConfigError, DatabaseError, PathError, CleanError) as exc:
@@ -297,8 +281,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("run interrompu : %s", exc)
         return EXIT_FAILED
     except OperationalError as exc:
-        # La base est joignable ou pas, mais la faute n'est jamais dans le
-        # SQL de la chaîne : une requête fautive lèverait ProgrammingError.
         if is_db_warming_up(exc):
             logger.info("base en attente : elle démarre encore.")
         else:

@@ -72,8 +72,6 @@ def test_a_service_never_imports_another_service(service: str) -> None:
 
 @pytest.mark.parametrize("service", SERVICES)
 def test_a_service_has_at_least_one_entry_point(service: str) -> None:
-    # Chaque service est lançable seul, sans les autres. Un service sans point
-    # d'entrée ne serait qu'une bibliothèque de plus.
     package = ROOT / "services" / service / "src" / service
     entry_points = [package / "__main__.py", package / "api.py"]
     assert any(path.is_file() for path in entry_points), (
@@ -83,8 +81,6 @@ def test_a_service_has_at_least_one_entry_point(service: str) -> None:
 
 @pytest.mark.parametrize("service", SERVICES)
 def test_a_service_declares_no_other_service_as_a_dependency(service: str) -> None:
-    # C'est la vérification qui compte vraiment : elle porte sur ce qui sera
-    # installé dans l'image, et pas seulement sur ce que le code écrit.
     manifest = (ROOT / "services" / service / "pyproject.toml").read_text(
         encoding="utf-8"
     )
@@ -103,8 +99,6 @@ def test_a_service_has_a_dockerfile(service: str) -> None:
 
 
 def test_the_shared_library_knows_no_service() -> None:
-    # `predict_common` est en dessous des services, jamais à côté : une
-    # dépendance vers l'un d'eux inverserait le sens de la pile.
     sources = sorted((ROOT / "libs" / SHARED / "src").rglob("*.py"))
     breaches = {
         path.relative_to(ROOT).as_posix(): sorted(imported_roots(path) & set(SERVICES))
@@ -114,25 +108,6 @@ def test_the_shared_library_knows_no_service() -> None:
 
 
 def test_the_shared_library_carries_only_its_declared_modules() -> None:
-    # Toute fonction qui n'aurait qu'un seul appelant appartient au service qui
-    # l'appelle. Un module de plus ici serait le premier pas du retour au
-    # monolithe : s'il est justifié, ce test se met à jour délibérément.
-    #
-    # `db` a rejoint les quatre premiers le jour où la couche brute est
-    # devenue une table : le collecteur et l'ETL écrivent tous deux `mesure`,
-    # et deux définitions de cette table donneraient deux vérités sur elle.
-    #
-    # `source` les a rejoints le jour où un deuxième service a eu besoin de
-    # parler à l'API Mock : le collecteur en tire les mesures, le service
-    # d'inférence relaie le référentiel et la simulation de pic pour l'API
-    # métier, qui ne connaît pas la source. Deux clients auraient donné deux
-    # façons de lire la même API, et un service ne peut pas importer l'autre.
-    #
-    # `timestamps` les a rejoints le jour où la source a cessé de dater ses
-    # réponses. La règle qui décide dans quel fuseau lire un horodatage nu ne
-    # peut pas vivre dans le collecteur : `source` en a besoin pour ses
-    # réglages, et `source` est ici. Une seconde copie de cette règle, c'est
-    # une mesure et une alerte du même tick datées différemment.
     modules = {
         path.stem
         for path in (ROOT / "libs" / SHARED / "src" / SHARED).glob("*.py")
@@ -150,8 +125,6 @@ def test_the_shared_library_carries_only_its_declared_modules() -> None:
 
 
 def test_every_partition_path_is_built_by_the_shared_module() -> None:
-    # Deux services qui ne construiraient pas le même chemin pour la même
-    # journée ne se parleraient plus. Personne ne compose donc `dt=` à la main.
     offenders: list[str] = []
     for service in SERVICES:
         for path in service_sources(service):
@@ -165,9 +138,6 @@ def test_every_partition_path_is_built_by_the_shared_module() -> None:
 
 
 def test_the_measure_table_is_declared_once() -> None:
-    # Le collecteur et l'ETL écrivent la même table. Deux déclarations
-    # donneraient deux vérités sur `mesure`, ce que le repo enervision-db
-    # interdit précisément en détenant le schéma.
     declared_table = re.compile(r"Table\(\s*[\"'](mesure|mesure_exclu)[\"']")
     declaring = [
         path.relative_to(ROOT).as_posix()
@@ -182,12 +152,6 @@ def test_the_measure_table_is_declared_once() -> None:
 
 
 def test_the_serving_service_never_reaches_the_database() -> None:
-    # Le collecteur écrit les mesures, l'ETL les relit et y repose ce qu'il en
-    # déduit, l'entraînement inscrit dans `modele` la version qu'il promeut.
-    # Le service d'inférence, lui, calcule et rend une réponse : l'archiver
-    # dans `prediction` est le métier de l'API EnerVision. Lui ouvrir la base
-    # ferait d'un service dimensionné pour répondre vite un quatrième
-    # écrivain, et d'une panne de base une panne de prévision.
     reaching = {
         service
         for service in SERVICES
@@ -198,13 +162,6 @@ def test_the_serving_service_never_reaches_the_database() -> None:
 
 
 def test_the_training_service_reaches_the_database_only_to_promote() -> None:
-    # L'entraînement ne lit rien en base : son amont est un ensemble de
-    # partitions. La base ne lui sert qu'à inscrire dans `modele` la version
-    # que l'alias champion désigne, et cette écriture tient dans un seul
-    # module. Le point d'entrée le nomme aussi, parce qu'il ouvre le moteur et
-    # traduit un refus de la base en code de sortie, comme celui de l'ETL. La
-    # voir déborder sur dataset.py ou model.py voudrait dire que
-    # l'apprentissage s'est mis à dépendre de la couche brute.
     touching = {
         path.name
         for path in service_sources("training")

@@ -19,18 +19,8 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
-# En deçà, un écart-type ne décrit rien : deux points suffisent à en produire
-# un, et le service en tirerait une bande dont la largeur serait un hasard.
 MINIMUM_RESIDUALS = 2
 
-# Métrique qui porte les décisions prises sur ces mesures — promouvoir une
-# version, déclarer une dérive. La MAE plutôt que la RMSE : elle s'exprime en
-# kilowatts moyens, ce qui se discute avec un exploitant, là où la RMSE
-# amplifie les grands écarts et se compare mal d'un site à l'autre.
-#
-# Définie ici et non chez ceux qui décident : l'arbitrage et la surveillance
-# tranchent sur la même grandeur, et deux constantes finiraient par diverger
-# le jour où l'une des deux changerait.
 DECISION_METRIC = "mae"
 
 

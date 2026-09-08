@@ -30,18 +30,12 @@ from predict_common.schemas import (
     TIMESTAMP_COLUMN,
 )
 
-# Colonnes de la table `mesure`, dans l'ordre du schéma figé v1.0. L'ordre
-# n'est pas cosmétique : c'est celui dans lequel la sortie annexe vers
-# TimescaleDB écrit ses lignes.
 MEASURE_COLUMNS = (
     TIMESTAMP_COLUMN,
     SITE_COLUMN,
     *NUMERIC_COLUMNS,
     "null_reasons",
     "data_quality",
-    # Signature du passage, posée par `qualify`. Déclarée ici pour qu'un lot
-    # vide la porte aussi : les étages suivants projettent cette liste, et une
-    # colonne absente n'y ferait défaut qu'au moment du chargement.
     QUALITY_SOURCE_COLUMN,
 )
 

@@ -67,8 +67,6 @@ def test_raw_schema_accepts_a_complete_measure() -> None:
 
 
 def test_raw_schema_keeps_a_null_measure() -> None:
-    # Une valeur nulle est un capteur qui dit qu'il est tombé : la refuser à
-    # l'entrée perdrait la panne, qui est l'information à conserver.
     row = raw_row(consumption_kw=None, data_quality="critical")
     validated = MEASURE_SCHEMA.validate(row)
     assert pd.isna(validated.loc[0, "consumption_kw"])
@@ -90,8 +88,6 @@ def test_raw_schema_refuses_a_site_id_the_base_would_truncate() -> None:
 
 
 def test_raw_schema_accepts_a_numpy_array_of_motives() -> None:
-    # C'est sous cette forme que parquet rend une colonne list<string> :
-    # n'accepter que la liste refuserait ce que le producteur a écrit valide.
     frame = raw_row()
     frame["null_reasons"] = [numpy.array(["sensor_failure"], dtype=object)]
     assert len(MEASURE_SCHEMA.validate(frame, lazy=True)) == 1
@@ -103,32 +99,23 @@ def test_raw_schema_refuses_a_lone_motive() -> None:
 
 
 def test_raw_schema_tolerates_a_column_the_source_added() -> None:
-    # Le collecteur projette ce que la table accepte ; une colonne de plus
-    # dans le lot lu n'est pas une rupture de contrat.
     frame = raw_row()
     frame["nouveau_capteur"] = 1.0
     assert len(MEASURE_SCHEMA.validate(frame, lazy=True)) == 1
 
 
 def test_measure_schema_refuses_a_duplicated_key() -> None:
-    # (site_id, ts) est la clé primaire de `mesure` : deux fois la même ferait
-    # échouer l'insertion du lot entier, et pas seulement de sa ligne.
     doubled = pd.concat([raw_row(), raw_row()], ignore_index=True)
     with pytest.raises((SchemaError, SchemaErrors)):
         MEASURE_SCHEMA.validate(doubled, lazy=True)
 
 
 def test_measure_schema_refuses_an_unqualified_measure() -> None:
-    # `NOT NULL DEFAULT 'good'` en base : le schéma figé ne sait pas dire
-    # « non qualifiée ». C'est le collecteur qui retombe sur le défaut, et
-    # l'ETL qui repose la qualification à son passage.
     with pytest.raises((SchemaError, SchemaErrors)):
         MEASURE_SCHEMA.validate(raw_row(data_quality=None), lazy=True)
 
 
 def test_measure_schema_refuses_a_power_factor_out_of_range() -> None:
-    # CHECK (power_factor BETWEEN 0 AND 1) en base : détectée ici, la valeur
-    # aberrante nomme sa ligne ; laissée à PostgreSQL, elle fait échouer le lot.
     with pytest.raises((SchemaError, SchemaErrors)):
         MEASURE_SCHEMA.validate(raw_row(power_factor=1.5), lazy=True)
 
@@ -151,16 +138,12 @@ def test_features_schema_accepts_a_complete_hour() -> None:
 
 
 def test_features_schema_refuses_a_missing_target() -> None:
-    # Une heure sans consommation exploitable n'est pas une ligne
-    # d'apprentissage dégradée : elle n'a pas sa place dans la couche.
     schema = features_schema(LAGS, WINDOW)
     with pytest.raises((SchemaError, SchemaErrors)):
         schema.validate(features_row(consumption_kw=None), lazy=True)
 
 
 def test_features_schema_accepts_a_site_without_a_thermometer() -> None:
-    # XGBoost gère nativement l'absence : exiger la température viderait la
-    # partition d'un site parfaitement exploitable.
     schema = features_schema(LAGS, WINDOW)
     assert len(schema.validate(features_row(temperature_celsius=None))) == 1
 
@@ -186,8 +169,6 @@ def test_features_schema_refuses_a_ratio_outside_zero_one() -> None:
 
 
 def test_features_schema_refuses_a_duplicated_hour() -> None:
-    # (site_id, ts) est la clé naturelle : deux fois la même heure donnerait
-    # deux cibles pour le même instant.
     schema = features_schema(LAGS, WINDOW)
     doubled = pd.concat([features_row(), features_row()], ignore_index=True)
     with pytest.raises((SchemaError, SchemaErrors)):
@@ -195,8 +176,6 @@ def test_features_schema_refuses_a_duplicated_hour() -> None:
 
 
 def test_feature_columns_puts_the_calendar_before_the_lags() -> None:
-    # L'ordre est celui de la signature MLflow : le service d'inférence le
-    # déduit du même appel, ce qui empêche les deux côtés de diverger.
     assert feature_columns(LAGS, WINDOW) == (
         "hour",
         "day_of_week",
@@ -209,16 +188,10 @@ def test_feature_columns_puts_the_calendar_before_the_lags() -> None:
 
 
 def test_the_model_is_not_given_the_temperature() -> None:
-    # Le service ne connaît pas la météo des heures qu'il prédit : il la
-    # présenterait vide à chaque requête, et le modèle aurait appris des
-    # séparations qu'il ne pourrait plus emprunter.
     assert "temperature_celsius" not in feature_columns(LAGS, WINDOW)
 
 
 def test_the_partition_keeps_the_temperature() -> None:
-    # Elle reste une mesure réelle, et servira le jour où une prévision météo
-    # alimentera l'inférence. La sortir de la partition changerait le contrat
-    # de la couche, donc imposerait une feature_version.
     published = published_columns(LAGS, WINDOW)
     assert "temperature_celsius" in published
     assert set(feature_columns(LAGS, WINDOW)) < set(published)
@@ -238,12 +211,9 @@ def test_published_columns_puts_the_calendar_before_the_lags() -> None:
 
 
 def test_changing_the_lags_changes_the_columns() -> None:
-    # C'est pour cela qu'un tel changement s'accompagne d'une feature_version.
     assert feature_columns((1,), WINDOW) != feature_columns(LAGS, WINDOW)
 
 
 def test_the_arrow_schema_carries_every_declared_column() -> None:
-    # Seule la couche des variables est un fichier : la couche brute est une
-    # table, dont les types sont ceux de PostgreSQL.
     arrow = features_arrow_schema(LAGS, WINDOW)
     assert set(arrow.names) == set(features_row().columns)

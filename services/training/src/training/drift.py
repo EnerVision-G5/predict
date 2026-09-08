@@ -61,14 +61,9 @@ from training.model import DECISION_METRIC, evaluate
 
 EXIT_OK = 0
 EXIT_FAILED = 1
-# Distinct de EXIT_FAILED : une dérive est un résultat, pas une panne. Les
-# confondre ferait chercher un problème d'infrastructure là où le modèle a
-# simplement vieilli.
 EXIT_DRIFTED = 2
 
 
-# Les quatre conclusions possibles. Nommées parce qu'elles voyagent : le
-# journal les imprime, MLflow les pose en tag, et le code de sortie en dépend.
 VERDICT_STABLE = "stable"
 VERDICT_DRIFTED = "dérive"
 VERDICT_UNDECIDED = "indécis"
@@ -185,8 +180,6 @@ class DriftReport:
     rows: int
     version: str
     window: str
-    # Le détail par site. Vide quand la partition n'en porte pas la colonne,
-    # ce qui n'empêche pas la mesure d'ensemble d'exister.
     sites: tuple[SiteMeasure, ...] = ()
 
     @property
@@ -358,8 +351,6 @@ def publish(report: DriftReport, settings: DriftSettings, feature_version: str) 
         )
         mlflow.log_metrics(report.metrics)
         for name, value in report.baseline.items():
-            # Préfixées : sans cela, la référence et la mesure porteraient le
-            # même nom et l'une écraserait l'autre dans le même run.
             mlflow.log_metric(f"baseline_{name}", value)
         ratio = report.ratio
         if ratio is not None:

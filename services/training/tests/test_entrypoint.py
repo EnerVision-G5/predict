@@ -33,14 +33,10 @@ class TestCandidateParams:
     """Le challenge énumère les familles, le modèle ordinaire en tête."""
 
     def test_the_registered_family_comes_first(self) -> None:
-        # C'est celui que l'entraînement ordinaire enregistre : le voir en
-        # tête du classement est ce qui rend la lecture immédiate.
         first, _ = next(iter(candidate_params(config_for())))
         assert first == DEFAULT_LEARNER
 
     def test_its_hyperparameters_come_from_training_params(self) -> None:
-        # Les écrire aussi dans training.candidates les ferait diverger : le
-        # challenge classerait alors un modèle que personne n'enregistre.
         _, params = next(iter(candidate_params(config_for())))
         assert params["n_estimators"] == 120
 
@@ -67,9 +63,6 @@ class TestEnforce:
         assert "promotion acceptée" in caplog.text
 
     def test_a_refusal_stops_everything(self) -> None:
-        # L'exception et non un code de retour : la promotion est faite d'un
-        # alias puis d'une écriture en base, et il ne doit rester aucun chemin
-        # par lequel la première aurait lieu après un refus.
         with pytest.raises(PromotionRefused, match="dégradation"):
             enforce(Verdict(accepted=False, reason="dégradation"), force=False)
 

@@ -73,8 +73,6 @@ def test_an_outage_inside_a_series_keeps_its_raw_null(make_raw, make_reading) ->
 
 
 def test_an_outage_inside_a_series_is_not_excluded(make_raw, make_reading) -> None:
-    # La mesure porte une valeur exploitable et dit d'où elle vient : l'écarter
-    # des agrégats reviendrait à jeter ce qu'on vient de reconstruire.
     frame = ingest(
         make_raw,
         [
@@ -109,8 +107,6 @@ def test_an_outage_without_a_past_is_filed_with_its_cause(
 
 
 def test_an_unfiled_outage_still_reaches_the_base_raw(make_raw, make_reading) -> None:
-    # L'exclusion range la mesure, elle ne la remplace pas : la ligne brute est
-    # chargée dans `mesure` avec sa cause, panne comprise.
     frame = ingest(make_raw, [outage(make_reading, 8)])
     record = to_records(frame)[0]
     assert record["consumption_kw"] is None

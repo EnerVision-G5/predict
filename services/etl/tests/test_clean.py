@@ -17,7 +17,6 @@ def test_to_measures_returns_the_measure_columns_on_an_empty_batch(
 
 
 def test_to_measures_renames_timestamp_to_ts(make_raw, make_reading) -> None:
-    # Une seule frontière de renommage dans toute la chaîne, et c'est celle-ci.
     frame = to_measures(make_raw([make_reading("2026-09-02T08:00:00Z")]))
     assert "ts" in frame.columns
     assert "timestamp" not in frame.columns
@@ -58,8 +57,6 @@ def test_to_measures_normalizes_null_reasons_to_a_list(
 def test_to_measures_accepts_the_array_parquet_returns(
     make_raw, make_reading
 ) -> None:
-    # Une colonne list<string> relue par pyarrow est un tableau numpy, pas une
-    # liste : la refuser refuserait ce que le collecteur a écrit valide.
     import numpy
 
     raw = make_raw([make_reading("2026-09-02T08:00:00Z")])
@@ -76,8 +73,6 @@ def test_to_measures_rejects_a_partition_without_the_key(make_raw) -> None:
 def test_deduplicate_keeps_the_last_row_of_a_duplicated_key(
     make_raw, make_reading
 ) -> None:
-    # Le rattrapage et le poller écrivent la même journée : la même minute
-    # peut donc arriver deux fois, et /readings fait autorité.
     frame = to_measures(
         make_raw(
             [

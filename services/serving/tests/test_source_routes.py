@@ -129,15 +129,11 @@ def test_le_referentiel_est_relaye_tel_que_la_source_le_sert(client) -> None:
     assert response.status_code == 200
     body = response.json()
     assert [site["site_id"] for site in body] == ["SITE001", SITE]
-    # Relayé, pas traduit : les noms de champs restent ceux de la source, et
-    # c'est l'API métier qui décide d'en faire un référentiel en base.
     assert body[1]["capacity_kw"] == 1000
     assert body[1]["site_name"] == "Usine Lyon Vénissieux"
 
 
 def test_une_source_muette_donne_502_et_non_503(client) -> None:
-    # 503 dirait que le service d'inférence est tombé, et l'exploitant
-    # chercherait la panne du mauvais côté : c'est la source qui est muette.
     def broken(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"detail": "source en carafe"})
 
@@ -158,8 +154,6 @@ def test_un_pic_rend_la_confirmation_et_la_mesure_qui_suit(client) -> None:
     assert body["site_id"] == SITE
     assert body["status"] == "simulated"
     assert body["duration_minutes"] == 60
-    # La confirmation seule ne prouve rien à qui regarde un dashboard : c'est
-    # la mesure relue qui montre le pic.
     assert body["reading"]["consumption_kw"] == 812.5
     assert body["reading"]["data_quality"] == "good"
 
@@ -180,8 +174,6 @@ def test_un_pic_declenche_reste_un_succes_si_la_relecture_echoue(client) -> None
 
 
 def test_une_duree_hors_bornes_est_refusee_avant_le_reseau(client) -> None:
-    # La source répondrait 422 elle-même, mais l'appel serait parti : une
-    # borne tenue ici évite de la solliciter pour rien.
     calls: list[str] = []
 
     def counting(request: httpx.Request) -> httpx.Response:
@@ -198,7 +190,6 @@ def test_une_duree_hors_bornes_est_refusee_avant_le_reseau(client) -> None:
 
 
 def test_un_service_sans_source_le_dit_en_503(monkeypatch) -> None:
-    # Ici le service EST en cause : il n'a pas terminé son démarrage.
     monkeypatch.setattr(api, "configure", lambda: None)
     api.state["source"] = None
     with TestClient(api.app) as http:
@@ -240,7 +231,6 @@ def test_un_site_id_porteur_de_query_est_refuse_avant_tout_appel(client) -> None
     assert injected.status_code == 422
     assert truncated.status_code == 422
     assert "site_id" in injected.json()["detail"]
-    # Le point du test : rien n'est parti vers la source.
     assert seen == []
 
 

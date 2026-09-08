@@ -25,8 +25,6 @@ import pandas as pd
 from etl.impute import IMPUTED_COLUMN, SOURCE_COLUMN
 from predict_common.schemas import SITE_COLUMN, TIMESTAMP_COLUMN
 
-# Cause retenue quand la source n'a fourni aucun motif. Elle ne prétend pas
-# expliquer la panne, seulement dire ce que l'ETL a constaté.
 DEFAULT_REASON = "valeur nulle non imputable"
 
 EXCLUSION_COLUMNS = (SITE_COLUMN, TIMESTAMP_COLUMN, "raison")

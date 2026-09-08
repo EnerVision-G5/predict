@@ -61,9 +61,6 @@ class TestLearner:
         assert learner(DEFAULT_LEARNER).name == DEFAULT_LEARNER
 
     def test_only_the_boosted_model_consumes_the_validation(self) -> None:
-        # L'arrêt anticipé est la seule raison de montrer la validation à un
-        # candidat : la donner aux autres serait leur laisser voir des heures
-        # qu'ils n'apprennent pas.
         assert learner(DEFAULT_LEARNER).uses_validation
         assert not learner("ridge").uses_validation
 
@@ -82,10 +79,6 @@ def test_every_family_learns_the_signal(name: str) -> None:
 
 @pytest.mark.parametrize("name", sorted(LEARNERS))
 def test_every_family_tolerates_a_missing_lag(name: str) -> None:
-    # Les premières heures d'un historique n'ont pas de décalage à 168 h.
-    # XGBoost les traite nativement, scikit-learn lève : sans l'imputation du
-    # pipeline, le classement dirait « erreur » là où il doit dire « moins
-    # bon ».
     features, target = learnable()
     features.loc[:9, "lag_24h"] = np.nan
     assert fit_named(name, features, target).predict(features) is not None

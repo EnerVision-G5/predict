@@ -66,13 +66,8 @@ import httpx
 from predict_common.config import Config
 from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
-# Plafond de `limit` imposé par la source : au-delà, elle répond 422. Le
-# refuser ici plutôt que de le découvrir en réponse évite de partir sur un
-# rattrapage de trois mois qui échouera à la première page.
 MAX_PAGE_SIZE = 1000
 
-# Bornes de `duration_minutes` déclarées par la source pour la simulation de
-# pic. Hors de cet intervalle elle répond 422.
 MIN_SPIKE_MINUTES = 1
 MAX_SPIKE_MINUTES = 240
 DEFAULT_SPIKE_MINUTES = 30
@@ -132,10 +127,6 @@ class SourceSettings:
     retries: int
     backoff_s: float
     rate_limit_rps: float
-    # Fuseau des horodatages que la source envoie sans le leur. Il décrit la
-    # source, pas une préférence d'affichage : `/current` sert l'heure locale
-    # de sa machine depuis le 8 septembre 2026, et rien dans la réponse ne le
-    # dit. Voir `predict_common.timestamps`.
     timezone: str = DEFAULT_SOURCE_TIMEZONE
 
     def with_page_size(self, page_size: int) -> SourceSettings:
@@ -247,8 +238,6 @@ class SourceClient:
             window_end = min(cursor + span, end_time)
             minutes = _minutes_between(cursor, window_end)
             if minutes < 1:
-                # Reliquat de moins d'une minute : la source ne sait pas le
-                # servir, et `limit=0` lui vaudrait un 422.
                 return
             payload = self._get_json(
                 path,
@@ -262,11 +251,6 @@ class SourceClient:
             )
             items = _as_readings(payload, path)
             if len(items) < minutes:
-                # La source rend normalement autant de résultats que demandé.
-                # En rendre moins n'est pas fatal — la journée sera simplement
-                # trouée — mais doit se voir, sans quoi un changement de
-                # comportement de la source produirait une série amputée que
-                # seul un compte en aval finirait par trahir.
                 logger.warning(
                     "site %s : %d mesure(s) reçue(s) pour %d minute(s)"
                     " demandée(s) à partir de %s",

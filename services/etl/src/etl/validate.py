@@ -30,9 +30,6 @@ from pandera.errors import SchemaError, SchemaErrors
 from etl.features import FeatureSpec
 from predict_common.schemas import MEASURE_SCHEMA, features_schema
 
-# Nombre de violations détaillées dans le message d'erreur. Au-delà, la liste
-# devient illisible dans un journal de conteneur et le compte total suffit à
-# dire l'ampleur du problème.
 REPORTED_FAILURES = 10
 
 logger = logging.getLogger(__name__)

@@ -37,10 +37,6 @@ from dataclasses import dataclass
 from training.arbitration import BenchResult
 from training.model import DECISION_METRIC
 
-# Ce que le candidat doit dépasser, en proportion de l'erreur du champion. 0
-# tolère l'égalité et refuse toute dégradation. Une marge positive assume du
-# bruit de mesure ; une marge négative exigerait un gain minimal pour
-# justifier le changement.
 DEFAULT_MARGIN = 0.0
 
 

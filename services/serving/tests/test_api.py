@@ -111,8 +111,6 @@ def client(serving_root: Path, monkeypatch):
                 rolling_window_h=WINDOW,
                 lookback_days=3,
             )
-            # Explicite : sans cela, l'état du processus garderait la source
-            # d'un autre fichier de tests, et l'arrêt la refermerait deux fois.
             api.state["source"] = None
 
         monkeypatch.setattr(api, "configure", configure)
@@ -122,8 +120,6 @@ def client(serving_root: Path, monkeypatch):
 
 
 def test_health_answers_without_any_dependency(client) -> None:
-    # La lier à MLflow ferait redémarrer un service en parfait état chaque
-    # fois que le registre tousse.
     with client() as http:
         response = http.get("/health")
     assert response.status_code == 200
@@ -140,7 +136,6 @@ def test_predict_returns_the_requested_horizon(client) -> None:
 
 
 def test_the_answer_names_the_model_that_produced_it(client) -> None:
-    # Sans elle, une prévision aberrante ne serait imputable à rien.
     with client() as http:
         response = http.post("/api/v1/predict", json={"site_id": "SITE001"})
     assert response.json()["model_version"] == "3"
@@ -156,8 +151,6 @@ def test_the_points_follow_one_another_in_time(client) -> None:
 
 
 def test_a_version_without_a_spread_serves_null_bounds(client) -> None:
-    # Le contrat les prévoit optionnelles : une version qui ne déclare pas la
-    # dispersion de son erreur sert une prévision nue, pas une bande inventée.
     with client() as http:
         response = http.post("/api/v1/predict", json={"site_id": "SITE001"})
     point = response.json()["points"][0]
@@ -174,8 +167,6 @@ def test_the_bounds_frame_the_prediction(client) -> None:
 
 
 def test_the_bounds_widen_with_the_horizon(client) -> None:
-    # L'erreur s'accumule à chaque pas de la récurrence : une bande constante
-    # sur 24 heures annoncerait la 24e aussi sûre que la première.
     with client(model=StubModel(residual_std=2.0)) as http:
         response = http.post(
             "/api/v1/predict", json={"site_id": "SITE001", "horizon_hours": 6}
@@ -196,9 +187,6 @@ def test_an_unknown_site_is_a_404(client) -> None:
 
 
 def test_an_empty_registry_is_a_503(client) -> None:
-    # 503 et non 404 : la panne est chez MLflow, pas dans la requête. Confondre
-    # les deux enverrait les exploitants chercher du côté du référentiel des
-    # sites une panne qui est celle du registre.
     with client(served=False) as http:
         response = http.post("/api/v1/predict", json={"site_id": "SITE001"})
     assert response.status_code == 503
@@ -221,8 +209,6 @@ def test_a_request_without_a_site_is_a_422(client) -> None:
 
 
 def test_a_validation_error_uses_the_shared_model(client) -> None:
-    # `detail` est une chaîne, jamais la liste du HTTPValidationError de
-    # FastAPI : c'est ce que le contrat gelé annonce aux consommateurs.
     with client() as http:
         response = http.post("/api/v1/predict", json={})
     assert isinstance(response.json()["detail"], str)
@@ -241,8 +227,6 @@ class TestSurQuoiLaPrevisionSAppuie:
             body = http.post(
                 "/api/v1/predict", json={"site_id": "SITE001", "horizon_hours": 2}
             ).json()
-        # La dernière heure publiée est celle qui précède le premier point
-        # prédit : la récurrence part de là.
         assert body["history_end"] < body["points"][0]["timestamp"]
 
     def test_the_feature_lag_is_the_gap_to_the_answer(self, client) -> None:
@@ -256,9 +240,6 @@ class TestSurQuoiLaPrevisionSAppuie:
         assert body["feature_lag_hours"] == pytest.approx(expected)
 
     def test_a_clock_ahead_of_the_features_is_not_hidden(self) -> None:
-        # Un écart négatif signale une partition en avance sur l'horloge du
-        # service. Le ramener à zéro ferait passer un problème de fuseau pour
-        # une prévision fraîche.
         generated = datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
         history_end = datetime(2026, 9, 2, 10, 0, tzinfo=UTC)
         assert api.feature_lag_hours(generated, history_end) == pytest.approx(-2.0)
@@ -276,12 +257,8 @@ class TestReadiness:
         assert body["detail"] == ""
 
     def test_an_empty_registry_is_named(self, client) -> None:
-        # C'est le cas courant tant qu'aucun modèle n'est promu, et celui que
-        # l'API métier doit pouvoir expliquer à ses utilisateurs.
         with client(served=False) as http:
             response = http.get("/ready")
-        # 200 et non 503 : un 503 ferait de cette route une seconde sonde, et
-        # l'hébergeur redémarrerait le service à chaque hoquet de MLflow.
         assert response.status_code == 200
         body = response.json()
         assert body["ready"] is False

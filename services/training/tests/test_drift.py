@@ -99,9 +99,6 @@ class TestVerdict:
         assert report(mae=11.0).verdict(SETTINGS) == "stable"
 
     def test_the_threshold_itself_is_not_a_drift(self) -> None:
-        # Strictement supérieur : un modèle qui tient exactement le seuil n'a
-        # pas dérivé, il est à la limite. Alerter là-dessus rendrait le seuil
-        # impossible à régler.
         assert report(mae=15.0).ratio == pytest.approx(1.5)
         assert report(mae=15.0).verdict(SETTINGS) == "stable"
 
@@ -109,13 +106,9 @@ class TestVerdict:
         assert report(mae=16.0).verdict(SETTINGS) == "dérive"
 
     def test_an_error_smaller_than_the_baseline_is_stable(self) -> None:
-        # Un modèle qui fait mieux que son test n'est pas une anomalie : la
-        # semaine évaluée était plus facile, c'est tout.
         assert report(mae=4.0).verdict(SETTINGS) == "stable"
 
     def test_the_ratio_is_relative_and_not_absolute(self) -> None:
-        # 20 kW d'écart sur un bureau de 200 kW et sur une usine de 1000 ne
-        # disent pas la même chose : c'est tout l'objet du rapport.
         petit = report(mae=20.0, baseline_mae=5.0)
         grand = report(mae=20.0, baseline_mae=40.0)
         assert petit.verdict(SETTINGS) == "dérive"
@@ -126,15 +119,12 @@ class TestQuandOnNePeutPasConclure:
     """Se taire est une réponse, mais elle doit être dite."""
 
     def test_too_few_hours_gives_no_verdict(self) -> None:
-        # Une poignée d'heures suffit à faire dire n'importe quoi à une
-        # moyenne : mieux vaut l'avouer qu'alerter au hasard.
         assert report(mae=100.0, rows=5).verdict(SETTINGS) == "indécis"
 
     def test_the_minimum_is_inclusive(self) -> None:
         assert report(mae=11.0, rows=SETTINGS.min_rows).verdict(SETTINGS) == "stable"
 
     def test_without_a_baseline_there_is_no_ratio(self) -> None:
-        # Inventer un rapport de 1 laisserait croire que tout va bien.
         assert report(mae=50.0, baseline_mae=None).ratio is None
 
     def test_without_a_baseline_the_verdict_says_so(self) -> None:
@@ -142,7 +132,6 @@ class TestQuandOnNePeutPasConclure:
         assert sans.verdict(SETTINGS) == "sans référence"
 
     def test_a_null_baseline_is_treated_as_absent(self) -> None:
-        # Diviser par zéro donnerait un infini, donc une alerte permanente.
         assert report(mae=1.0, baseline_mae=0.0).ratio is None
 
 
@@ -159,9 +148,6 @@ class TestMesure:
         assert measure(Parfait(), frame, COLUMNS)[DECISION_METRIC] == 0.0
 
     def test_the_model_only_sees_the_declared_columns(self) -> None:
-        # Les décalages viennent des mesures réelles : c'est ce qui rend la
-        # mesure comparable à celle de l'entraînement, et non à l'erreur
-        # cumulée du service sur 48 heures.
         frame = _features(48)
         vues: list[list[str]] = []
 
@@ -190,8 +176,6 @@ class TestCodesDeSortie:
     """Un ordonnanceur décide sur le code, pas sur le journal."""
 
     def test_a_drift_is_not_a_failure(self) -> None:
-        # Les confondre ferait chercher un problème d'infrastructure là où le
-        # modèle a simplement vieilli.
         assert EXIT_DRIFTED != EXIT_OK
         assert EXIT_DRIFTED == 2
 
@@ -212,8 +196,6 @@ class TestCodesDeSortie:
         )
         settings = DriftSettings.from_config(config)
         assert settings.alert_ratio == 1.5
-        # C'est le modèle SERVI qui est surveillé, pas le dernier entraîné :
-        # surveiller un challenger que personne n'utilise ne dirait rien.
         assert settings.alias == "champion"
 
 
@@ -239,8 +221,6 @@ def _features(hours: int) -> pd.DataFrame:
 
 
 def test_the_default_window_is_a_week() -> None:
-    # Assez pour que l'erreur ne dépende pas d'une journée atypique, assez
-    # court pour qu'une dérive installée depuis trois jours se voie encore.
     assert SETTINGS.window_days == 7
     first, last = window(None, None, SETTINGS.window_days)
     assert last - first == timedelta(days=6)
@@ -272,16 +252,12 @@ class TestDecoupageParSite:
         sites = measure_sites(Constant(), frame, COLUMNS)
         assert [site.site_id for site in sites] == ["SITE001", "SITE002"]
         assert [site.rows for site in sites] == [48, 48]
-        # Le site dix fois plus gros porte une erreur dix fois plus grande :
-        # c'est exactement ce que la moyenne d'ensemble confondait.
         petit, grand = sites
         assert grand.metrics[DECISION_METRIC] == pytest.approx(
             petit.metrics[DECISION_METRIC] * 10
         )
 
     def test_a_partition_without_sites_still_measures_the_whole(self) -> None:
-        # Une mesure d'ensemble reste valable sans détail : l'absence de
-        # colonne n'est pas une raison de ne rien mesurer.
         frame = _features(48).drop(columns=["site_id"])
 
         class Constant:
@@ -291,8 +267,6 @@ class TestDecoupageParSite:
         assert measure_sites(Constant(), frame, COLUMNS) == ()
 
     def test_a_single_drifting_site_is_named(self) -> None:
-        # La raison d'être de la découpe : un petit site qui double son erreur
-        # disparaît dans la moyenne d'une usine dix fois plus grande.
         rapport = DriftReport(
             metrics={"mae": 10.0},
             baseline={"mae": 10.0},
@@ -308,8 +282,6 @@ class TestDecoupageParSite:
         assert rapport.drifted_sites(SETTINGS) == ("SITE001",)
 
     def test_a_site_with_too_few_hours_gives_no_verdict(self) -> None:
-        # Sans une journée entière, le cycle jour/nuit décide seul de la
-        # moyenne du site.
         court = SiteMeasure("SITE001", {"mae": 100.0}, rows=3)
         assert court.verdict(SETTINGS, {"mae": 10.0}) == VERDICT_UNDECIDED
 

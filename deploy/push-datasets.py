@@ -35,16 +35,9 @@ import pyarrow.fs
 from predict_common import io
 from predict_common.paths import join
 
-# Ce qui part par défaut. Les sept fichiers par site suffisent au collecteur :
-# `all_sites_combined.csv` porte exactement les mêmes lignes pour 11 Mo de
-# plus, et les métadonnées décrivent le jeu pour un lecteur humain. Les
-# envoyer se demande explicitement, avec --tout.
 SITE_PATTERN = "SITE*.csv"
 ALL_PATTERN = "*"
 
-# Taille des blocs de transfert. Un fichier par site fait 1,7 Mo : le lire
-# d'un bloc tiendrait en mémoire, mais rien ne garantit que le jeu de données
-# gardera cette taille, et un flux borné ne coûte rien à écrire.
 CHUNK_BYTES = 1 << 20
 
 EXIT_OK = 0
@@ -139,8 +132,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     pattern = ALL_PATTERN if args.everything else SITE_PATTERN
     try:
         total = push(args.root, args.destination, pattern)
-    # FileNotFoundError, que lève une source muette, dérive d'OSError : la
-    # nommer en plus ne couvrirait rien de neuf.
     except (OSError, io.StorageError) as exc:
         logger.error("envoi impossible : %s", exc)
         return EXIT_FAILED

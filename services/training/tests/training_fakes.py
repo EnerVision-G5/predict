@@ -11,7 +11,6 @@ trois `FakeEngine` ne sont pas interchangeables.
 
 Chacun passait donc seul, et lancer la suite entière en donnait neuf en
 échec, sur une erreur qui ne nommait pas la cause :
-
     TypeError: FakeEngine.__init__() got an unexpected keyword argument 'rows'
 
 Un nom de module unique par service supprime la collision à sa racine. Les

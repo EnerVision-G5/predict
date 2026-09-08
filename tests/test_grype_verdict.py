@@ -72,9 +72,6 @@ class TestVerdict:
         assert verdict.main(["", str(path)]) == 1
 
     def test_a_high_does_not_block(self, tmp_path: Path, capsys) -> None:
-        # Le verrou porte des failles hautes sans correctif publié : les rendre
-        # bloquantes laisserait la CI rouge en permanence, sans qu'aucune PR ne
-        # puisse y remédier — et une porte toujours rouge est contournée.
         path = report(tmp_path, [match("High"), match("Medium"), match("Low")])
         assert verdict.main(["", str(path)]) == 0
 
@@ -85,7 +82,6 @@ class TestVerdict:
         assert verdict.main(["", str(path)]) == 1
 
     def test_a_missing_report_is_not_a_silent_pass(self, tmp_path: Path) -> None:
-        # Un scan qui n'a rien écrit n'est pas un scan qui n'a rien trouvé.
         with pytest.raises(SystemExit):
             verdict.main(["", str(tmp_path / "absent.json")])
 
@@ -133,11 +129,9 @@ class TestFixedIn:
         )
 
     def test_no_fix_is_a_dash_not_an_empty_string(self) -> None:
-        # Une chaîne vide dans le tableau se lirait comme une colonne oubliée.
         assert verdict.fixed_in({"fix": {"versions": []}}) == "—"
 
     def test_an_absent_fix_key_is_tolerated(self) -> None:
-        # Grype omet la clé quand aucun correctif n'est connu de sa base.
         assert verdict.fixed_in({}) == "—"
 
 
@@ -156,8 +150,6 @@ class TestPublish:
         assert "ajouté" in content
 
     def test_without_the_variable_it_prints(self, monkeypatch, capsys) -> None:
-        # C'est ce qui rend le script rejouable sur un poste, sur un rapport
-        # déjà produit, sans reproduire l'environnement du runner.
         monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
         verdict.publish(["sur la sortie standard"])
         assert "sur la sortie standard" in capsys.readouterr().out
@@ -171,7 +163,6 @@ class TestAnnotate:
         assert capsys.readouterr().out.count("::warning") == 2
 
     def test_lesser_findings_are_not(self, capsys) -> None:
-        # Annoter les moyennes noierait les hautes, que personne ne lirait plus.
         verdict.annotate([match("Medium"), match("Low")])
         assert capsys.readouterr().out == ""
 
