@@ -239,3 +239,16 @@ class TestBuild:
         assert set(features["site_id"]) == {"SITE001", "SITE002"}
         # Aucune heure ne doit être dupliquée : (site_id, ts) est la clé.
         assert not features.duplicated(subset=["site_id", "ts"]).any()
+
+
+def test_build_says_which_lag_emptied_the_day(caplog) -> None:
+    # Une journée sort vide dès que la collecte est plus jeune que le plus
+    # long décalage. Sans ce message, la cause se cherche pendant des jours :
+    # aucune erreur n'est levée, la partition est simplement vide.
+    spec = FeatureSpec(version="v1", resample_rule="1h", lag_hours=(1, 168),
+                       rolling_window_h=24)
+    jeune = measures(72, start="2026-09-06T00:00:00Z")
+    with caplog.at_level("WARNING"):
+        assert build(jeune, spec, DAY).empty
+    assert "lag_168h absent sur" in caplog.text
+

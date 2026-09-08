@@ -121,9 +121,37 @@ def transform(
     return measures, check_features(features, spec)
 
 
-def publish(features: pd.DataFrame, root: str, spec: FeatureSpec, day: date) -> str:
-    """Écrit la partition de variables, en remplaçant celle qui existait."""
+def publish(
+    features: pd.DataFrame,
+    root: str,
+    spec: FeatureSpec,
+    day: date,
+) -> str | None:
+    """Écrit la partition de variables, sauf si cela revenait à en effacer une.
+
+    Une partition vide se publie : une journée sans heure exploitable existe,
+    et le dire vaut mieux que laisser un trou qu'on ne saurait distinguer
+    d'une journée jamais traitée.
+
+    Mais l'écriture REMPLACE la partition cible. Un run qui ne produit rien
+    par accident de fenêtre — la collecte trop jeune pour que `lag_168h`
+    désigne quelque chose, la source muette pendant un cycle — effacerait
+    alors des variables qu'aucun autre traitement ne régénère à cette date,
+    et la chaîne aval n'aurait plus rien à lire sans qu'une seule erreur ait
+    été levée. Entre les deux, on garde ce qui existe.
+
+    Rend `None` quand rien n'a été écrit, pour que l'appelant ne journalise
+    pas une publication qui n'a pas eu lieu.
+    """
     partition = features_partition(root, spec.version, day)
+    if features.empty and io.exists(partition):
+        logger.warning(
+            "%s laissée en place : ce run n'a produit aucune heure, et la"
+            " remplacer par une partition vide effacerait des variables que"
+            " rien ne reproduit à cette date.",
+            partition,
+        )
+        return None
     io.write_frame(
         features,
         partition,
@@ -154,12 +182,13 @@ def run(config: Config, engine: Engine, day: date, version: str | None) -> int:
     )
 
     partition = publish(features, root, spec, day)
-    logger.info(
-        "%s : %d heure(s) publiée(s) pour %d site(s)",
-        partition,
-        len(features),
-        features["site_id"].nunique() if not features.empty else 0,
-    )
+    if partition is not None:
+        logger.info(
+            "%s : %d heure(s) publiée(s) pour %d site(s)",
+            partition,
+            len(features),
+            features["site_id"].nunique() if not features.empty else 0,
+        )
     return len(features)
 
 
