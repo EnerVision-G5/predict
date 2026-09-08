@@ -46,7 +46,7 @@ from datetime import UTC, date, datetime
 
 import pandas as pd
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from etl.clean import CleanError, deduplicate, to_measures
 from etl.exclude import keep_usable
@@ -79,6 +79,19 @@ DEFAULT_DAYS = 1
 
 EXIT_OK = 0
 EXIT_FAILED = 1
+
+# Ce que Postgres répond tant qu'il n'accepte pas encore de connexion : il
+# rejoue son WAL, ou il s'arrête. Au redémarrage du poste, les conteneurs
+# repartent tous ensemble et gagnent la course sur la base de quelques
+# secondes — `depends_on: service_healthy` n'ordonne que `compose up`, pas la
+# relance du démon Docker. Le cycle suivant passera ; laisser la trace du
+# driver ici ferait chercher un bug là où il n'y a qu'un ordre de démarrage.
+DB_WARMUP_MARKERS = (
+    "the database system is starting up",
+    "the database system is shutting down",
+    "the database system is in recovery mode",
+    "the database system is not yet accepting connections",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +225,23 @@ def _configure_logging() -> None:
     )
 
 
+def is_db_warming_up(error: BaseException) -> bool:
+    """Dit si la base refuse la connexion parce qu'elle démarre encore."""
+    message = str(error).lower()
+    return any(marker in message for marker in DB_WARMUP_MARKERS)
+
+
+def db_error_line(error: BaseException) -> str:
+    """Réduit une erreur de driver à sa raison, en une ligne.
+
+    SQLAlchemy ajoute à `str()` un lien vers sa documentation et psycopg
+    déroule l'adresse et le port : quatre lignes pour une boucle horaire qui
+    n'a besoin que de savoir pourquoi elle n'a pas pu écrire.
+    """
+    lines = str(getattr(error, "orig", None) or error).strip().splitlines()
+    return lines[0].strip() if lines else type(error).__name__
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Point d'entrée du conteneur ETL."""
     _configure_logging()
@@ -237,8 +267,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ContractError, LoadError) as exc:
         logger.error("run interrompu : %s", exc)
         return EXIT_FAILED
+    except OperationalError as exc:
+        # La base est joignable ou pas, mais la faute n'est jamais dans le
+        # SQL de la chaîne : une requête fautive lèverait ProgrammingError.
+        if is_db_warming_up(exc):
+            logger.info("base en attente : elle démarre encore.")
+        else:
+            logger.error("base injoignable : %s", db_error_line(exc))
+        return EXIT_FAILED
     except SQLAlchemyError as exc:
-        logger.error("base inaccessible ou refusant l'écriture : %s", exc)
+        logger.error("base refusant l'écriture : %s", db_error_line(exc))
         return EXIT_FAILED
     except io.StorageError as exc:
         logger.error("stockage des variables inaccessible : %s", exc)
