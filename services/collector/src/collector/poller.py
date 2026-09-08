@@ -47,7 +47,7 @@ import signal
 import sys
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import FrameType
 
@@ -87,6 +87,7 @@ from predict_common.db import (
 )
 from predict_common.schemas import TIMESTAMP_COLUMN
 from predict_common.source import SourceClient, SourceError, SourceSettings
+from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
 # Le démarrage n'a pas le luxe d'attendre le tick suivant : sans référentiel
 # des sites, il n'y a rien à interroger. On insiste donc plus longuement
@@ -111,6 +112,11 @@ class PollSettings:
     interval_s: float
     lag_warning_s: float
     batch_size: int
+    # Fuseau prêté aux horodatages que la source envoie sans le leur. Il est
+    # lu du bloc `source`, qui le décrit, mais il est porté ici : la boucle en
+    # a besoin à chaque tick, et l'aller chercher dans le client ferait
+    # dépendre l'écriture de la façon dont la lecture est branchée.
+    source_timezone: str = DEFAULT_SOURCE_TIMEZONE
 
     @classmethod
     def from_config(cls, config: Config) -> PollSettings:
@@ -119,6 +125,9 @@ class PollSettings:
             interval_s=config.get_float("collector.poll_interval_s"),
             lag_warning_s=config.get_float("collector.lag_warning_s"),
             batch_size=config.get_int("database.batch_size"),
+            source_timezone=config.get_str(
+                "source.timezone", DEFAULT_SOURCE_TIMEZONE
+            ),
         )
 
 
@@ -220,7 +229,7 @@ def poll_site(context: PollContext, site_id: str, now: datetime) -> SiteTick:
     """
     settings = context.settings
     records = context.client.fetch_current(site_id)
-    frame = to_measures(records)
+    frame = to_measures(records, context.settings.source_timezone)
     report = write(context.engine, frame, settings.batch_size)
     lag_s = ingestion_lag_s(frame, now)
     _log_site(
@@ -340,7 +349,12 @@ def collect_side_channels(context: PollContext) -> None:
     """
     batch_size = context.settings.batch_size
     try:
-        write_alerts(context.engine, context.client.fetch_alerts(), batch_size)
+        write_alerts(
+            context.engine,
+            context.client.fetch_alerts(),
+            batch_size,
+            context.settings.source_timezone,
+        )
     except Exception as exc:  # noqa: BLE001 - annexe : rien ne doit remonter
         logger.warning("alertes non collectées : %s", exc)
     try:
@@ -356,9 +370,10 @@ def _collect_sensors(context: PollContext, batch_size: int) -> None:
     débuts et les fins de panne, la source ne servant qu'un présent.
     """
     payload = context.client.fetch_sensors_status()
-    states = to_sensor_states(payload)
+    timezone = context.settings.source_timezone
+    states = to_sensor_states(payload, timezone)
     previous = read_sensor_statuses(context.engine)
-    write_sensor_states(context.engine, payload, batch_size)
+    write_sensor_states(context.engine, payload, batch_size, timezone)
     write_sensor_episodes(
         context.engine, previous, states, datetime.now(UTC), batch_size
     )
@@ -592,11 +607,10 @@ def _with_interval(settings: PollSettings, interval_s: float) -> PollSettings:
     """Retourne les réglages avec la cadence imposée en ligne de commande."""
     if interval_s <= 0:
         raise ValueError("--interval doit être strictement positif.")
-    return PollSettings(
-        interval_s=interval_s,
-        lag_warning_s=settings.lag_warning_s,
-        batch_size=settings.batch_size,
-    )
+    # `replace` et non une reconstruction champ par champ : celle-ci laissait
+    # silencieusement tomber tout réglage ajouté depuis, et `--interval` aurait
+    # suffi à faire relire la source dans un autre fuseau que celui configuré.
+    return replace(settings, interval_s=interval_s)
 
 
 def _wait_until(

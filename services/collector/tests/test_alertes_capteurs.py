@@ -75,13 +75,24 @@ class TestAlertes:
         row = rows[0]
         assert row["alert_id"] == "ALR-SITE002-1718458320"
         assert row["site_id"] == "SITE002"
-        assert row["ts"] == datetime(2026, 9, 4, 14, 12)
+        # Daté, et non nu : `alerte.ts` est un `timestamptz`, et un horodatage
+        # sans fuseau y serait interprété selon le réglage de la session qui
+        # l'insère. Sans fuseau prêté, la source est lue en UTC.
+        assert row["ts"] == datetime(2026, 9, 4, 14, 12, tzinfo=UTC)
         assert row["severity"] == "critical"
         # `type` est trop générique pour une colonne : la traduction est portée
         # une fois, ici, plutôt que dans chaque requête.
         assert row["type_alerte"] == "outage"
         assert row["valeur"] == 812.5
         assert row["seuil"] == 720.0
+
+    def test_l_horodatage_suit_le_fuseau_prete_a_la_source(self) -> None:
+        # La source date ses alertes comme elle date ses mesures : sans
+        # fuseau, sur l'heure locale de sa machine. Une alerte de 14:12
+        # locales est un incident de 12:12 UTC.
+        rows = to_alerts([ALERTE], "Europe/Paris")
+
+        assert rows[0]["ts"] == datetime(2026, 9, 4, 12, 12, tzinfo=UTC)
 
     def test_une_alerte_incomplete_est_ecartee_seule(self) -> None:
         # Le lot entier serait rejeté par la base si elle partait avec : une
@@ -148,8 +159,24 @@ class TestEtatDesCapteurs:
         rows = {row["capteur"]: row for row in to_sensor_states(CAPTEURS)}
 
         assert rows["temperature"]["statut"] == "failing"
-        assert rows["temperature"]["failing_until"] == datetime(2026, 9, 4, 14, 33, 5)
+        assert rows["temperature"]["failing_until"] == datetime(
+            2026, 9, 4, 14, 33, 5, tzinfo=UTC
+        )
         assert rows["network"]["failing_until"] is None
+
+    def test_la_date_de_retablissement_suit_le_fuseau_prete_a_la_source(
+        self,
+    ) -> None:
+        # `/sensors/status` ne date pas mieux ses réponses que `/current` :
+        # un capteur annoncé rétabli à 14:33 locales le serait à 12:33 UTC.
+        rows = {
+            row["capteur"]: row
+            for row in to_sensor_states(CAPTEURS, "Europe/Paris")
+        }
+
+        assert rows["temperature"]["failing_until"] == datetime(
+            2026, 9, 4, 12, 33, 5, tzinfo=UTC
+        )
 
     def test_un_capteur_inconnu_est_ignore(self) -> None:
         payload = {
@@ -218,7 +245,9 @@ class TestJournalDesPannes:
         assert [row["capteur"] for row in opened] == ["temperature"]
         assert opened[0]["debut_le"] == NOW
         assert opened[0]["fin_le"] is None
-        assert opened[0]["failing_until"] == datetime(2026, 9, 4, 14, 33, 5)
+        assert opened[0]["failing_until"] == datetime(
+            2026, 9, 4, 14, 33, 5, tzinfo=UTC
+        )
         assert closed == []
 
     def test_une_panne_qui_dure_n_ouvre_rien_de_plus(self) -> None:

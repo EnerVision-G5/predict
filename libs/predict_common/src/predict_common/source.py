@@ -64,6 +64,7 @@ from typing import Any
 import httpx
 
 from predict_common.config import Config
+from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
 # Plafond de `limit` imposé par la source : au-delà, elle répond 422. Le
 # refuser ici plutôt que de le découvrir en réponse évite de partir sur un
@@ -131,6 +132,11 @@ class SourceSettings:
     retries: int
     backoff_s: float
     rate_limit_rps: float
+    # Fuseau des horodatages que la source envoie sans le leur. Il décrit la
+    # source, pas une préférence d'affichage : `/current` sert l'heure locale
+    # de sa machine depuis le 8 septembre 2026, et rien dans la réponse ne le
+    # dit. Voir `predict_common.timestamps`.
+    timezone: str = DEFAULT_SOURCE_TIMEZONE
 
     def with_page_size(self, page_size: int) -> SourceSettings:
         """Retourne les mêmes réglages avec la taille de page demandée.
@@ -163,6 +169,7 @@ class SourceSettings:
             retries=config.get_int("source.retries"),
             backoff_s=config.get_float("source.backoff_s"),
             rate_limit_rps=config.get_float("source.rate_limit_rps"),
+            timezone=config.get_str("source.timezone", DEFAULT_SOURCE_TIMEZONE),
         )
 
 

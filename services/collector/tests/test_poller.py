@@ -288,6 +288,9 @@ def test_settings_read_the_configuration_block() -> None:
     settings = PollSettings.from_config(config)
     assert settings.interval_s == 60.0
     assert settings.batch_size == 1000
+    # Le bloc `source` est absent de cette configuration : le fuseau retombe
+    # sur un défaut neutre plutôt que de faire échouer le démarrage.
+    assert settings.source_timezone == "UTC"
 
 
 def test_the_client_is_closed_when_the_context_ends(make_client) -> None:

@@ -275,6 +275,9 @@ def test_settings_read_the_configuration_blocks() -> None:
     # La barre finale est retirée : elle donnerait une URL à double séparateur.
     assert settings.base_url == "http://mock:8000"
     assert settings.page_size == 500
+    # Une configuration muette sur le fuseau ne déplace aucun horodatage :
+    # c'est le déploiement qui décrit sa source, pas le code qui suppose.
+    assert settings.timezone == "UTC"
 
 
 class TestRateLimiter:
