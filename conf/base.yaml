@@ -154,7 +154,17 @@ etl:
 
 training:
   experiment: ${MLFLOW_EXPERIMENT:-enervision-consumption}
-  registered_model: enervision_xgboost
+  # Nom du modèle au registre. Il désigne le PROBLÈME — prévoir la
+  # consommation — et non la famille qui le résout aujourd'hui.
+  #
+  # Il s'appelait `enervision_xgboost`, ce qui condamnait l'arbitrage à ne
+  # jamais rien changer : le jour où une forêt aléatoire ou une ridge gagne le
+  # banc, la promouvoir l'aurait inscrite sous le nom d'une famille qui n'est
+  # pas la sienne. Les familles sont maintenant des VERSIONS de ce modèle,
+  # chacune taguée par son candidat, et l'alias champion désigne celle qui
+  # sert. Promouvoir une autre famille ne demande alors ni renommage, ni
+  # redéploiement du service.
+  registered_model: ${MLFLOW_REGISTERED_MODEL:-enervision_consommation}
   # Découpe temporelle, jamais aléatoire : une coupe au hasard laisserait le
   # modèle voir le futur d'une même journée pendant l'apprentissage.
   valid_ratio: 0.15
@@ -268,7 +278,7 @@ serving:
   # Alias et non version figée : promouvoir un modèle se fait en déplaçant
   # l'alias dans MLflow, sans redéployer le service, et le retour arrière est
   # le même geste en sens inverse.
-  model_uri: ${SERVING_MODEL_URI:-models:/enervision_xgboost@champion}
+  model_uri: ${SERVING_MODEL_URI:-models:/enervision_consommation@champion}
   # Durée de conservation des partitions de variables en mémoire, en secondes.
   # Le service relisait le stockage objet à CHAQUE prévision : une fenêtre de
   # dix journées, décompressée et triée, pour en extraire un seul site. L'ETL

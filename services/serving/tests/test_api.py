@@ -36,7 +36,9 @@ class StubModel:
 
 class StubRegistry(ModelRegistry):
     def __init__(self, model: StubModel | None) -> None:
-        super().__init__("http://mlflow.invalid", "models:/enervision_xgboost@champion")
+        super().__init__(
+            "http://mlflow.invalid", "models:/enervision_consommation@champion"
+        )
         self._loaded = model
 
     def load(self):

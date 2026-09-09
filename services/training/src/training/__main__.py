@@ -12,7 +12,7 @@ import argparse
 import logging
 import sys
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -471,30 +471,54 @@ def candidate_params(config: Config) -> Iterator[tuple[str, Mapping[str, object]
         yield str(name), dict(params or {})
 
 
+@dataclass(frozen=True)
+class Contender:
+    """Classe : Contender
+    Description : Un candidat mesuré sur le banc, et le run qui le porte.
+
+      Le run est retenu parce que le vainqueur n'est connu qu'une fois tous les
+      candidats mesurés, donc bien après la fermeture du sien : l'inscrire au
+      registre demande de savoir d'où reprendre son modèle.
+    """
+    bench: BenchResult
+    run_id: str
+    learned: bool
+    tags: dict[str, object] = field(default_factory=dict)
+
+
 def challenge_learner(
     settings: tracking.TrackingSettings,
     fixtures: Fixtures,
     name: str,
     params: Mapping[str, object],
     early_stopping: int,
-) -> BenchResult:
+) -> Contender:
     """Méthode : challenge_learner
     Description : Apprend une famille et la mesure sur le banc, sans rien
       promouvoir.
     """
-    with tracking.run(settings, run_name=f"{fixtures.version}-challenge-{name}"):
+    with tracking.run(
+        settings, run_name=f"{fixtures.version}-challenge-{name}", nested=True
+    ) as active:
         trained = fit_and_measure(fixtures, name, params, early_stopping)
         tracking.log_params(run_params(fixtures, params, trained))
         tracking.log_metrics(trained.metrics)
         tracking.set_tags({"challenge": True, "famille": "apprise"})
-    return trained.bench
+        tracking.log_candidate_model(
+            trained.model,
+            trained.signature_features,
+            trained.signature_predictions,
+        )
+        run_id = active.info.run_id
+        tags = {**version_tags(fixtures, trained), "role": "vainqueur-arbitrage"}
+    return Contender(bench=trained.bench, run_id=run_id, learned=True, tags=tags)
 
 
 def challenge_baseline(
     settings: tracking.TrackingSettings,
     fixtures: Fixtures,
     baseline: Persistence,
-) -> BenchResult:
+) -> Contender:
     """Méthode : challenge_baseline
     Description : Mesure une baseline naïve sur le même banc que les candidats.
     """
@@ -506,8 +530,10 @@ def challenge_baseline(
         fixtures.bench,
     )
     with tracking.run(
-        settings, run_name=f"{fixtures.version}-challenge-{baseline.name}"
-    ):
+        settings,
+        run_name=f"{fixtures.version}-challenge-{baseline.name}",
+        nested=True,
+    ) as active:
         tracking.log_params(
             {
                 "candidat": baseline.name,
@@ -521,7 +547,11 @@ def challenge_baseline(
         )
         tracking.log_metrics(arbitration.bench_metrics(measured, fixtures.naive))
         tracking.set_tags({"challenge": True, "famille": "naive"})
-    return measured
+        run_id = active.info.run_id
+    # Aucun modèle attaché, et rien à inscrire même en cas de victoire : une
+    # persistance recopie une colonne, elle ne se sert pas. Qu'elle gagne est
+    # une information sur les autres candidats, pas un modèle à déployer.
+    return Contender(bench=measured, run_id=run_id, learned=False)
 
 
 def challenge(
@@ -538,19 +568,148 @@ def challenge(
     fixtures = prepare(config, version, end, history_days, sites)
     settings = tracking_settings(config)
     early_stopping = config.get_int("training.early_stopping_rounds")
-    measured = [
-        challenge_learner(settings, fixtures, name, params, early_stopping)
-        for name, params in candidate_params(config)
-    ]
-    measured.extend(
-        challenge_baseline(settings, fixtures, baseline)
-        for baseline in fixtures.baselines
-    )
-    ranked = tuple(
-        sorted(measured, key=lambda result: result.metrics[DECISION_METRIC])
-    )
-    report_ranking(ranked, fixtures)
+    learners = [name for name, _ in candidate_params(config)]
+    with tracking.run(settings, run_name=f"{fixtures.version}-challenge"):
+        contenders = [
+            challenge_learner(settings, fixtures, name, params, early_stopping)
+            for name, params in candidate_params(config)
+        ]
+        contenders.extend(
+            challenge_baseline(settings, fixtures, baseline)
+            for baseline in fixtures.baselines
+        )
+        ordered = sorted(
+            contenders, key=lambda entry: entry.bench.metrics[DECISION_METRIC]
+        )
+        ranked = tuple(entry.bench for entry in ordered)
+        report_ranking(ranked, fixtures)
+        publish_ranking(ranked, fixtures, learners)
+        register_winner(settings, ordered[0], fixtures)
     return ranked
+
+
+def register_winner(
+    settings: tracking.TrackingSettings,
+    winner: Contender,
+    fixtures: Fixtures,
+) -> None:
+    """Méthode : register_winner
+    Description : Inscrit au catalogue la famille qui a gagné le banc, et elle
+      seule.
+
+      C'est le partage que MLflow suppose entre ses deux moitiés : l'expérience
+      porte la confrontation, le registre porte ce qui peut être servi. Une
+      famille n'y entre donc que le jour où elle gagne — le jour où elle
+      devient déployable — et les battues restent lisibles dans leur run, avec
+      leur modèle.
+
+      Une baseline victorieuse n'est pas inscrite : elle ne se déploie pas. Le
+      journal le dit, parce qu'une persistance en tête de banc est un résultat
+      qui mérite d'être vu plutôt qu'un silence.
+    """
+    if not winner.learned:
+        logger.warning(
+            "banc remporté par %s : aucune famille apprise ne bat la"
+            " persistance, rien n'est inscrit au registre",
+            winner.bench.name,
+        )
+        return
+    version = tracking.register_run_model(
+        settings,
+        winner.run_id,
+        tags={**winner.tags, "banc": fixtures.bench.label},
+    )
+    if version:
+        logger.info(
+            "vainqueur %s inscrit au registre %s en version %s",
+            winner.bench.name,
+            settings.registered_model,
+            version,
+        )
+
+
+def ranking_table(
+    ranked: Sequence[BenchResult],
+    learners: Sequence[str],
+) -> pd.DataFrame:
+    """Méthode : ranking_table
+    Description : Met le classement du banc en tableau, du meilleur au pire.
+
+      La famille y figure en clair. C'est la seule colonne qui ne se déduit pas
+      des métriques, et c'est celle qui porte le verdict : un modèle appris
+      classé derrière une persistance n'a rien appris du tout.
+    """
+    best = ranked[0].metrics[DECISION_METRIC] if ranked else 0.0
+    return pd.DataFrame(
+        [
+            {
+                "rang": rank,
+                "candidat": result.name,
+                "famille": "apprise" if result.name in learners else "naive",
+                "mae": round(result.metrics["mae"], 4),
+                "rmse": round(result.metrics["rmse"], 4),
+                "r2": round(result.metrics["r2"], 4),
+                "ecart_au_meilleur_pct": round(
+                    (result.metrics[DECISION_METRIC] - best) / best * 100, 2
+                )
+                if best
+                else None,
+            }
+            for rank, result in enumerate(ranked, start=1)
+        ]
+    )
+
+
+def publish_ranking(
+    ranked: Sequence[BenchResult],
+    fixtures: Fixtures,
+    learners: Sequence[str],
+) -> None:
+    """Méthode : publish_ranking
+    Description : Attache au run parent ce que l'arbitrage a décidé.
+
+      Trois formes, parce qu'elles ne servent pas au même lecteur. Le tableau
+      se trie et se compare dans l'interface. Les métriques se suivent d'un
+      arbitrage à l'autre, et c'est là qu'on voit une famille perdre du terrain
+      sur plusieurs mois. Les tags rendent le run retrouvable sans l'ouvrir.
+    """
+    table = ranking_table(ranked, learners)
+    tracking.log_table(table, "arbitrage/classement.json")
+    # `to_string` et non `to_markdown` : ce dernier réclame tabulate, une
+    # dépendance de plus pour la seule mise en forme d'un tableau que
+    # l'interface affiche déjà depuis le JSON.
+    tracking.log_text(table.to_string(index=False), "arbitrage/classement.txt")
+
+    best = ranked[0]
+    best_naive = next(
+        (result for result in ranked if result.name not in learners), None
+    )
+    metrics = {
+        "meilleur_mae": best.metrics["mae"],
+        "candidats": float(len(ranked)),
+    }
+    if best_naive is not None:
+        naive_mae = best_naive.metrics[DECISION_METRIC]
+        metrics["meilleure_naive_mae"] = naive_mae
+        if naive_mae:
+            # Ce que le meilleur candidat gagne sur la meilleure baseline. Un
+            # gain négatif dit qu'apprendre n'a servi à rien ce jour-là, et
+            # c'est exactement le genre de chose qu'un classement enfoui dans
+            # une sortie console laisse passer.
+            metrics["gain_sur_naive_pct"] = (
+                (naive_mae - best.metrics[DECISION_METRIC]) / naive_mae * 100
+            )
+    tracking.log_metrics(metrics)
+    tracking.set_tags(
+        {
+            "challenge": True,
+            "role": "arbitrage",
+            "vainqueur": best.name,
+            "vainqueur_famille": "apprise" if best.name in learners else "naive",
+            "candidats": len(ranked),
+            "banc": fixtures.bench.label,
+        }
+    )
 
 
 def report_ranking(ranked: Sequence[BenchResult], fixtures: Fixtures) -> None:
