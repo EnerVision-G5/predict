@@ -59,18 +59,9 @@ jobs:
         # les accepte — c'est son métier, et le schéma figé le garantit — mais
         # que chaque service produise la bonne.
         #
-        # La couverture est produite ici et nulle part ailleurs. La rejouer
-        # dans le job SonarQube donnerait une seconde mesure, sur un second
-        # environnement, qui pourrait diverger de celle qui a fait passer la
-        # CI — et personne ne saurait laquelle fait foi.
-        run: uv run pytest --cov --cov-report=xml:coverage.xml
-
-      - name: Conserver la couverture pour l'analyse
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: coverage.xml
-          retention-days: 1
+        # La couverture est mesurée ici et son seuil (pyproject.toml,
+        # tool.coverage.report) fait échouer l'étape : c'est la porte qualité.
+        run: uv run pytest --cov
 
   build-images:
     name: Build des images
