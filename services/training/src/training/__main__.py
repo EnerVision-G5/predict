@@ -24,7 +24,7 @@ from predict_common.config import Config, ConfigError, load_config
 from predict_common.db import DatabaseError, open_engine
 from predict_common.paths import PathError, parse_date
 from predict_common.schemas import feature_columns
-from training import arbitration, promotion, registry, tracking
+from training import arbitration, promotion, registry, tracing, tracking
 from training.arbitration import ArbitrationError, Bench, BenchResult
 from training.baseline import BaselineError, Persistence, naive_baselines
 from training.candidates import (
@@ -160,32 +160,52 @@ def prepare(
     Description : Rassemble en une fois tout ce dont l'entraînement aura
       besoin.
     """
-    bench = arbitration.resolve_bench(config, end)
-    columns = feature_columns(
-        config.get_int_list("etl.lag_hours"), config.get_int("etl.rolling_window_h")
-    )
-    bench_frame = load_bench_frame(config, version, bench, sites)
-    baselines = naive_baselines(config.get_int_list("etl.lag_hours"))
-    logger.info(
-        "banc d'arbitrage %s (%d journée(s), %s) : %d heure(s)",
-        bench.label,
-        bench.days,
-        "figé" if bench.pinned else "glissant",
-        len(bench_frame),
-    )
-    return Fixtures(
-        version=version,
-        history_days=history_days,
-        sites=tuple(sites or ()),
-        split=load_split(config, version, end, history_days, sites, bench),
-        bench=bench,
-        bench_frame=bench_frame,
-        columns=columns,
-        baselines=baselines,
-        naive=arbitration.naive_reference(
-            baselines, bench_frame, columns, bench
-        ),
-    )
+    inputs = {
+        "feature_version": version,
+        "until": end.isoformat(),
+        "history_days": history_days,
+        "sites": list(sites or ()),
+    }
+    with tracing.span("preparation", inputs=inputs) as active:
+        bench = arbitration.resolve_bench(config, end)
+        columns = feature_columns(
+            config.get_int_list("etl.lag_hours"),
+            config.get_int("etl.rolling_window_h"),
+        )
+        bench_frame = load_bench_frame(config, version, bench, sites)
+        baselines = naive_baselines(config.get_int_list("etl.lag_hours"))
+        logger.info(
+            "banc d'arbitrage %s (%d journée(s), %s) : %d heure(s)",
+            bench.label,
+            bench.days,
+            "figé" if bench.pinned else "glissant",
+            len(bench_frame),
+        )
+        fixtures = Fixtures(
+            version=version,
+            history_days=history_days,
+            sites=tuple(sites or ()),
+            split=load_split(config, version, end, history_days, sites, bench),
+            bench=bench,
+            bench_frame=bench_frame,
+            columns=columns,
+            baselines=baselines,
+            naive=arbitration.naive_reference(
+                baselines, bench_frame, columns, bench
+            ),
+        )
+        active.set_outputs(
+            {
+                "bench_window": bench.label,
+                "bench_pinned": bench.pinned,
+                "bench_hours": len(bench_frame),
+                "train_hours": len(fixtures.split.train),
+                "valid_hours": len(fixtures.split.valid),
+                "test_hours": len(fixtures.split.test),
+                "feature_columns": len(columns),
+            }
+        )
+    return fixtures
 
 
 def promote(
@@ -198,10 +218,18 @@ def promote(
     """Méthode : promote
     Description : Pose l'alias champion et inscrit la version active en base.
     """
-    tracking.set_alias(settings.registered_model, version, tracking.PRODUCTION_ALIAS)
-    registry.publish_champion(
-        engine, settings.registered_model, version, run_id, trained_at
-    )
+    inputs = {
+        "registered_model": settings.registered_model,
+        "version": version,
+        "run_id": run_id,
+    }
+    with tracing.span("mise_en_service", inputs=inputs):
+        tracking.set_alias(
+            settings.registered_model, version, tracking.PRODUCTION_ALIAS
+        )
+        registry.publish_champion(
+            engine, settings.registered_model, version, run_id, trained_at
+        )
 
 
 def promote_registered(
@@ -280,16 +308,29 @@ def fit_and_measure(
     Description : Ajuste un candidat et le mesure, sur le test comme sur le
       banc.
     """
-    train_x, train_y = matrices(fixtures.split.train, fixtures.columns)
-    valid_x, valid_y = matrices(fixtures.split.valid, fixtures.columns)
-    test_x, test_y = matrices(fixtures.split.test, fixtures.columns)
-    model = fit_candidate(
-        name, params, train_x, train_y, valid_x, valid_y, early_stopping
-    )
-    predicted = model.predict(test_x)
-    measured = arbitration.score(
-        model, fixtures.bench_frame, fixtures.columns, name, fixtures.bench
-    )
+    inputs = {
+        "learner": name,
+        "params": {key: str(value) for key, value in params.items()},
+        "early_stopping_rounds": early_stopping,
+        "train_hours": len(fixtures.split.train),
+    }
+    with tracing.span(f"apprentissage.{name}", inputs=inputs) as active:
+        train_x, train_y = matrices(fixtures.split.train, fixtures.columns)
+        valid_x, valid_y = matrices(fixtures.split.valid, fixtures.columns)
+        test_x, test_y = matrices(fixtures.split.test, fixtures.columns)
+        model = fit_candidate(
+            name, params, train_x, train_y, valid_x, valid_y, early_stopping
+        )
+        predicted = model.predict(test_x)
+        measured = arbitration.score(
+            model, fixtures.bench_frame, fixtures.columns, name, fixtures.bench
+        )
+        active.set_outputs(
+            {
+                **evaluate(test_y, predicted),
+                **arbitration.bench_metrics(measured, fixtures.naive),
+            }
+        )
     return Trained(
         model=model,
         name=name,
@@ -365,7 +406,8 @@ def train(
     params = config.section("training.params")
     early_stopping = config.get_int("training.early_stopping_rounds")
 
-    with tracking.run(settings, run_name=f"{version}-{DEFAULT_LEARNER}") as active:
+    run_name = f"{version}-{DEFAULT_LEARNER}"
+    with tracking.run(settings, run_name=run_name) as active:
         identity = (active.info.run_id, tracking.started_at(active))
         trained = fit_and_measure(fixtures, DEFAULT_LEARNER, params, early_stopping)
         tracking.log_params(run_params(fixtures, params, trained))
@@ -376,6 +418,7 @@ def train(
             trained.signature_features,
             trained.signature_predictions,
             tags=version_tags(fixtures, trained),
+            name=run_name,
         )
     report_bench(trained.bench, fixtures)
     if engine is not None and registered:
@@ -416,12 +459,30 @@ def decide_promotion(
     """Méthode : decide_promotion
     Description : Oppose le candidat au champion et à la baseline sur le banc.
     """
-    return promotion.decide(
-        candidate,
-        champion_bench(settings),
-        naive,
-        config.get_float("training.promotion.margin"),
-    )
+    inputs = {
+        "candidat": candidate.name,
+        "candidat_erreur": candidate.error,
+        "baseline": naive.name,
+        "baseline_erreur": naive.error,
+        "banc": candidate.window,
+    }
+    with tracing.span("arbitrage", inputs=inputs) as active:
+        champion = champion_bench(settings)
+        verdict = promotion.decide(
+            candidate,
+            champion,
+            naive,
+            config.get_float("training.promotion.margin"),
+        )
+        active.set_outputs(
+            {
+                "champion": champion.name if champion else None,
+                "champion_erreur": champion.error if champion else None,
+                "accepte": verdict.accepted,
+                "raison": verdict.reason,
+            }
+        )
+    return verdict
 
 
 def enforce(verdict: promotion.Verdict, force: bool) -> None:
@@ -483,6 +544,10 @@ class Contender:
     bench: BenchResult
     run_id: str
     learned: bool
+    # Identifiant du modèle journalisé, vide s'il n'est pas parti. Une famille
+    # peut avoir gagné le banc sans que son modèle soit attaché : elle reste
+    # alors lisible dans l'expérience, mais rien ne peut être inscrit d'elle.
+    model_id: str = ""
     tags: dict[str, object] = field(default_factory=dict)
 
 
@@ -497,21 +562,27 @@ def challenge_learner(
     Description : Apprend une famille et la mesure sur le banc, sans rien
       promouvoir.
     """
-    with tracking.run(
-        settings, run_name=f"{fixtures.version}-challenge-{name}", nested=True
-    ) as active:
+    run_name = f"{fixtures.version}-challenge-{name}"
+    with tracking.run(settings, run_name=run_name, nested=True) as active:
         trained = fit_and_measure(fixtures, name, params, early_stopping)
         tracking.log_params(run_params(fixtures, params, trained))
         tracking.log_metrics(trained.metrics)
         tracking.set_tags({"challenge": True, "famille": "apprise"})
-        tracking.log_candidate_model(
+        model_id = tracking.log_candidate_model(
             trained.model,
             trained.signature_features,
             trained.signature_predictions,
+            name=run_name,
         )
         run_id = active.info.run_id
         tags = {**version_tags(fixtures, trained), "role": "vainqueur-arbitrage"}
-    return Contender(bench=trained.bench, run_id=run_id, learned=True, tags=tags)
+    return Contender(
+        bench=trained.bench,
+        run_id=run_id,
+        learned=True,
+        model_id=model_id,
+        tags=tags,
+    )
 
 
 def challenge_baseline(
@@ -560,10 +631,17 @@ def challenge(
     end: date,
     history_days: int,
     sites: Sequence[str] | None,
+    engine: Engine | None = None,
+    promote_winner: bool = False,
+    force: bool = False,
 ) -> tuple[BenchResult, ...]:
     """Méthode : challenge
-    Description : Oppose toutes les familles et les baselines, et rend le
-      classement.
+    Description : Oppose toutes les familles et les baselines, rend le
+      classement, et met le vainqueur en service si on le demande.
+
+      Avec `promote_winner`, le vainqueur passe la même règle que tout
+      candidat : battre la persistance, ne pas dégrader le champion. Gagner
+      entre familles ne suffit pas.
     """
     fixtures = prepare(config, version, end, history_days, sites)
     settings = tracking_settings(config)
@@ -584,15 +662,46 @@ def challenge(
         ranked = tuple(entry.bench for entry in ordered)
         report_ranking(ranked, fixtures)
         publish_ranking(ranked, fixtures, learners)
-        register_winner(settings, ordered[0], fixtures)
+        winner = register_winner(settings, ordered[0], fixtures)
+    # Hors du run parent : la promotion suit l'arbitrage, elle n'en fait pas
+    # partie.
+    if promote_winner:
+        promote_challenge_winner(config, engine, winner, force)
     return ranked
+
+
+def promote_challenge_winner(
+    config: Config,
+    engine: Engine | None,
+    version: str,
+    force: bool = False,
+) -> None:
+    """Méthode : promote_challenge_winner
+    Description : Met en service le vainqueur d'un arbitrage, s'il y en a un
+      d'inscrit.
+
+      Un arbitrage sans vainqueur inscrit n'est pas une panne : les baselines
+      ont pu tout remporter. `register_winner` l'a déjà journalisé.
+    """
+    if not version:
+        logger.warning(
+            "aucun vainqueur inscrit au registre : rien à mettre en service,"
+            " le champion en place le reste"
+        )
+        return
+    if engine is None:
+        raise ValueError(
+            "--challenge --promote exige DATABASE_URL : la mise en service"
+            " inscrit la version active dans la table `modele`."
+        )
+    promote_registered(config, engine, version, force)
 
 
 def register_winner(
     settings: tracking.TrackingSettings,
     winner: Contender,
     fixtures: Fixtures,
-) -> None:
+) -> str:
     """Méthode : register_winner
     Description : Inscrit au catalogue la famille qui a gagné le banc, et elle
       seule.
@@ -613,10 +722,20 @@ def register_winner(
             " persistance, rien n'est inscrit au registre",
             winner.bench.name,
         )
-        return
-    version = tracking.register_run_model(
+        return ""
+    # Une version sans modèle passerait la règle de promotion, puis
+    # refuserait de se charger : une panne différée.
+    if not winner.model_id:
+        logger.error(
+            "banc remporté par %s, mais son modèle n'a pas été attaché à son"
+            " run : rien n'est inscrit au registre, une version sans artefact"
+            " serait inservable une fois promue",
+            winner.bench.name,
+        )
+        return ""
+    version = tracking.register_logged_model(
         settings,
-        winner.run_id,
+        winner.model_id,
         tags={**winner.tags, "banc": fixtures.bench.label},
     )
     if version:
@@ -626,6 +745,7 @@ def register_winner(
             settings.registered_model,
             version,
         )
+    return version
 
 
 def ranking_table(
@@ -769,7 +889,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Oppose toutes les familles de conf/ et les baselines naïves sur"
-            " le banc d'arbitrage, les classe, et ne promeut rien."
+            " le banc d'arbitrage, les classe, et inscrit le vainqueur au"
+            " registre. Combiné à --promote, met ce vainqueur en service :"
+            " c'est ainsi qu'une famille autre que la famille apprise par"
+            " défaut peut devenir champion sans intervention."
         ),
     )
     parser.add_argument(
@@ -800,7 +923,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Pose aussi l'alias champion, donc met le modèle en service, et"
             " l'inscrit active dans la table `modele`. Exige DATABASE_URL."
-            " Sans cette option, la version reste challenger."
+            " Sans cette option, la version reste challenger. Porte sur ce"
+            " que l'entraînement vient d'apprendre, ou sur le vainqueur de"
+            " --challenge. La règle de promotion s'applique dans les deux"
+            " cas : battre la persistance, et ne pas dégrader le champion."
         ),
     )
     return parser.parse_args(argv)
@@ -843,28 +969,59 @@ def main(argv: Sequence[str] | None = None) -> int:
                 " service ce qu'il vient d'apprendre, le second une version"
                 " déjà enregistrée."
             )
-        if args.challenge and (args.promote or args.promote_version):
+        if args.challenge and args.promote_version:
             raise ValueError(
-                "--challenge ne promeut rien, par construction : il compare"
-                " des familles, et la mise en service se décide après lecture"
-                " du classement."
+                "--challenge et --promote-version s'excluent : le premier"
+                " désigne un vainqueur qu'il vient de mesurer, le second met"
+                " en service une version déjà enregistrée."
             )
         if args.promote or args.promote_version:
             engine = open_engine(config.get_optional_str("database.url"))
+        # Avant le premier span : sans expérience active, la trace
+        # atterrirait dans `Default`.
+        tracing.configure(tracking_settings(config))
+        inputs = {
+            "feature_version": version,
+            "until": end.isoformat(),
+            "history_days": args.history_days,
+            "sites": list(args.sites or ()),
+            "force": bool(args.force),
+        }
         if args.challenge:
-            challenge(config, version, end, args.history_days, args.sites)
+            with tracing.span(
+                "challenge", inputs={"promote": bool(args.promote), **inputs}
+            ):
+                challenge(
+                    config,
+                    version,
+                    end,
+                    args.history_days,
+                    args.sites,
+                    engine,
+                    args.promote,
+                    args.force,
+                )
         elif args.promote_version:
-            promote_registered(config, engine, args.promote_version, args.force)
+            with tracing.span(
+                "promotion_version",
+                inputs={"version": args.promote_version, **inputs},
+            ):
+                promote_registered(
+                    config, engine, args.promote_version, args.force
+                )
         else:
-            train(
-                config,
-                version,
-                end,
-                args.history_days,
-                args.sites,
-                engine,
-                args.force,
-            )
+            with tracing.span(
+                "entrainement", inputs={"promote": bool(args.promote), **inputs}
+            ):
+                train(
+                    config,
+                    version,
+                    end,
+                    args.history_days,
+                    args.sites,
+                    engine,
+                    args.force,
+                )
     except PromotionRefused as exc:
         logger.warning(
             "promotion refusée — %s. La version reste challenger ; --force"

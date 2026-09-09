@@ -22,7 +22,9 @@ import mlflow.xgboost
 import pandas as pd
 from mlflow.models import infer_signature
 
-# Nom de l'artefact sous lequel le modèle est enregistré.
+# Repli si l'appelant ne nomme pas son modèle. MLflow 3 en fait une entité
+# nommée dans l'onglet « Models » : les appelants passent leur nom de run,
+# sinon toutes les lignes s'appellent `model`.
 ARTIFACT_NAME = "model"
 
 # Chemin de l'artefact où atterrit le journal d'un run.
@@ -32,6 +34,15 @@ LOG_ARTIFACT = "logs/run.log"
 # est relu des mois plus tard dans MLflow doit se lire comme ce que
 # l'exploitant avait sous les yeux le jour du run.
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+# Types que skops accepte de relire. Il refuse tout ce qu'il ne connaît pas,
+# et c'est ce qui le rend plus sûr que pickle. Sans cette liste, log_model
+# échoue et le run garde ses métriques mais pas son modèle.
+SKOPS_TRUSTED_TYPES = (
+    "numpy.dtype",
+    "xgboost.core.Booster",
+    "xgboost.sklearn.XGBRegressor",
+)
 
 # Alias posé sur toute version fraîchement enregistrée.
 STAGING_ALIAS = "challenger"
@@ -163,19 +174,21 @@ def log_text(text: str, artifact_file: str) -> None:
     _attach(lambda: mlflow.log_text(text, artifact_file), artifact_file)
 
 
-def _attach(write: Any, artifact_file: str) -> None:
+def _attach(write: Any, artifact_file: str) -> bool:
     """Méthode : _attach
     Description : Écrit un artefact, et se contente d'un avertissement s'il ne
-      part pas.
+      part pas. Rend l'issue, pour que l'appelant en tienne compte.
 
-      Un artefact manquant appauvrit la relecture ; une exception ferait perdre
-      l'entraînement qui l'a produit. Le premier est un désagrément, le second
-      une panne.
+      Une exception ferait perdre l'entraînement qui l'a produit. Mais tous les
+      artefacts ne se valent pas : un journal manquant se lit ailleurs, un
+      MODÈLE manquant rend inservable la version inscrite depuis lui.
     """
     try:
         write()
     except Exception as exc:  # noqa: BLE001 - annexe : rien ne doit remonter
         logger.warning("artefact %s non attaché : %s", artifact_file, exc)
+        return False
+    return True
 
 
 def version_snapshot(name: str, version: str) -> AliasSnapshot:
@@ -198,14 +211,19 @@ def log_model(
     features: pd.DataFrame,
     predictions: Any,
     tags: Mapping[str, Any] | None = None,
+    name: str = ARTIFACT_NAME,
 ) -> str:
     """Méthode : log_model
     Description : Enregistre le modèle avec sa signature, le décrit par ses
       tags, et le marque challenger.
+
+      `name` nomme le modèle dans l'onglet « Models » de l'expérience. On y
+      passe le nom du run, pour qu'une ligne de cet onglet dise d'elle-même de
+      quelle version de variables et de quelle famille elle vient.
     """
     info = mlflow.xgboost.log_model(
         model,
-        name=ARTIFACT_NAME,
+        name=name,
         signature=infer_signature(features, predictions),
         input_example=features.head(5),
         registered_model_name=settings.registered_model,
@@ -221,7 +239,8 @@ def log_candidate_model(
     model: Any,
     features: pd.DataFrame,
     predictions: Any,
-) -> None:
+    name: str = ARTIFACT_NAME,
+) -> str:
     """Méthode : log_candidate_model
     Description : Attache le modèle d'un candidat à son run, sans l'inscrire au
       registre.
@@ -235,37 +254,55 @@ def log_candidate_model(
       Le modèle est attaché quand même, et ce n'est pas contradictoire : sans
       l'objet, un run d'arbitrage ne garde que des nombres, et l'on ne peut ni
       rejouer une prédiction du perdant pour comprendre POURQUOI il a perdu, ni
-      l'inscrire le jour où il gagne — c'est de cet artefact que part
-      `register_run_model`.
+      l'inscrire le jour où il gagne — c'est de ce modèle journalisé que part
+      `register_logged_model`.
+
+      `name` le nomme dans l'onglet « Models » : on y passe le nom du run,
+      sinon les six candidats d'un arbitrage y sont six lignes `model`.
 
       `mlflow.sklearn` et non `mlflow.xgboost` : les trois familles exposent
       l'interface sklearn, et une seule saveur évite de faire dépendre
       l'enregistrement de la famille arbitrée.
+
+      Rend l'identifiant du modèle journalisé, vide s'il n'est pas parti :
+      inscrire une version qui pointe vers un modèle absent passerait la règle
+      de promotion, puis refuserait de se charger en production.
     """
-    _attach(
-        lambda: mlflow.sklearn.log_model(
+    logged: list[str] = []
+
+    def write() -> None:
+        info = mlflow.sklearn.log_model(
             model,
-            name=ARTIFACT_NAME,
+            name=name,
             signature=infer_signature(features, predictions),
             input_example=features.head(5),
-        ),
-        ARTIFACT_NAME,
-    )
+            serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_SKOPS,
+            skops_trusted_types=list(SKOPS_TRUSTED_TYPES),
+        )
+        logged.append(str(info.model_id))
+
+    if not _attach(write, name):
+        return ""
+    return logged[0] if logged else ""
 
 
-def register_run_model(
+def register_logged_model(
     settings: TrackingSettings,
-    run_id: str,
+    model_id: str,
     tags: Mapping[str, Any] | None = None,
 ) -> str:
-    """Méthode : register_run_model
-    Description : Inscrit au registre le modèle déjà attaché à un run, sans
-      poser d'alias.
+    """Méthode : register_logged_model
+    Description : Inscrit au registre un modèle déjà journalisé, sans poser
+      d'alias.
 
-      L'inscription part de l'artefact du run et non d'un objet en mémoire :
-      la version enregistrée pointe alors vers le run qui l'a produite, et la
+      L'inscription part du modèle journalisé et non d'un objet en mémoire :
+      la version enregistrée pointe alors vers le run qui l'a produit, et la
       lignée se remonte depuis le catalogue jusqu'aux métriques et au journal
       de l'arbitrage qui l'a désignée.
+
+      `models:/<id>` et non `runs:/<id>/<nom>` : MLflow 3 ne range plus les
+      modèles parmi les artefacts du run. Le chemin d'artefact ne tenait que
+      par un repli, qui suppose un seul modèle par run.
 
       Aucun alias n'est posé, et c'est la différence avec `log_model` : gagner
       un banc ne met pas en service. `challenger` désigne ce qui sort d'un
@@ -274,7 +311,7 @@ def register_run_model(
     """
     try:
         version = mlflow.register_model(
-            f"runs:/{run_id}/{ARTIFACT_NAME}", settings.registered_model
+            f"models:/{model_id}", settings.registered_model
         )
     except Exception as exc:  # noqa: BLE001 - annexe : rien ne doit remonter
         logger.warning("vainqueur non inscrit au registre : %s", exc)
