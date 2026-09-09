@@ -1,10 +1,3 @@
-"""Aiguillage de l'entraînement : ce qui se décide avant d'apprendre.
-
-Le run MLflow reste un effet de bord, testé par une exécution réelle et non par
-la CI. Ce qui se teste ici sans dépendance, c'est ce qui décide : quels
-candidats le challenge oppose, et ce qu'un refus de promotion fait réellement.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -18,7 +11,6 @@ from training.promotion import Verdict
 
 
 def config_for(candidates: dict | None = None) -> Config:
-    """Configuration réduite aux deux blocs que le challenge énumère."""
     return Config(
         values={
             "training": {
@@ -30,17 +22,11 @@ def config_for(candidates: dict | None = None) -> Config:
 
 
 class TestCandidateParams:
-    """Le challenge énumère les familles, le modèle ordinaire en tête."""
-
     def test_the_registered_family_comes_first(self) -> None:
-        # C'est celui que l'entraînement ordinaire enregistre : le voir en
-        # tête du classement est ce qui rend la lecture immédiate.
         first, _ = next(iter(candidate_params(config_for())))
         assert first == DEFAULT_LEARNER
 
     def test_its_hyperparameters_come_from_training_params(self) -> None:
-        # Les écrire aussi dans training.candidates les ferait diverger : le
-        # challenge classerait alors un modèle que personne n'enregistre.
         _, params = next(iter(candidate_params(config_for())))
         assert params["n_estimators"] == 120
 
@@ -59,17 +45,12 @@ class TestCandidateParams:
 
 
 class TestEnforce:
-    """Un refus doit arrêter la promotion, pas seulement la commenter."""
-
     def test_an_accepted_verdict_lets_the_promotion_through(self, caplog) -> None:
         with caplog.at_level(logging.INFO, logger="training.__main__"):
             enforce(Verdict(accepted=True, reason="meilleur"), force=False)
         assert "promotion acceptée" in caplog.text
 
     def test_a_refusal_stops_everything(self) -> None:
-        # L'exception et non un code de retour : la promotion est faite d'un
-        # alias puis d'une écriture en base, et il ne doit rester aucun chemin
-        # par lequel la première aurait lieu après un refus.
         with pytest.raises(PromotionRefused, match="dégradation"):
             enforce(Verdict(accepted=False, reason="dégradation"), force=False)
 

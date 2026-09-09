@@ -1,10 +1,3 @@
-"""Qualification des mesures : aucune valeur nulle sans cause.
-
-La garantie testée est celle du ticket EV-08 : une mesure nulle qui
-traverserait l'ETL sans motif ni qualification aurait perdu la panne capteur,
-et aucune étape aval ne saurait la reconstituer.
-"""
-
 from __future__ import annotations
 
 import pandas as pd
@@ -55,8 +48,6 @@ def test_complete_null_reasons_names_every_unexplained_column() -> None:
 
 
 def test_complete_null_reasons_keeps_the_source_motives_alone() -> None:
-    # `network_loss` explique aussi bien un capteur muet que sept : y ajouter
-    # un motif par colonne inventerait des causes distinctes.
     completed = complete_null_reasons(["network_loss"], ("voltage_v",))
     assert completed == ["network_loss"]
 
@@ -88,7 +79,6 @@ def test_qualify_never_lets_a_null_pass_without_a_reason(
 def test_qualify_keeps_a_source_alert_the_data_alone_would_not_show(
     make_raw, make_reading
 ) -> None:
-    # Un seul capteur muet ferait déduire 'partial' ; la source en sait plus.
     frame = to_measures(
         make_raw(
             [
@@ -106,8 +96,6 @@ def test_qualify_keeps_a_source_alert_the_data_alone_would_not_show(
 def test_qualify_refuses_a_qualification_kinder_than_the_data(
     make_raw, make_reading
 ) -> None:
-    # La source annonce 'good' en n'envoyant pas de puissance : la garder
-    # sortirait la panne de idx_mesure_quality, qui n'indexe que le non-'good'.
     frame = to_measures(
         make_raw(
             [
@@ -125,8 +113,6 @@ def test_qualify_refuses_a_qualification_kinder_than_the_data(
 def test_qualify_recomputes_a_qualification_the_base_would_reject(
     make_raw, make_reading
 ) -> None:
-    # 'ok' n'est pas dans le CHECK de la colonne : le soumettre tel quel
-    # ferait échouer l'insertion du lot entier, pas seulement de la ligne.
     frame = to_measures(
         make_raw([make_reading("2026-09-02T08:00:00Z", data_quality="ok")])
     )
@@ -153,8 +139,6 @@ def test_qualify_counts_an_unreadable_value_as_a_silent_sensor(
 
 
 class TestWorst:
-    """L'agrégation horaire retient la pire qualification, pas leur moyenne."""
-
     def test_a_critical_minute_makes_the_hour_critical(self) -> None:
         assert worst([QUALITY_GOOD, QUALITY_CRITICAL, QUALITY_GOOD]) == QUALITY_CRITICAL
 
@@ -165,20 +149,10 @@ class TestWorst:
         assert worst(["ok", QUALITY_PARTIAL]) == QUALITY_PARTIAL
 
     def test_an_hour_without_any_known_value_is_critical(self) -> None:
-        # Ne rien savoir de la qualité d'une heure n'est pas la même chose que
-        # la savoir bonne.
         assert worst([]) == QUALITY_CRITICAL
 
 
 class TestQualitySource:
-    """La marque qui distingue un `good` posé d'un `good` confirmé.
-
-    `data_quality` est NOT NULL DEFAULT 'good' : le collecteur retombe sur le
-    défaut quand la source se tait. Sans cette marque, l'API métier compterait
-    0 % de mesures dégradées sur une journée que l'ETL n'a pas encore vue, et
-    le site paraîtrait parfait — l'inverse de ce que l'indicateur doit dire.
-    """
-
     def test_a_qualified_batch_is_signed_by_the_etl(
         self, make_raw, make_reading
     ) -> None:
@@ -186,6 +160,4 @@ class TestQualitySource:
         assert frame.loc[0, QUALITY_SOURCE_COLUMN] == QUALITY_SOURCE_ETL
 
     def test_an_empty_batch_still_carries_the_column(self, make_raw) -> None:
-        # Le lot vide traverse `qualify` sans y passer : la colonne doit venir
-        # de la projection, sinon le chargement échouerait sur une absence.
         assert QUALITY_SOURCE_COLUMN in to_measures(make_raw([])).columns

@@ -48,7 +48,6 @@ La route dit pourquoi une prévision manque, là où un 503 nu ne le dit pas.
 `/health` reste sans dépendance, et c'est délibéré : voir `get_health`.
 
 Le contrat gelé doit être régénéré et relu :
-
     python scripts/export_openapi.py ../docs/contracts/openapi-predict.json
 """
 
@@ -98,35 +97,14 @@ from serving.schemas import (
     SpikeSimulationOut,
 )
 
-# Version du contrat gelé dans enervision/docs/contracts/openapi-predict.json.
-# Incrémentée en semver : patch pour une description, minor pour un champ
-# optionnel ajouté, major pour un champ retiré ou renommé.
 CONTRACT_VERSION = "1.4.0"
 
 API_PREFIX = "/api/v1"
 
 SECONDS_PER_HOUR = 3600.0
 
-# Repli du TTL du cache des variables, pour une application montée sans passer
-# par `configure` — c'est le cas de plusieurs tests. La valeur d'exploitation
-# vient de `serving.feature_cache_ttl_s`.
 DEFAULT_FEATURE_CACHE_TTL_S = 300.0
 
-# Forme admise d'un identifiant de site. Le paramètre voyage jusque dans le
-# CHEMIN de l'appel sortant vers la source (`simulate_spike_path.format(...)`),
-# et Starlette décode `%2F` avant de remplir le paramètre : sans cette borne,
-# un identifiant peut porter des segments de chemin et faire émettre au
-# service des requêtes vers des routes de la source qu'il n'expose pas.
-#
-# Le motif est celui du référentiel — `SITE001` — élargi de ce qu'un
-# identifiant technique peut raisonnablement porter, et de rien d'autre : ni
-# barre oblique, ni point, ni pourcentage.
-#
-# La vérification est faite EN CODE et non par `Path(pattern=...)`, qui
-# publierait le motif dans la spécification et ferait dériver le contrat gelé.
-# Le refus est le même — 422, que le contrat documente déjà sur cette route —
-# et déclarer le motif au contrat reste la bonne cible, en patch semver, par
-# une PR sur enervision/docs/contracts.
 SITE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
 
 INVALID_SITE_ID = (
@@ -147,16 +125,9 @@ def ensure_site_id(site_id: str) -> str:
 
 logger = logging.getLogger(__name__)
 
-# Valeurs du champ `history_source` du contrat. Nommées ici plutôt qu'écrites
-# en clair aux deux endroits qui les posent : une faute de frappe sur l'une
-# des deux ferait passer une prévision de repli pour une prévision ordinaire.
 HISTORY_RECENT = "recent"
 HISTORY_REFERENCE = "reference"
 
-# Ni le modèle ni la configuration ne sont chargés à l'import : un module qui
-# joint un registre au moment où on l'importe rend le service intestable et
-# fait échouer la génération de la spécification OpenAPI en CI, où aucun
-# MLflow ne tourne.
 state: dict[str, Any] = {
     "registry": None,
     "spec": None,
@@ -208,9 +179,6 @@ def configure() -> None:
         lookback_days=config.get_int("serving.feature_lookback_days"),
         reference_years=config.get_int("serving.reference_years", 0),
     )
-    # Le client de la source est construit ici, pas à chaque requête : il tient
-    # sa connexion ouverte, et le relais du référentiel est appelé à chaque
-    # démarrage de l'API métier.
     state["source"] = SourceClient(SourceSettings.from_config(config))
     state["feature_cache_ttl_s"] = config.get_float(
         "serving.feature_cache_ttl_s",
@@ -241,9 +209,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Monté à l'import et non dans le `lifespan` : Starlette fige la pile de
-# middlewares au premier démarrage, et en ajouter un après lève. La clé, elle,
-# est relue dans `state` à chaque requête — c'est `configure()` qui l'y pose.
 app.middleware("http")(build_middleware(lambda: str(state.get("api_key") or "")))
 
 
@@ -309,9 +274,6 @@ def predict(payload: PredictionRequest) -> PredictionOut:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
-    # Deux tentatives, dans cet ordre, et jamais l'inverse : les heures
-    # réellement observées cette semaine priment toujours sur un profil de
-    # l'an dernier. Le repli ne se déclenche que là où le service se taisait.
     history_source = HISTORY_RECENT
     history_origin: datetime | None = None
     history: pd.Series | None = None
@@ -333,10 +295,6 @@ def predict(payload: PredictionRequest) -> PredictionOut:
             columns,
             residual_std=model.residual_std,
         )
-    # `not points` autant que `history is None` : un site peut avoir des heures
-    # récentes sans avoir les 168 h continues que réclame le décalage le plus
-    # profond. C'est même le cas ordinaire au démarrage de la collecte, et le
-    # refus était alors identique à celui d'un site totalement absent.
     if not points and spec.reference_years > 0:
         try:
             history, origin = reference_history(spec, payload.site_id)
@@ -368,10 +326,6 @@ def predict(payload: PredictionRequest) -> PredictionOut:
         site_id=payload.site_id,
         model_version=model.version,
         generated_at=generated_at,
-        # Le service prédit à partir des partitions publiées par l'ETL, pas de
-        # la base : ses variables peuvent dater sans que rien ne le signale.
-        # C'est ce couple qui le dit, et il est calculé ici parce que le
-        # service est le seul à savoir sur quoi il vient de s'appuyer.
         history_end=history_end,
         feature_lag_hours=feature_lag_hours(generated_at, history_end),
         history_source=history_source,
@@ -380,10 +334,6 @@ def predict(payload: PredictionRequest) -> PredictionOut:
             PredictionPoint(
                 timestamp=point.stamp.to_pydatetime(),
                 predicted_consumption_kw=point.value,
-                # Bornes calculées par `forecast.confidence_band` à partir de
-                # la dispersion que la version servie déclare. Nulles quand la
-                # version ne la déclare pas : le contrat les prévoit
-                # optionnelles depuis l'origine, précisément pour ce cas.
                 lower_bound_kw=point.lower,
                 upper_bound_kw=point.upper,
             )
@@ -436,15 +386,8 @@ def list_source_sites() -> list[SourceSiteOut]:
     client = _source()
     try:
         payload = client.fetch_sites()
-    # ValueError couvre le corps JSON illisible : `response.json()` lève une
-    # JSONDecodeError, qui en dérive et que le client ne traduit pas en
-    # SourceError. Sans elle, une source qui répond 200 avec du HTML sortait
-    # en 500 — soit « la panne est chez moi », l'inverse de ce que le 502
-    # établit, et l'API métier partait chercher l'incident du mauvais côté.
     except (SourceError, ValueError) as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-    # Une entrée sans identifiant n'est pas un site : la relayer ferait
-    # échouer la validation et emporterait tout le référentiel avec elle.
     return [
         SourceSiteOut.model_validate(site)
         for site in payload
@@ -489,14 +432,10 @@ def simulate_spike(
     Son échec ne fait pas échouer la réponse : le pic est déclenché, le dire
     en erreur inviterait à rejouer l'appel et à superposer deux pics.
     """
-    # Avant tout appel sortant : l'identifiant part dans le chemin de la
-    # requête vers la source, un refus tardif l'aurait déjà émise.
     ensure_site_id(site_id)
     client = _source()
     try:
         payload = client.simulate_spike(site_id, duration_minutes)
-    # ValueError pour la même raison qu'au relais du référentiel : un corps
-    # illisible est une panne de la source, pas du service.
     except (SourceError, ValueError) as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 

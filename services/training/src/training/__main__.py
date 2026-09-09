@@ -1,49 +1,10 @@
-"""Point d'entrée de l'entraînement : des partitions en entrée, un modèle en sortie.
-
-    python -m training --feature-version v1
-    python -m training --feature-version v1 --history-days 180 --site SITE001
-
-Le service lit `features/{version}/dt=.../` et enregistre un modèle dans
-MLflow. Il n'écrit aucun fichier que quelqu'un d'autre devrait aller chercher,
-et ne connaît ni le collecteur, ni l'ETL, ni le service d'inférence.
-
-Un modèle entraîné hors de ce chemin n'est pas déployable, et c'est
-volontaire : le service d'inférence ne charge que ce que le registre lui
-désigne. C'est aussi ce qui rend un modèle traçable — son run porte la version
-des variables, la fenêtre apprise et les métriques du bloc de test.
-
-L'entraînement produit un `challenger`, jamais un `champion`. Promouvoir est
-une décision d'exploitation, prise en déplaçant l'alias dans MLflow, et le
-service la suit sans être redéployé.
-
-Le mot `challenger` a longtemps été le seul morceau de challenge : rien
-n'opposait la version apprise à celle en service. Deux choses le font
-maintenant. Tout candidat est réévalué sur un banc d'arbitrage — une fenêtre
-retirée de l'apprentissage, la même pour tous — et la promotion refuse ce qui
-ne bat pas la persistance naïve (ADR-010) ou ce qui dégraderait le champion.
-`--force` passe outre, en le disant.
-
-    python -m training --challenge
-
-oppose toutes les familles déclarées dans `conf/` et les baselines naïves sur
-ce banc, les classe, et ne promeut rien. Le classement est une lecture ; la
-mise en service reste un geste séparé.
-
-`--promote` fait deux choses et non une : il déplace l'alias, puis inscrit la
-version dans `modele`, la table du schéma figé. Ce second geste demande la
-base, que l'entraînement ne touche dans aucun autre cas — c'est pourquoi la
-connexion est ouverte avant l'apprentissage et non après. Découvrir une
-DATABASE_URL absente au bout d'une heure de calcul laisserait le choix entre
-perdre le run et servir un modèle que rien ne référence.
-
-`--promote-version` fait le même geste sur une version déjà enregistrée, sans
-rien réapprendre :
-
-    python -m training --promote-version 7
-
-C'est la voie qui remet le miroir d'aplomb après un `mlflow models set-alias`,
-qui déplace l'alias sans rien savoir de `modele`.
-"""
+# **********************************************************************
+# * Nom     : __main__.py                                              *
+# * Type    : Point d'entrée                                           *
+# * Sujet   : Entraînement, arbitrage des candidats et mise en service *
+# *   du modèle                                                        *
+# * Service : training                                                 *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -90,21 +51,23 @@ from training.model import (
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
+# Profondeur d'historique apprise par défaut, en journées.
 DEFAULT_HISTORY_DAYS = 90
 
+# Code de sortie d'un entraînement abouti.
 EXIT_OK = 0
+# Code de sortie d'un entraînement interrompu.
 EXIT_FAILED = 1
-# Distinct de EXIT_FAILED, comme le code 2 de la surveillance : un refus de
-# promotion est un résultat, pas une panne. Le modèle a été appris et
-# enregistré en challenger, seule sa mise en service a été refusée — les
-# confondre ferait chercher un incident là où la règle a simplement tranché.
+# Code de sortie d'une promotion refusée par la règle.
 EXIT_REFUSED = 3
 
 logger = logging.getLogger(__name__)
 
 
 def tracking_settings(config: Config) -> tracking.TrackingSettings:
-    """Lit où le run doit être écrit et sous quel nom enregistrer le modèle."""
+    """Méthode : tracking_settings
+    Description : Compose les coordonnées du registre depuis la configuration.
+    """
     return tracking.TrackingSettings(
         tracking_uri=config.get_str("mlflow.tracking_uri"),
         experiment=config.get_str("training.experiment"),
@@ -114,15 +77,10 @@ def tracking_settings(config: Config) -> tracking.TrackingSettings:
 
 @dataclass(frozen=True)
 class Fixtures:
-    """Ce qu'un entraînement a lu avant d'apprendre quoi que ce soit.
-
-    Réunies dans un seul objet parce qu'elles sont indissociables : le banc
-    est retiré du jeu d'apprentissage, et les baselines sont mesurées sur le
-    banc. Les passer séparément laisserait la possibilité d'en apparier deux
-    qui ne vont pas ensemble — un banc et un jeu qui se recouvrent, par
-    exemple, ce qu'aucune signature ne signalerait.
+    """Classe : Fixtures
+    Description : Tout ce qu'un entraînement lit une fois : découpe, banc,
+      colonnes, baselines.
     """
-
     version: str
     history_days: int
     sites: tuple[str, ...]
@@ -135,7 +93,9 @@ class Fixtures:
 
     @property
     def sites_label(self) -> str:
-        """Sites appris, tels qu'ils partent dans les paramètres du run."""
+        """Méthode : sites_label
+        Description : Sites appris, tels qu'ils apparaissent dans les tags.
+        """
         return ",".join(self.sites) if self.sites else "toutes"
 
 
@@ -147,11 +107,8 @@ def load_split(
     sites: Sequence[str] | None,
     bench: Bench | None = None,
 ) -> Split:
-    """Lit la fenêtre d'apprentissage et la découpe dans l'ordre du temps.
-
-    Le banc est retiré avant la découpe et non après : retiré après, il
-    amputerait le bloc de test de ses journées les plus récentes tout en
-    laissant les ratios croire qu'il les a.
+    """Méthode : load_split
+    Description : Lit la fenêtre d'apprentissage et la découpe dans le temps.
     """
     start = end - timedelta(days=history_days - 1)
     frame = read_features(config.get_str("storage.root"), version, start, end)
@@ -176,11 +133,8 @@ def load_bench_frame(
     bench: Bench,
     sites: Sequence[str] | None,
 ) -> pd.DataFrame:
-    """Lit les heures du banc, filtrées comme celles de l'apprentissage.
-
-    Le même filtre d'imputation qu'à l'apprentissage, sinon le banc jugerait
-    les candidats sur des heures que l'entraînement s'interdit d'apprendre :
-    on mesurerait alors leur aptitude à reproduire l'interpolation de l'ETL.
+    """Méthode : load_bench_frame
+    Description : Lit les variables du banc d'arbitrage, hors apprentissage.
     """
     frame = read_features(
         config.get_str("storage.root"), version, bench.start, bench.end
@@ -202,7 +156,10 @@ def prepare(
     history_days: int,
     sites: Sequence[str] | None,
 ) -> Fixtures:
-    """Lit le jeu d'apprentissage, le banc, et la référence à battre."""
+    """Méthode : prepare
+    Description : Rassemble en une fois tout ce dont l'entraînement aura
+      besoin.
+    """
     bench = arbitration.resolve_bench(config, end)
     columns = feature_columns(
         config.get_int_list("etl.lag_hours"), config.get_int("etl.rolling_window_h")
@@ -238,13 +195,8 @@ def promote(
     run_id: str,
     trained_at: datetime,
 ) -> None:
-    """Met la version en service, puis l'inscrit comme telle dans `modele`.
-
-    L'alias d'abord, le miroir ensuite. C'est l'alias qui met réellement le
-    modèle en service : une ligne active pour une version que le service ne
-    résout pas serait un miroir qui ment, alors qu'un alias déplacé sans
-    miroir est un retard visible, que le journal nomme et qu'un second
-    `--promote` rattrape.
+    """Méthode : promote
+    Description : Pose l'alias champion et inscrit la version active en base.
     """
     tracking.set_alias(settings.registered_model, version, tracking.PRODUCTION_ALIAS)
     registry.publish_champion(
@@ -258,18 +210,9 @@ def promote_registered(
     version: str,
     force: bool = False,
 ) -> None:
-    """Met en service une version déjà enregistrée, sans rien réapprendre.
-
-    Deux usages, et le second est le plus fréquent. Servir une version qu'on a
-    laissée décanter en `challenger`, et rattraper un alias déplacé à la main
-    — `mlflow models set-alias` ne connaît pas `modele` et laisse le miroir en
-    arrière. L'inscription étant un `ON CONFLICT DO UPDATE`, la rejouer sur une
-    version déjà active ne fait rien de plus.
-
-    La règle de promotion s'y applique comme ailleurs, mais sur ce que la
-    version a journalisé le jour de son entraînement : rien n'est réappris ici,
-    et recalculer sa mesure sur le banc d'aujourd'hui la jugerait sur des
-    heures qu'elle n'a pas vues au même titre que les autres.
+    """Méthode : promote_registered
+    Description : Met en service une version déjà enregistrée, sans
+      réapprendre.
     """
     settings = tracking_settings(config)
     tracking.connect(settings)
@@ -283,12 +226,9 @@ def decide_registered(
     settings: tracking.TrackingSettings,
     version: str,
 ) -> promotion.Verdict:
-    """Oppose une version déjà enregistrée au champion en place.
-
-    Une version antérieure au banc n'en porte aucune mesure. Le refus est alors
-    franc : la mettre en service reste possible sous `--force`, ce qui est
-    exactement ce qu'elle est — une décision prise sans comparaison, et qui
-    doit se lire comme telle dans le journal.
+    """Méthode : decide_registered
+    Description : Applique la règle de promotion à une version déjà
+      enregistrée.
     """
     snapshot = tracking.version_snapshot(settings.registered_model, version)
     label = f"version {version}"
@@ -311,19 +251,17 @@ def decide_registered(
 
 
 class PromotionRefused(RuntimeError):
-    """La règle a refusé de mettre le candidat en service."""
+    """Classe : PromotionRefused
+    Description : La règle refuse de mettre ce candidat en service.
+    """
 
 
 @dataclass(frozen=True)
 class Trained:
-    """Un candidat ajusté, et tout ce qu'on a mesuré sur lui.
-
-    Les deux mesures ne disent pas la même chose et voyagent donc ensemble.
-    `metrics` juge le modèle dans sa propre fenêtre — c'est ce que le service
-    d'inférence lit pour borner sa prévision. `bench` le juge sur la fenêtre
-    commune, et c'est la seule des deux qui se compare à un autre candidat.
+    """Classe : Trained
+    Description : Un candidat appris, avec ses mesures et de quoi signer son
+      modèle.
     """
-
     model: Any
     name: str
     metrics: dict[str, float]
@@ -338,11 +276,9 @@ def fit_and_measure(
     params: Mapping[str, object],
     early_stopping: int,
 ) -> Trained:
-    """Ajuste un candidat, le mesure sur son test puis sur le banc.
-
-    Partagé par l'entraînement ordinaire et par le challenge : les deux
-    doivent mesurer exactement de la même façon, sinon le classement du second
-    ne dirait rien du modèle que le premier enregistre.
+    """Méthode : fit_and_measure
+    Description : Ajuste un candidat et le mesure, sur le test comme sur le
+      banc.
     """
     train_x, train_y = matrices(fixtures.split.train, fixtures.columns)
     valid_x, valid_y = matrices(fixtures.split.valid, fixtures.columns)
@@ -350,9 +286,6 @@ def fit_and_measure(
     model = fit_candidate(
         name, params, train_x, train_y, valid_x, valid_y, early_stopping
     )
-    # Une seule prédiction sur le test, relue deux fois : la refaire pour
-    # l'écart-type ferait dépendre l'intervalle servi d'un second calcul que
-    # rien ne garantirait identique au premier.
     predicted = model.predict(test_x)
     measured = arbitration.score(
         model, fixtures.bench_frame, fixtures.columns, name, fixtures.bench
@@ -376,11 +309,8 @@ def run_params(
     params: Mapping[str, object],
     trained: Trained,
 ) -> dict[str, object]:
-    """Retourne ce qui rend le run reproductible et comparable.
-
-    La fenêtre du banc en fait partie, et c'est nouveau : c'est elle que la
-    promotion relit pour refuser d'opposer deux mesures qui n'ont pas vu les
-    mêmes heures.
+    """Méthode : run_params
+    Description : Compose les paramètres journalisés avec le run.
     """
     values: dict[str, object] = {
         **dict(params),
@@ -395,15 +325,15 @@ def run_params(
         "arbitrage_rows": len(fixtures.bench_frame),
         "reference_naive": fixtures.naive.name,
     }
-    # Seul l'arrêt anticipé produit ce nombre : l'inscrire pour les autres
-    # familles ferait lire une borne d'arbres à une régression.
     if hasattr(trained.model, "best_iteration"):
         values["best_iteration"] = best_iteration(trained.model)
     return values
 
 
 def version_tags(fixtures: Fixtures, trained: Trained) -> dict[str, object]:
-    """Décrit la version dans le registre, à côté de son alias."""
+    """Méthode : version_tags
+    Description : Compose les tags qui décrivent la version enregistrée.
+    """
     return {
         "candidat": trained.name,
         "feature_version": fixtures.version,
@@ -413,9 +343,6 @@ def version_tags(fixtures: Fixtures, trained: Trained) -> dict[str, object]:
         "mae": round(trained.metrics["mae"], 4),
         "rmse": round(trained.metrics["rmse"], 4),
         "r2": round(trained.metrics["r2"], 4),
-        # Le service d'inférence lit ce tag pour borner sa prévision. Un tag et
-        # non une métrique de run : le service résout un alias, il n'a pas à
-        # remonter jusqu'au run qui l'a produit.
         "residual_std": round(trained.metrics["residual_std"], 4),
     }
 
@@ -429,12 +356,9 @@ def train(
     engine: Engine | None = None,
     force: bool = False,
 ) -> dict[str, float]:
-    """Entraîne un modèle sur la fenêtre demandée et enregistre son run.
-
-    Un moteur passé vaut demande de promotion : `main` ne l'ouvre que sous
-    `--promote`, et la base n'a aucun autre usage dans ce service. La promotion
-    n'est plus acquise pour autant — elle passe par la règle de
-    `training.promotion`, et un refus laisse la version en challenger.
+    """Méthode : train
+    Description : Apprend, enregistre, arbitre, et promeut si la règle
+      l'accepte.
     """
     fixtures = prepare(config, version, end, history_days, sites)
     settings = tracking_settings(config)
@@ -455,9 +379,6 @@ def train(
         )
     report_bench(trained.bench, fixtures)
     if engine is not None and registered:
-        # Hors du contexte du run : promouvoir n'appartient pas à
-        # l'entraînement, c'est une décision d'exploitation que la ligne de
-        # commande exprime. Le run, lui, est clos dès que le modèle est écrit.
         enforce(
             decide_promotion(config, settings, trained.bench, fixtures.naive),
             force,
@@ -470,13 +391,9 @@ def train(
 
 
 def champion_bench(settings: tracking.TrackingSettings) -> BenchResult | None:
-    """Retourne ce que la version en service a mesuré sur son banc.
-
-    `None` quand il n'y a pas encore de champion, et `None` aussi quand celui
-    en place a été enregistré avant l'existence du banc. Les deux cas sont
-    distincts pour la règle de promotion — le premier est une première mise en
-    service, le second un refus — et c'est elle qui les sépare, pas cette
-    lecture.
+    """Méthode : champion_bench
+    Description : Relit le résultat de banc du champion en place, s'il y en a
+      un.
     """
     try:
         snapshot = tracking.alias_snapshot(
@@ -496,7 +413,9 @@ def decide_promotion(
     candidate: BenchResult,
     naive: BenchResult,
 ) -> promotion.Verdict:
-    """Oppose le candidat au champion en place, sur le banc."""
+    """Méthode : decide_promotion
+    Description : Oppose le candidat au champion et à la baseline sur le banc.
+    """
     return promotion.decide(
         candidate,
         champion_bench(settings),
@@ -506,11 +425,8 @@ def decide_promotion(
 
 
 def enforce(verdict: promotion.Verdict, force: bool) -> None:
-    """Applique la décision, ou journalise le passage en force.
-
-    Le refus est une exception et non un code de retour : la promotion est
-    faite d'un alias puis d'une écriture en base, et il ne doit rester aucun
-    chemin par lequel la première aurait lieu après un refus.
+    """Méthode : enforce
+    Description : Applique le verdict, ou passe outre si l'exploitant l'assume.
     """
     if verdict.accepted:
         logger.info("promotion acceptée — %s", verdict.reason)
@@ -525,11 +441,9 @@ def enforce(verdict: promotion.Verdict, force: bool) -> None:
 
 
 def report_bench(candidate: BenchResult, fixtures: Fixtures) -> None:
-    """Dit ce que le candidat vaut face à la référence gratuite.
-
-    Journalisé même sans promotion : c'est le chiffre qui dit si
-    l'entraînement a servi à quelque chose, et il ne doit pas n'apparaître que
-    le jour où quelqu'un demande une mise en service.
+    """Méthode : report_bench
+    Description : Journalise l'écart entre le candidat et la meilleure
+      baseline.
     """
     measured, reference = candidate.error, fixtures.naive.error
     if measured is None or reference is None:
@@ -549,12 +463,8 @@ def report_bench(candidate: BenchResult, fixtures: Fixtures) -> None:
 
 
 def candidate_params(config: Config) -> Iterator[tuple[str, Mapping[str, object]]]:
-    """Énumère les candidats du challenge, le modèle ordinaire en tête.
-
-    XGBoost n'est pas dans `training.candidates` et vient de `training.params`
-    : c'est celui que l'entraînement ordinaire apprend, et écrire ses
-    hyperparamètres à deux endroits les ferait diverger — le challenge
-    classerait alors un modèle que personne n'enregistre.
+    """Méthode : candidate_params
+    Description : Énumère les familles à opposer et leurs hyperparamètres.
     """
     yield DEFAULT_LEARNER, config.section("training.params")
     for name, params in config.section("training.candidates").items():
@@ -568,13 +478,9 @@ def challenge_learner(
     params: Mapping[str, object],
     early_stopping: int,
 ) -> BenchResult:
-    """Ajuste un candidat, journalise son run, et n'enregistre rien.
-
-    Aucun appel à `log_model` : un challenge compare, il ne met pas en service.
-    Enregistrer chaque candidat remplirait le registre de versions qu'aucun
-    alias ne désigne, et la version que `serving` résout porte le nom d'une
-    famille — y déposer une forêt serait un contresens de nommage avant d'être
-    un contresens d'exploitation.
+    """Méthode : challenge_learner
+    Description : Apprend une famille et la mesure sur le banc, sans rien
+      promouvoir.
     """
     with tracking.run(settings, run_name=f"{fixtures.version}-challenge-{name}"):
         trained = fit_and_measure(fixtures, name, params, early_stopping)
@@ -589,11 +495,8 @@ def challenge_baseline(
     fixtures: Fixtures,
     baseline: Persistence,
 ) -> BenchResult:
-    """Mesure une persistance sur le banc et lui donne son propre run.
-
-    ADR-010 fait de la baseline un livrable permanent : lui donner un run,
-    c'est la rendre visible dans l'interface à côté de ce qu'elle arbitre,
-    plutôt que de la réduire à un nombre cité dans le journal d'un autre.
+    """Méthode : challenge_baseline
+    Description : Mesure une baseline naïve sur le même banc que les candidats.
     """
     measured = arbitration.score(
         baseline,
@@ -628,11 +531,9 @@ def challenge(
     history_days: int,
     sites: Sequence[str] | None,
 ) -> tuple[BenchResult, ...]:
-    """Oppose tous les candidats sur le banc, les classe, et ne promeut rien.
-
-    Ne rien promouvoir est le propos, pas une limite. Un classement dit quelle
-    famille convient au problème ; mettre en service est une autre décision,
-    qui se prend après l'avoir lu et passe par `--promote-version`.
+    """Méthode : challenge
+    Description : Oppose toutes les familles et les baselines, et rend le
+      classement.
     """
     fixtures = prepare(config, version, end, history_days, sites)
     settings = tracking_settings(config)
@@ -653,11 +554,8 @@ def challenge(
 
 
 def report_ranking(ranked: Sequence[BenchResult], fixtures: Fixtures) -> None:
-    """Imprime le classement, du meilleur au moins bon.
-
-    Sur le banc et non sur les blocs de test respectifs : c'est toute la
-    raison d'être du banc, et un classement bâti sur des fenêtres différentes
-    serait une opinion présentée comme une mesure.
+    """Méthode : report_ranking
+    Description : Journalise le classement du banc, du meilleur au pire.
     """
     logger.info(
         "classement sur le banc %s (%d journée(s), %s, %d heure(s)) :",
@@ -678,7 +576,9 @@ def report_ranking(ranked: Sequence[BenchResult], fixtures: Fixtures) -> None:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Analyse la ligne de commande de l'entraînement."""
+    """Méthode : parse_args
+    Description : Analyse la ligne de commande de l'entraînement.
+    """
     parser = argparse.ArgumentParser(
         prog="training",
         description="Entraînement du modèle de prévision EnerVision.",
@@ -748,13 +648,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _configure_logging() -> None:
-    """Arme le journal, et met la sortie standard à l'abri de l'encodage local.
-
-    MLflow imprime des emoji quand il rend la main ; une console Windows en
-    cp1252 lève alors une UnicodeEncodeError au beau milieu d'un run qui, lui,
-    s'est bien passé. On ne peut pas demander à MLflow de se taire, mais on
-    peut faire en sorte qu'un caractère non représentable dégrade l'affichage
-    au lieu d'interrompre le traitement.
+    """Méthode : _configure_logging
+    Description : Arme le journal et met la sortie à l'abri de l'encodage
+      local.
     """
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -767,7 +663,10 @@ def _configure_logging() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Point d'entrée du conteneur d'entraînement."""
+    """Méthode : main
+    Description : Point d'entrée : entraîne ou arbitre, et rend un code de
+      sortie.
+    """
     _configure_logging()
     args = parse_args(argv)
     engine: Engine | None = None
@@ -791,9 +690,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 " des familles, et la mise en service se décide après lecture"
                 " du classement."
             )
-        # Avant l'apprentissage : une DATABASE_URL absente doit se voir en
-        # quelques secondes, pas une heure plus tard, quand il ne resterait
-        # qu'à choisir entre perdre le run et servir un modèle non référencé.
         if args.promote or args.promote_version:
             engine = open_engine(config.get_optional_str("database.url"))
         if args.challenge:
@@ -811,10 +707,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.force,
             )
     except PromotionRefused as exc:
-        # Le modèle est appris et enregistré en challenger : seule sa mise en
-        # service a été refusée. Un code distinct pour que l'ordonnanceur ne
-        # traite pas une décision comme une panne — et parce que l'exploitant
-        # a quelque chose à lire, pas quelque chose à réparer.
         logger.warning(
             "promotion refusée — %s. La version reste challenger ; --force"
             " passe outre si la règle a tort.",
@@ -835,15 +727,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("promotion impossible : %s", exc)
         return EXIT_FAILED
     except MlflowException as exc:
-        # Une version inconnue du registre sort ici, et non par la trace
-        # complète : c'est la faute de saisie la plus courante sous
-        # --promote-version, et elle n'a rien d'un incident.
         logger.error("registre MLflow : %s", exc)
         return EXIT_FAILED
     except SQLAlchemyError as exc:
-        # L'alias est posé et le modèle est servi ; seul le miroir manque. Le
-        # run sort en échec pour que l'exploitant le sache, et un second
-        # `--promote` sur la même version rattrape sans rien réapprendre.
         logger.error(
             "alias champion posé, mais `modele` non mise à jour : %s."
             " Relancer --promote une fois la base joignable.",
@@ -851,10 +737,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_FAILED
     except ValueError as exc:
-        # Les erreurs de la chaîne ont leur type ; celles-ci viennent
-        # d'ailleurs — un hyperparamètre refusé par XGBoost, un encodage de
-        # console. Les ranger sous le même message enverrait chercher la panne
-        # du mauvais côté, alors on dit d'où elle sort.
         logger.error("erreur inattendue (%s) : %s", type(exc).__name__, exc)
         return EXIT_FAILED
     finally:
@@ -864,7 +746,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _with_experiment(config: Config, experiment: str) -> Config:
-    """Retourne la configuration avec l'expérience imposée en ligne de commande."""
+    """Méthode : _with_experiment
+    Description : Rend la même configuration avec une autre expérience MLflow.
+    """
     values = {**config.values}
     values["training"] = {**values.get("training", {}), "experiment": experiment}
     return type(config)(values=values, env_name=config.env_name)

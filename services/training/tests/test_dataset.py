@@ -1,12 +1,3 @@
-"""Jeu d'apprentissage : lecture des partitions et découpe temporelle.
-
-La garantie centrale est que le modèle ne voit jamais le futur. Une coupe au
-hasard le laisserait apprendre la fin d'une journée dont il doit prédire le
-début : ses métriques seraient excellentes en validation et fausses en
-production, ce qui est la pire des deux erreurs possibles — celle qui ne se
-voit qu'une fois déployée.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -35,7 +26,6 @@ END = date(2026, 9, 10)
 
 
 def features(day: date, hours: int = 24, site_id: str = "SITE001", **columns):
-    """Partition de variables d'une journée, telle que l'ETL la publie."""
     stamps = pd.date_range(
         f"{day.isoformat()}T00:00:00Z", periods=hours, freq="h", tz="UTC"
     )
@@ -61,7 +51,6 @@ def features(day: date, hours: int = 24, site_id: str = "SITE001", **columns):
 
 
 def seed(root: Path, days: int = 6, **columns) -> None:
-    """Publie `days` partitions de variables se terminant le jour de référence."""
     for offset in range(days):
         day = END - timedelta(days=offset)
         io.write_frame(
@@ -78,8 +67,6 @@ def test_read_features_gathers_the_window(tmp_path: Path) -> None:
 
 
 def test_read_features_skips_a_missing_day(tmp_path: Path) -> None:
-    # La source a pu être arrêtée, ou la chaîne démarrée en cours de fenêtre :
-    # c'est le volume total qui décide si l'apprentissage est possible.
     seed(tmp_path, days=2)
     frame = read_features(str(tmp_path), "v1", END - timedelta(days=5), END)
     assert len(frame) == 48
@@ -88,10 +75,6 @@ def test_read_features_skips_a_missing_day(tmp_path: Path) -> None:
 def test_read_features_says_how_much_of_the_window_is_missing(
     tmp_path: Path, caplog
 ) -> None:
-    # `--history-days 90` sur une chaîne qui n'a qu'un mois produit un modèle
-    # appris sur un mois, et rien ne l'annonçait : les journées absentes sont
-    # journalisées en debug par la couche de stockage, sous le niveau que les
-    # services configurent.
     seed(tmp_path, days=2)
     with caplog.at_level(logging.WARNING):
         read_features(str(tmp_path), "v1", END - timedelta(days=5), END)
@@ -102,7 +85,6 @@ def test_read_features_says_how_much_of_the_window_is_missing(
 def test_read_features_stays_quiet_on_a_complete_window(
     tmp_path: Path, caplog
 ) -> None:
-    # Un avertissement à chaque run le rendrait illisible le jour où il compte.
     seed(tmp_path, days=3)
     with caplog.at_level(logging.WARNING):
         read_features(str(tmp_path), "v1", END - timedelta(days=2), END)
@@ -132,8 +114,6 @@ def test_select_keeps_the_requested_sites(tmp_path: Path) -> None:
 
 
 def test_select_drops_a_target_the_etl_mostly_invented() -> None:
-    # Une heure reconstruite à 90 % enseigne l'interpolation de l'ETL, pas la
-    # consommation du site.
     frame = features(END)
     frame.loc[0, "imputed_ratio"] = 0.9
     assert len(select(frame, None, 0.5)) == 23
@@ -146,8 +126,6 @@ def test_select_keeps_a_lightly_imputed_target() -> None:
 
 
 class TestSplit:
-    """Trois blocs, dans l'ordre du temps, et jamais au hasard."""
-
     def test_the_blocks_follow_one_another_in_time(self) -> None:
         frame = pd.concat(
             [features(END - timedelta(days=offset)) for offset in range(6)],
@@ -166,8 +144,6 @@ class TestSplit:
         assert sizes["train_rows"] > sizes["valid_rows"] + sizes["test_rows"]
 
     def test_the_window_names_the_learnt_period(self) -> None:
-        # Deux modèles aux mêmes métriques ne sont pas comparables s'ils n'ont
-        # pas vu la même période : c'est un paramètre du run.
         frame = pd.concat(
             [features(END - timedelta(days=offset)) for offset in range(6)],
             ignore_index=True,
@@ -175,8 +151,6 @@ class TestSplit:
         assert "/" in split_by_time(frame, 0.15, 0.15).window
 
     def test_two_sites_are_cut_at_the_same_instant(self) -> None:
-        # Une coupe par rang mettrait la fin d'un site dans l'apprentissage et
-        # le début d'un autre dans le test.
         frame = pd.concat(
             [
                 features(END - timedelta(days=offset), site_id=site)
@@ -193,8 +167,6 @@ class TestSplit:
             split_by_time(pd.DataFrame(), 0.15, 0.15)
 
     def test_a_window_too_short_for_the_ratios_is_refused(self) -> None:
-        # Un test vide donnerait un modèle enregistré sans rien qui atteste sa
-        # qualité — pire qu'un échec, puisqu'il serait promouvable.
         with pytest.raises(DatasetError):
             split_by_time(features(END, hours=2), 0.15, 0.15)
 
@@ -204,8 +176,6 @@ class TestSplit:
 
 
 def test_matrices_follow_the_shared_column_order() -> None:
-    # L'ordre est celui de la signature MLflow : le fixer à la main ici
-    # laisserait le service d'inférence diverger sans que rien ne le dise.
     explanatory, target = matrices(features(END), COLUMNS)
     assert list(explanatory.columns) == list(COLUMNS)
     assert target.name == "consumption_kw"
@@ -217,18 +187,13 @@ def test_matrices_refuse_a_partition_missing_a_variable() -> None:
 
 
 class TestExcludeWindow:
-    """Le banc d'arbitrage ne vaut que s'il est tenu hors de l'apprentissage."""
-
     def frame(self) -> pd.DataFrame:
-        """Trois journées consécutives, une partition par jour."""
         return pd.concat(
             [features(END - timedelta(days=offset)) for offset in range(3)],
             ignore_index=True,
         )
 
     def test_the_reserved_days_are_removed(self) -> None:
-        # Un modèle évalué sur des heures qu'il a apprises annonce la qualité
-        # de sa mémoire, pas celle de ses prévisions.
         kept = exclude_window(self.frame(), END - timedelta(days=1), END)
         assert len(kept) == 24
         assert kept["ts"].dt.date.max() == END - timedelta(days=2)
@@ -243,8 +208,6 @@ class TestExcludeWindow:
         assert exclude_window(pd.DataFrame(), END, END).empty
 
     def test_what_the_bench_costs_is_said(self, caplog) -> None:
-        # Sur une fenêtre courte, le banc peut emporter une part appréciable de
-        # ce qu'il y avait à apprendre : le run doit dire ce qu'il a payé.
         with caplog.at_level(logging.INFO, logger="training.dataset"):
             exclude_window(self.frame(), END, END)
         assert "24 heure(s) retirée(s)" in caplog.text

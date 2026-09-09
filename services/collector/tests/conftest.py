@@ -1,18 +1,3 @@
-"""Fixtures du service de collecte.
-
-Aucun test ne joint l'API Mock ni PostgreSQL.
-
-Le transport HTTP est remplacé par un `httpx.MockTransport`, qui laisse le
-client réel — sa pagination, ses reprises, sa limite de débit — s'exécuter tel
-qu'il s'exécutera en production. Remplacer le client lui-même par un faux ne
-testerait plus que le faux.
-
-La base est remplacée par un moteur qui mémorise les instructions au lieu de
-les exécuter. Ce qui compte n'est pas que PostgreSQL les accepte — c'est son
-métier, et le schéma figé le garantit — mais que le collecteur produise la
-bonne instruction : celle qui n'écrase rien.
-"""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -26,7 +11,6 @@ from predict_common.source import SourceClient, SourceSettings
 
 @pytest.fixture
 def settings() -> SourceSettings:
-    """Réglages inoffensifs : aucun test ne joint réellement cet hôte."""
     return SourceSettings(
         base_url="http://mock.invalid",
         sites_path="/api/v1/sites",
@@ -46,8 +30,6 @@ def settings() -> SourceSettings:
 
 @pytest.fixture
 def make_client(settings: SourceSettings) -> Callable[..., SourceClient]:
-    """Fabrique un client branché sur un gestionnaire de requêtes local."""
-
     def build(
         handler: Callable[[httpx.Request], httpx.Response],
         overrides: dict[str, Any] | None = None,
@@ -68,8 +50,6 @@ def make_client(settings: SourceSettings) -> Callable[..., SourceClient]:
 
 @pytest.fixture
 def make_reading() -> Callable[..., dict[str, Any]]:
-    """Fabrique une mesure au format de l'API Mock IoT."""
-
     def build(
         timestamp: str,
         site_id: str = "SITE001",

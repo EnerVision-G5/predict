@@ -1,22 +1,10 @@
-"""Normalisation des mesures lues en base, avant qualification.
-
-Les lignes arrivent déjà nommées et typées par la table : le renommage a eu
-lieu une fois pour toutes chez le collecteur. Ce qui reste à faire ici est ce
-que la base ne garantit pas — un `NUMERIC` relu par le driver n'est pas un
-flottant, un `TEXT[]` n'est pas une liste Python, et deux lignes de la fenêtre
-peuvent porter la même clé si le lot déborde.
-
-Règle structurante héritée du contrat de la source : les valeurs manquantes ne
-sont jamais filtrées. Une mesure nulle porte une information de panne capteur,
-elle traverse cette étape telle quelle avec son `data_quality` et ses
-`null_reasons`. L'imputation est un traitement aval, elle n'a pas sa place
-ici : elle relève de `etl.impute`, qui écrit dans une colonne séparée sans
-jamais toucher à la valeur brute normalisée ici.
-
-La qualification, elle, appartient bien à cette étape : un lot qui sortirait
-d'ici avec un null sans motif aurait déjà perdu la panne, et aucune étape aval
-ne saurait la retrouver.
-"""
+# **********************************************************************
+# * Nom     : clean.py                                                 *
+# * Type    : Module                                                   *
+# * Sujet   : Normalisation du lot lu dans mesure : types, doublons,   *
+# *   qualification                                                    *
+# * Service : etl                                                      *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -30,32 +18,27 @@ from predict_common.schemas import (
     TIMESTAMP_COLUMN,
 )
 
-# Colonnes de la table `mesure`, dans l'ordre du schéma figé v1.0. L'ordre
-# n'est pas cosmétique : c'est celui dans lequel la sortie annexe vers
-# TimescaleDB écrit ses lignes.
+# Colonnes de la couche brute, dans l'ordre attendu en aval.
 MEASURE_COLUMNS = (
     TIMESTAMP_COLUMN,
     SITE_COLUMN,
     *NUMERIC_COLUMNS,
     "null_reasons",
     "data_quality",
-    # Signature du passage, posée par `qualify`. Déclarée ici pour qu'un lot
-    # vide la porte aussi : les étages suivants projettent cette liste, et une
-    # colonne absente n'y ferait défaut qu'au moment du chargement.
     QUALITY_SOURCE_COLUMN,
 )
 
 
 class CleanError(ValueError):
-    """Le lot reçu ne porte pas les colonnes de la table `mesure`."""
+    """Classe : CleanError
+    Description : Le lot lu n'a pas la forme attendue de la couche brute.
+    """
 
 
 def to_measures(raw: pd.DataFrame) -> pd.DataFrame:
-    """Convertit un lot lu en base en tableau normalisé et qualifié.
-
-    Le tableau retourné a toujours les colonnes de `MEASURE_COLUMNS`, même
-    pour un lot vide : les étages suivants travaillent sans tester le cas
-    dégénéré.
+    """Méthode : to_measures
+    Description : Projette un lot brut sur les colonnes de la couche, types
+      forcés et qualité posée.
     """
     if not raw.empty:
         missing = {TIMESTAMP_COLUMN, SITE_COLUMN} - set(raw.columns)
@@ -78,12 +61,9 @@ def to_measures(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def deduplicate(frame: pd.DataFrame) -> pd.DataFrame:
-    """Ne garde qu'une ligne par clé naturelle (site_id, ts), la dernière.
-
-    La clé primaire de `mesure` interdit déjà le doublon, mais l'étage reste :
-    il protège l'écriture de retour, où `ON CONFLICT` arbitre entre le lot et
-    la table et non à l'intérieur d'un même lot. Une projection qui
-    dupliquerait une ligne ferait échouer l'insertion entière.
+    """Méthode : deduplicate
+    Description : Ne garde qu'une mesure par site et par instant, la plus
+      récente.
     """
     dated = frame.dropna(subset=[TIMESTAMP_COLUMN, SITE_COLUMN])
     return (
@@ -94,18 +74,17 @@ def deduplicate(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _as_object(column: pd.Series | None, index: pd.Index) -> pd.Series:
-    """Retourne la colonne demandée, ou une colonne vide de même longueur."""
+    """Méthode : _as_object
+    Description : Rend une colonne en type objet, même absente du lot lu.
+    """
     if column is None:
         return pd.Series([None] * len(index), index=index, dtype="object")
     return column.astype("object")
 
 
 def _normalize_null_reasons(value: object) -> list[str]:
-    """Ramène `null_reasons` au TEXT[] NOT NULL attendu par la base.
-
-    Le driver rend un TEXT[] tantôt en liste, tantôt en tableau numpy selon le
-    chemin de lecture : les deux disent la même chose, une seule doit traverser
-    l'étage.
+    """Méthode : _normalize_null_reasons
+    Description : Ramène les causes d'absence à une liste de chaînes.
     """
     if isinstance(value, (list, tuple)) or hasattr(value, "tolist"):
         return [str(item) for item in list(value)]

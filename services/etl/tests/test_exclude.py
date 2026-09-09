@@ -1,10 +1,3 @@
-"""Mise à l'écart des mesures inexploitables, et cause de chaque écart.
-
-Ce qui compte ici est le tri : quelles mesures sont écartées, lesquelles ne le
-sont pas, et avec quelle cause. L'écriture de ces exclusions vers TimescaleDB
-est une autre affaire, testée dans `test_sink_db`.
-"""
-
 from __future__ import annotations
 
 from etl.clean import deduplicate, to_measures
@@ -18,7 +11,6 @@ from etl.impute import impute_frame
 
 
 def ingest(make_raw, readings):
-    """Fait traverser au lot les étages qui précèdent l'exclusion."""
     return impute_frame(deduplicate(to_measures(make_raw(readings))))
 
 
@@ -44,7 +36,6 @@ def test_to_exclusions_files_a_null_no_imputation_could_restore(
 def test_to_exclusions_spares_a_measure_the_batch_could_rebuild(
     make_raw, make_reading
 ) -> None:
-    # Écarter ce qu'on vient de reconstruire n'aurait servi à rien.
     frame = ingest(
         make_raw,
         [
@@ -84,7 +75,6 @@ def test_to_exclusions_falls_back_on_its_own_observation(
         make_raw,
         [make_reading("2026-09-02T08:00:00Z", consumption_kw=None, null_reasons=[])],
     )
-    # La normalisation a nommé le capteur muet, l'exclusion en hérite.
     assert to_exclusions(frame)[0]["raison"] == "consumption_kw:undeclared"
 
 
@@ -108,7 +98,6 @@ def test_exclusion_reason_reads_the_array_parquet_returns() -> None:
 def test_keep_usable_removes_what_no_aggregate_could_use(
     make_raw, make_reading
 ) -> None:
-    # Un modèle entraîné sur ces valeurs apprendrait les pannes.
     frame = ingest(
         make_raw,
         [

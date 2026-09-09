@@ -1,26 +1,9 @@
-"""Miroir de la promotion dans `modele`, la table du schéma figé v1.0.
-
-Poser l'alias `champion` met un modèle en service, et c'est le seul geste qui
-le fait. Sans ce miroir, l'information ne vivrait que dans le registre MLflow :
-l'API EnerVision et le tableau de bord ne pourraient dire quel modèle a produit
-une prévision qu'en interrogeant un service dont ce n'est pas le contrat, et
-`prediction.modele_id`, qui est NOT NULL, n'aurait aucune ligne à référencer.
-
-L'écriture n'a donc lieu qu'à la promotion, jamais à l'entraînement. Une
-version restée `challenger` n'a jamais rien servi : l'inscrire ferait de
-`modele` un journal des essais, alors que `prediction.modele_id` attend le
-registre de ce qui a tourné.
-
-Deux instructions, une seule transaction. La nouvelle version est posée
-active, puis les autres versions du même modèle sont désactivées. Les séparer
-laisserait, le temps d'un incident réseau, soit deux versions actives, soit
-aucune — et un consommateur qui lit `actif` pendant cette fenêtre lirait faux
-sans qu'aucune erreur ne le lui dise.
-
-L'ordre entre les deux est ensuite celui-là et pas l'inverse, pour la même
-raison qu'ailleurs dans la chaîne : à l'intérieur de la transaction, la ligne
-qui remplace existe avant que celles qu'elle remplace ne s'effacent.
-"""
+# **********************************************************************
+# * Nom     : registry.py                                              *
+# * Type    : Module                                                   *
+# * Sujet   : Inscription en base du modèle mis en service             *
+# * Service : training                                                 *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -43,10 +26,8 @@ def to_record(
     run_id: str,
     trained_at: datetime,
 ) -> dict[str, Any]:
-    """Construit la ligne décrivant la version qui vient d'être promue.
-
-    `actif` est vrai par construction : cette fonction ne sert qu'à la
-    promotion, et une ligne écrite ici décrit toujours le modèle en service.
+    """Méthode : to_record
+    Description : Compose la ligne de modele décrivant la version promue.
     """
     return {
         "nom": name,
@@ -58,12 +39,8 @@ def to_record(
 
 
 def build_upsert(record: dict[str, Any]) -> Any:
-    """Construit l'écriture de la version promue, qui repose sans dupliquer.
-
-    `DO UPDATE` et non `DO NOTHING` : une version rétrogradée puis reprise —
-    le retour arrière est un geste courant — est déjà dans la table, avec
-    `actif` à faux. L'ignorer laisserait le miroir désigner l'ancienne version
-    alors que le registre en sert une autre.
+    """Méthode : build_upsert
+    Description : Écrit la version promue, en réécrivant celle déjà inscrite.
     """
     statement = insert(modele).values([record])
     return statement.on_conflict_do_update(
@@ -76,13 +53,9 @@ def build_upsert(record: dict[str, Any]) -> Any:
 
 
 def build_demotion(name: str, version: str) -> Any:
-    """Construit la désactivation des autres versions du même modèle.
-
-    Bornée au même `nom` : deux modèles distincts ont chacun leur version en
-    service, et désactiver au-delà éteindrait un modèle que personne n'a
-    demandé de retirer. La version promue est exclue de la clause plutôt que
-    réécrite juste après, ce qui la rend indépendante de l'ordre des deux
-    instructions.
+    """Méthode : build_demotion
+    Description : Retire le drapeau actif à toutes les autres versions du
+      modèle.
     """
     return (
         update(modele)
@@ -102,11 +75,9 @@ def publish_champion(
     run_id: str,
     trained_at: datetime,
 ) -> None:
-    """Repose dans `modele` la version que l'alias champion désigne désormais.
-
-    Appelée après que l'alias a été posé, et jamais avant : l'alias est ce qui
-    met réellement le modèle en service, et une ligne active pour une version
-    que le service ne résout pas serait un miroir qui ment.
+    """Méthode : publish_champion
+    Description : Inscrit la version active et désactive les précédentes, d'un
+      seul tenant.
     """
     record = to_record(name, version, run_id, trained_at)
     with engine.begin() as connection:

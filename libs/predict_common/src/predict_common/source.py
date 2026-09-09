@@ -1,56 +1,10 @@
-"""Client de l'API Mock IoT : pagination, reprises, débit borné.
-
-Deux services parlent à la source : le collecteur, qui en tire les mesures, et
-le service d'inférence, qui relaie le référentiel et la simulation de pic pour
-le compte de l'API métier — laquelle ne connaît pas la source. D'où la place de
-ce module dans la bibliothèque partagée plutôt que dans l'un des deux : deux
-clients donneraient deux façons de lire la même API, et un service ne peut pas
-importer le code d'un autre.
-
-Tout ce qui relève du réseau est ici, et rien d'autre : pas de conversion en
-tableau, pas de règle de qualité, pas d'écriture. Ce module rend des
-dictionnaires tels que la source les sert.
-
-Trois mécanismes, et une raison pour chacun.
-
-La lecture est un générateur. Une fenêtre de rattrapage de trois mois sur
-sept sites à la minute dépasse le million de lignes : les matérialiser toutes
-avant d'en écrire une seule ferait sortir le processus sur un défaut de
-mémoire, très loin de la ligne qui l'a causé.
-
-Elle découpe le temps, et ne pagine pas. `/api/v1/readings` n'est pas une API
-paginée : sa documentation définit `limit` comme le NOMBRE DE RÉSULTATS
-(1–1000), et la source rend toujours ce nombre-là, réparti uniformément entre
-`start_time` et `end_time` puis arrondi à la minute. `limit` est donc une
-RÉSOLUTION, pas une taille de page.
-
-Deux conséquences, et le code découle des deux.
-
-Demander une journée avec `limit=1000` ne rend pas les mille premières minutes,
-mais mille points étalés sur 1440 minutes — une série trouée, à un point toutes
-les 86 secondes, qu'aucune erreur ne signale. Une fenêtre ne peut donc pas être
-plus large que `limit` minutes, et `limit` doit valoir exactement le nombre de
-minutes demandées.
-
-Et comme la source rend toujours `limit` résultats, une réponse n'est JAMAIS
-incomplète : « page pleine, donc il en reste » est une condition qui ne devient
-jamais fausse. Une pagination par curseur redemandait alors la même fenêtre en
-la divisant par mille à chaque tour, jusqu'à ramper d'une microseconde par
-requête sans plus rien collecter.
-
-Le découpage supprime les deux problèmes : chaque fenêtre est demandée une
-fois, à sa résolution native, et les fenêtres pavent la période sans se
-recouvrir.
-
-Les reprises absorbent la micro-coupure, et elle seule. L'attente croît avec le
-rang de la tentative : une coupure qui dure ne se règle pas en insistant à la
-même cadence. Au-delà, l'échec remonte — c'est à l'appelant, qui sait s'il
-rattrape une journée ou s'il tient une cadence, de décider quoi en faire.
-
-Le débit est borné en sortie. La limite protège la source, pas le collecteur :
-un rattrapage de trois mois lui envoie des milliers de pages, et rien du côté
-de l'API Mock ne l'en empêcherait.
-"""
+# **********************************************************************
+# * Nom     : source.py                                                *
+# * Type    : Module                                                   *
+# * Sujet   : Client HTTP de la source amont : pagination, cadence,    *
+# *   reprise sur échec                                                *
+# * Service : predict_common (bibliothèque partagée)                   *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -66,44 +20,48 @@ import httpx
 from predict_common.config import Config
 from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
-# Plafond de `limit` imposé par la source : au-delà, elle répond 422. Le
-# refuser ici plutôt que de le découvrir en réponse évite de partir sur un
-# rattrapage de trois mois qui échouera à la première page.
+# Nombre maximal de mesures demandées en une requête.
 MAX_PAGE_SIZE = 1000
 
-# Bornes de `duration_minutes` déclarées par la source pour la simulation de
-# pic. Hors de cet intervalle elle répond 422.
+# Durée minimale acceptée pour une simulation de pic.
 MIN_SPIKE_MINUTES = 1
+# Durée maximale acceptée pour une simulation de pic.
 MAX_SPIKE_MINUTES = 240
+# Durée retenue quand l'appelant n'en propose aucune.
 DEFAULT_SPIKE_MINUTES = 30
 
 logger = logging.getLogger(__name__)
 
 
 class SourceError(RuntimeError):
-    """La source a répondu autre chose que ce que le contrat annonce."""
+    """Classe : SourceError
+    Description : La source n'a pas répondu, ou a répondu autre chose que ce
+      qui était attendu.
+    """
 
 
 class RetryExhausted(SourceError):
-    """Toutes les tentatives d'un appel ont échoué."""
+    """Classe : RetryExhausted
+    Description : Toutes les tentatives ont échoué sur le même appel.
+    """
 
 
 @dataclass
 class RateLimiter:
-    """Espace les appels sortants d'un intervalle minimal.
-
-    Un débit nul lève la limite, ce qui est le réglage du poste : brider les
-    appels vers une API Mock qui tourne sur la même machine ne protégerait
-    personne et allongerait chaque test.
+    """Classe : RateLimiter
+    Description : Espace les requêtes pour tenir la cadence que la source
+      accepte.
     """
-
     requests_per_second: float
     sleep: Callable[[float], Any] = time.sleep
     clock: Callable[[], float] = time.monotonic
     _next_at: float = field(default=0.0, init=False)
 
     def wait(self) -> None:
-        """Attend, si nécessaire, avant de laisser passer l'appel suivant."""
+        """Méthode : wait
+        Description : Attend, si besoin, le temps qui reste avant la requête
+          suivante.
+        """
         if self.requests_per_second <= 0:
             return
         interval_s = 1.0 / self.requests_per_second
@@ -117,8 +75,10 @@ class RateLimiter:
 
 @dataclass(frozen=True)
 class SourceSettings:
-    """Ce que le collecteur doit savoir de la source pour l'interroger."""
-
+    """Classe : SourceSettings
+    Description : Adresses, délais et cadence de la source, lus dans la
+      configuration.
+    """
     base_url: str
     sites_path: str
     readings_path: str
@@ -132,18 +92,12 @@ class SourceSettings:
     retries: int
     backoff_s: float
     rate_limit_rps: float
-    # Fuseau des horodatages que la source envoie sans le leur. Il décrit la
-    # source, pas une préférence d'affichage : `/current` sert l'heure locale
-    # de sa machine depuis le 8 septembre 2026, et rien dans la réponse ne le
-    # dit. Voir `predict_common.timestamps`.
     timezone: str = DEFAULT_SOURCE_TIMEZONE
 
     def with_page_size(self, page_size: int) -> SourceSettings:
-        """Retourne les mêmes réglages avec la taille de page demandée.
-
-        La borne est celle de la source, pas une préférence : une valeur plus
-        grande ferait répondre 422 à chaque page, et l'exploitant chercherait
-        la panne du côté du réseau.
+        """Méthode : with_page_size
+        Description : Rend les mêmes réglages avec une autre taille de page,
+          bornée.
         """
         if not 1 <= page_size <= MAX_PAGE_SIZE:
             raise ValueError(
@@ -154,7 +108,10 @@ class SourceSettings:
 
     @classmethod
     def from_config(cls, config: Config) -> SourceSettings:
-        """Lit le bloc `source` et la cadence du collecteur."""
+        """Méthode : from_config
+        Description : Construit les réglages depuis le bloc source de la
+          configuration.
+        """
         return cls(
             base_url=config.get_str("source.base_url").rstrip("/"),
             sites_path=config.get_str("source.sites_path"),
@@ -174,19 +131,19 @@ class SourceSettings:
 
 
 class SourceClient:
-    """Accès à l'API Mock IoT, partagé par le rattrapage et le poller.
-
-    Le client tient une connexion ouverte pour toute sa durée de vie. Sur un
-    rattrapage de plusieurs milliers de pages, c'est la différence entre une
-    poignée de poignées de main TLS et une par page.
+    """Classe : SourceClient
+    Description : Client de la source : une requête par appel, avec cadence et
+      reprise.
     """
-
     def __init__(
         self,
         settings: SourceSettings,
         client: httpx.Client | None = None,
         sleep: Callable[[float], Any] = time.sleep,
     ) -> None:
+        """Méthode : __init__
+        Description : Prépare le client HTTP, sa cadence et ses délais.
+        """
         self.settings = settings
         self.sleep = sleep
         self.limiter = RateLimiter(settings.rate_limit_rps, sleep=sleep)
@@ -197,18 +154,29 @@ class SourceClient:
         )
 
     def close(self) -> None:
-        """Rend la connexion. Un processus long n'en ouvre qu'une."""
+        """Méthode : close
+        Description : Ferme le client HTTP sous-jacent.
+        """
         self._client.close()
 
     def __enter__(self) -> SourceClient:
+        """Méthode : __enter__
+        Description : Rend le client lui-même, pour un usage en bloc with.
+        """
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
+        """Méthode : __exit__
+        Description : Ferme le client à la sortie du bloc, sans avaler
+          d'exception.
+        """
         self.close()
         return False
 
     def fetch_sites(self) -> list[dict[str, Any]]:
-        """Retourne le référentiel des sites exposé par la source."""
+        """Méthode : fetch_sites
+        Description : Lit le référentiel des sites servi par la source.
+        """
         path = self.settings.sites_path
         payload = self._get_json(path, label="référentiel des sites")
         if not isinstance(payload, list):
@@ -216,7 +184,9 @@ class SourceClient:
         return payload
 
     def site_ids(self) -> list[str]:
-        """Retourne les seuls identifiants du référentiel."""
+        """Méthode : site_ids
+        Description : Ne retient que les identifiants du référentiel des sites.
+        """
         return [
             str(site["site_id"]) for site in self.fetch_sites() if "site_id" in site
         ]
@@ -227,18 +197,9 @@ class SourceClient:
         start_time: datetime,
         end_time: datetime,
     ) -> Iterator[dict[str, Any]]:
-        """Itère les mesures d'un site, fenêtre par fenêtre.
-
-        La période est découpée en tranches d'au plus `page_size` minutes, et
-        chaque tranche est demandée avec `limit` égal à son nombre de minutes.
-        C'est ce qui rend la série à sa résolution native : la source répartit
-        `limit` points sur la fenêtre, donc `limit` minutes sur une fenêtre de
-        `limit` minutes font exactement un point par minute.
-
-        Les tranches pavent la période sans se recouvrir. La source pose son
-        premier point sur `start_time` et espace les suivants de
-        (fin - début) / limit : la dernière minute d'une tranche est donc celle
-        qui précède le début de la suivante.
+        """Méthode : iter_readings
+        Description : Parcourt les mesures d'un site par fenêtres, en signalant
+          les pages incomplètes.
         """
         path = self.settings.readings_path
         span = timedelta(minutes=self.settings.page_size)
@@ -247,8 +208,6 @@ class SourceClient:
             window_end = min(cursor + span, end_time)
             minutes = _minutes_between(cursor, window_end)
             if minutes < 1:
-                # Reliquat de moins d'une minute : la source ne sait pas le
-                # servir, et `limit=0` lui vaudrait un 422.
                 return
             payload = self._get_json(
                 path,
@@ -262,11 +221,6 @@ class SourceClient:
             )
             items = _as_readings(payload, path)
             if len(items) < minutes:
-                # La source rend normalement autant de résultats que demandé.
-                # En rendre moins n'est pas fatal — la journée sera simplement
-                # trouée — mais doit se voir, sans quoi un changement de
-                # comportement de la source produirait une série amputée que
-                # seul un compte en aval finirait par trahir.
                 logger.warning(
                     "site %s : %d mesure(s) reçue(s) pour %d minute(s)"
                     " demandée(s) à partir de %s",
@@ -279,11 +233,9 @@ class SourceClient:
             cursor = window_end
 
     def fetch_current(self, site_id: str) -> list[dict[str, Any]]:
-        """Retourne la mesure courante d'un site, toujours sous forme de liste.
-
-        Une liste et jamais un objet seul : le reste de la chaîne travaille par
-        lots, et une source qui répondrait plusieurs mesures d'un coup ne doit
-        pas obliger l'appelant à distinguer les deux cas.
+        """Méthode : fetch_current
+        Description : Lit la mesure courante d'un site, avec le délai court de
+          la collecte.
         """
         path = self.settings.current_path.format(site_id=site_id)
         payload = self._get_json(
@@ -298,11 +250,9 @@ class SourceClient:
         site_id: str | None = None,
         severity: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Retourne les alertes actives, filtrées à la demande.
-
-        La source ne sert que ce qui est en cours : une réponse vide est une
-        réponse valable, et non une panne. C'est l'appelant qui décide d'en
-        faire un journal, parce que c'est lui qui écrit.
+        """Méthode : fetch_alerts
+        Description : Lit les alertes actives, éventuellement filtrées par site
+          ou gravité.
         """
         params = {
             name: value
@@ -319,10 +269,8 @@ class SourceClient:
         return [item for item in payload if isinstance(item, dict)]
 
     def fetch_sensors_status(self) -> dict[str, Any]:
-        """Retourne l'état des capteurs, indexé par site tel que la source le sert.
-
-        Un objet et non une liste : la source indexe par identifiant de site,
-        et le remettre à plat ici obligerait l'appelant à refaire le lien.
+        """Méthode : fetch_sensors_status
+        Description : Lit l'état des capteurs tel que la source le présente.
         """
         path = self.settings.sensors_status_path
         payload = self._get_json(path, label="état des capteurs")
@@ -335,15 +283,9 @@ class SourceClient:
         site_id: str,
         duration_minutes: int,
     ) -> dict[str, Any]:
-        """Demande à la source de simuler un pic de consommation sur un site.
-
-        Seule écriture de tout ce module, et la seule que la source expose.
-        Elle n'est pas retentée comme l'est une lecture : rejouer un POST
-        déclencherait un second pic, et deux pics qui se recouvrent ne sont
-        pas ce qu'on a demandé. Un échec remonte donc au premier essai.
-
-        La borne sur la durée est celle de la source : au-delà elle répond
-        422, et le dire ici évite d'aller le découvrir sur le réseau.
+        """Méthode : simulate_spike
+        Description : Demande à la source de simuler un pic sur un site, durée
+          bornée.
         """
         if not MIN_SPIKE_MINUTES <= duration_minutes <= MAX_SPIKE_MINUTES:
             raise ValueError(
@@ -369,7 +311,10 @@ class SourceClient:
         label: str = "",
         timeout_s: float | None = None,
     ) -> Any:
-        """Exécute un GET, en retentant les échecs dont on peut se remettre."""
+        """Méthode : _get_json
+        Description : Rejoue l'appel jusqu'à épuisement des tentatives, en
+          espaçant les essais.
+        """
         attempts = max(self.settings.retries, 0) + 1
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
@@ -400,10 +345,9 @@ class SourceClient:
         timeout_s: float | None,
         method: str = "GET",
     ) -> Any:
-        """Envoie une requête et rend son corps, un statut d'erreur exclu.
-
-        Le débit reste borné quelle que soit la méthode : la limite protège la
-        source, et un POST la sollicite autant qu'un GET.
+        """Méthode : _request
+        Description : Émet une requête après attente de cadence et refuse tout
+          statut d'erreur.
         """
         self.limiter.wait()
         response = self._client.request(
@@ -420,17 +364,17 @@ class SourceClient:
 
 
 def _minutes_between(start: datetime, end: datetime) -> int:
-    """Nombre de minutes ENTIÈRES d'une fenêtre, soit le `limit` à demander.
-
-    Tronqué et non arrondi : demander une minute de plus que la fenêtre n'en
-    porte resserrerait l'espacement sous la minute, et la source rendrait deux
-    points dans la même minute plutôt qu'un par minute.
+    """Méthode : _minutes_between
+    Description : Compte les minutes entières séparant deux instants.
     """
     return int((end - start).total_seconds() // 60)
 
 
 def _as_readings(payload: Any, path: str) -> list[dict[str, Any]]:
-    """Ramène les formes acceptables de réponse à une liste de mesures."""
+    """Méthode : _as_readings
+    Description : Ramène une réponse à une liste de mesures, quelle que soit
+      son enveloppe.
+    """
     if isinstance(payload, dict):
         items = payload.get("items")
         if isinstance(items, list):

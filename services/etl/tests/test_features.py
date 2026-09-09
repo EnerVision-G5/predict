@@ -1,19 +1,3 @@
-"""Variables explicatives : grille horaire, décalages, fuites évitées.
-
-Trois familles de garanties, et la première corrige une faute que la chaîne
-portait avant la découpe. Un décalage compté en nombre de lignes suppose une
-série sans trou : une coupure de capteur décalait alors tout l'historique, et
-`lag_24h` désignait autre chose que la veille sans que rien ne le dise. Ici,
-un décalage est une position sur une grille horaire complète.
-
-La deuxième porte sur les fuites. La moyenne glissante ne doit jamais contenir
-la cible de l'heure qu'on prédit, sans quoi le modèle lirait la réponse dans
-la question — excellent à l'apprentissage, faux en production.
-
-La troisième porte sur ce qu'une heure doit à l'ETL : `imputed_ratio` et
-`data_quality` doivent décrire l'heure, pas la moyenne de ses minutes.
-"""
-
 from __future__ import annotations
 
 from datetime import date
@@ -40,7 +24,6 @@ def measures(
     start: str = "2026-09-01T00:00:00Z",
     **columns,
 ) -> pd.DataFrame:
-    """Série horaire d'un site, déjà normalisée et imputée."""
     stamps = pd.date_range(start, periods=hours, freq="h", tz="UTC")
     frame = pd.DataFrame(
         {
@@ -59,11 +42,7 @@ def measures(
 
 
 class TestFeatureSpec:
-    """La définition d'une version décide de tout le reste."""
-
     def test_the_lookback_follows_the_deepest_lag(self) -> None:
-        # Produire une journée avec lag_168h demande de lire jusqu'au 7e jour
-        # précédent : la journée elle-même, plus une marge de fuseau.
         spec = FeatureSpec("v1", "1h", (1, 24, 168), 24)
         assert spec.lookback_days == 9
 
@@ -72,7 +51,6 @@ class TestFeatureSpec:
         assert FeatureSpec("v1", "15min", (1,), 24).periods_per_hour == 4
 
     def test_a_step_that_does_not_divide_the_hour_is_refused(self) -> None:
-        # Sinon lag_24h ne tomberait pas sur la veille à la même heure.
         spec = FeatureSpec("v1", "7min", (1,), 24)
         with pytest.raises(FeatureError):
             assert spec.periods_per_hour
@@ -90,9 +68,6 @@ class TestFeatureSpec:
 
 
 class TestResample:
-    """La série change de pas : la source produit à la minute, le modèle prédit
-    à l'heure."""
-
     def test_minutes_are_averaged_into_an_hour(self) -> None:
         stamps = pd.date_range(
             "2026-09-08T00:00:00Z", periods=4, freq="15min", tz="UTC"
@@ -113,8 +88,6 @@ class TestResample:
         assert hourly.loc[0, "consumption_kw"] == 25.0
 
     def test_the_target_comes_from_the_imputed_column(self) -> None:
-        # Agréger la brute trouerait les heures que l'imputation venait de
-        # combler.
         frame = measures(1)
         frame.loc[0, "consumption_kw"] = None
         frame.loc[0, "consumption_kw_imputed"] = 42.0
@@ -173,11 +146,7 @@ class TestResample:
 
 
 class TestBuild:
-    """Seule la journée demandée sort, et seulement si son historique existe."""
-
     def test_only_the_requested_day_is_returned(self) -> None:
-        # C'est ce qui rend la production d'une journée indépendante de ses
-        # voisines, donc rejouable.
         features = build(measures(24 * 9), SPEC, DAY)
         assert set(features["ts"].dt.date) == {DAY}
 
@@ -188,8 +157,6 @@ class TestBuild:
         assert row["lag_1h"] == earlier["consumption_kw"]
 
     def test_a_gap_in_the_series_does_not_shift_the_lags(self) -> None:
-        # Le cas que la découpe corrige : une coupure décalait auparavant tout
-        # l'historique sans que rien ne le signale.
         frame = measures(24 * 9)
         gap = frame["ts"].between("2026-09-05T00:00:00Z", "2026-09-05T05:00:00Z")
         with_gap = frame[~gap].reset_index(drop=True)
@@ -199,22 +166,16 @@ class TestBuild:
         assert row["lag_1h"] == pytest.approx(expected["consumption_kw"].iloc[0])
 
     def test_the_rolling_mean_excludes_the_hour_it_describes(self) -> None:
-        # Sans le décalage d'un pas, le modèle lirait la réponse dans la
-        # question : métriques excellentes, prévisions fausses.
         features = build(measures(24 * 9), SPEC, DAY)
         row = features.iloc[5]
         previous = features.iloc[2:5]["consumption_kw"]
         assert row["roll_mean_3h"] == pytest.approx(previous.mean())
 
     def test_an_hour_without_enough_history_is_dropped(self) -> None:
-        # La garder reviendrait à imputer une valeur que le modèle prendrait
-        # pour une observation.
         features = build(measures(24 * 2, start="2026-09-07T00:00:00Z"), SPEC, DAY)
         assert features["lag_24h"].notna().all()
 
     def test_a_site_without_a_thermometer_keeps_its_hours(self) -> None:
-        # XGBoost gère nativement l'absence : exiger la température viderait
-        # la partition de ce site.
         frame = measures(24 * 9)
         frame["temperature_celsius"] = None
         assert not build(frame, SPEC, DAY).empty
@@ -237,14 +198,10 @@ class TestBuild:
         second["site_id"] = "SITE002"
         features = build(pd.concat([first, second], ignore_index=True), SPEC, DAY)
         assert set(features["site_id"]) == {"SITE001", "SITE002"}
-        # Aucune heure ne doit être dupliquée : (site_id, ts) est la clé.
         assert not features.duplicated(subset=["site_id", "ts"]).any()
 
 
 def test_build_says_which_lag_emptied_the_day(caplog) -> None:
-    # Une journée sort vide dès que la collecte est plus jeune que le plus
-    # long décalage. Sans ce message, la cause se cherche pendant des jours :
-    # aucune erreur n'est levée, la partition est simplement vide.
     spec = FeatureSpec(version="v1", resample_rule="1h", lag_hours=(1, 168),
                        rolling_window_h=24)
     jeune = measures(72, start="2026-09-06T00:00:00Z")

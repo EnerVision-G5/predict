@@ -1,11 +1,3 @@
-"""La règle qui accepte ou refuse une mise en service.
-
-C'est le fichier le plus proche d'une décision d'exploitation : chaque test
-décrit une situation où quelqu'un aurait tapé `--promote`, et ce que le service
-aurait dû répondre. La raison est vérifiée autant que le verdict — un refus
-qu'on ne peut pas relire six mois plus tard n'est pas une décision.
-"""
-
 from __future__ import annotations
 
 from training.arbitration import BenchResult
@@ -16,7 +8,6 @@ OTHER_WINDOW = "2026-08-08/2026-08-21"
 
 
 def result(error: float, window: str = WINDOW, name: str = "xgboost") -> BenchResult:
-    """Une mesure de banc réduite à ce sur quoi la règle tranche."""
     return BenchResult(name=name, window=window, metrics={"mae": error})
 
 
@@ -24,16 +15,12 @@ NAIVE = result(10.0, name="persistance-24h")
 
 
 def test_a_model_that_loses_to_persistence_is_refused() -> None:
-    # ADR-010 : un modèle qui ne bat pas la recopie de la veille ne paie ni son
-    # entraînement, ni son registre, ni sa surveillance.
     verdict = decide(result(11.0), champion=result(12.0), naive=NAIVE)
     assert not verdict.accepted
     assert "ADR-010" in verdict.reason
 
 
 def test_persistence_is_checked_before_the_champion() -> None:
-    # L'ordre porte la décision : un candidat meilleur que le champion mais
-    # battu par la persistance ne mérite pas d'être servi pour autant.
     verdict = decide(result(11.0), champion=result(50.0), naive=NAIVE)
     assert not verdict.accepted
     assert "persistance" in verdict.reason
@@ -46,8 +33,6 @@ def test_the_first_promotion_has_nothing_to_degrade() -> None:
 
 
 def test_two_different_benches_are_not_compared() -> None:
-    # Le refus est franc plutôt que masqué par un classement que personne ne
-    # pourrait défendre. Il se lève en figeant le banc dans conf/.
     verdict = decide(
         result(6.0), champion=result(7.0, window=OTHER_WINDOW), naive=NAIVE
     )
@@ -62,8 +47,6 @@ def test_a_degradation_is_refused() -> None:
 
 
 def test_an_equal_candidate_passes_at_zero_margin() -> None:
-    # Marge nulle : le candidat doit au moins égaler le champion, et l'égalité
-    # n'est pas une dégradation.
     assert decide(result(7.0), champion=result(7.0), naive=NAIVE).accepted
 
 

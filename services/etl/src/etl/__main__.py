@@ -1,40 +1,10 @@
-"""Point d'entrée de l'ETL : une journée de mesures, une partition de variables.
-
-    python -m etl
-    python -m etl --date 2026-09-02
-    python -m etl --date 2026-09-02 --feature-version v1
-    python -m etl --days 2
-
-Sans `--date`, la journée produite est celle du jour : c'est ce dont une
-boucle périodique a besoin, et lui faire calculer une date dans son shell
-mettrait la règle ailleurs que dans le service qui l'applique.
-
-`--days` produit plusieurs journées en remontant depuis `--date`, de la plus
-ancienne à la plus récente. Une journée en cours n'est complète qu'au
-lendemain : la rejouer une fois de plus est ce qui la termine, et comme
-l'écriture remplace la partition au lieu de l'allonger, la rejouer ne coûte
-que le calcul.
-
-Le service lit `mesure` dans TimescaleDB, y repose ce qu'il en a déduit, et
-publie `features/{version}/dt=.../` sur le stockage objet. Il ne connaît ni le
-collecteur qui a rempli la table ni l'entraînement qui lira les partitions : il
-ouvre une connexion et un chemin.
-
-La fenêtre lue déborde sur les jours précédents, et c'est nécessaire. Le
-décalage de 168 heures d'une heure du 2 septembre désigne une heure du
-26 août : produire la journée à partir d'elle seule donnerait des décalages
-vides, et elle sortirait presque entièrement écartée sans que rien ne
-l'explique. La profondeur du débord est déduite du plus long décalage demandé,
-jamais fixée à la main.
-
-Seule la journée demandée est réécrite en base, jamais toute la fenêtre lue :
-celle-ci ne sert qu'aux décalages, et reposer huit journées pour en produire
-une ferait payer huit fois le même travail sans rien changer au résultat.
-
-Relancer la même date reproduit le même résultat des deux côtés : l'écriture en
-base repose les colonnes déduites au lieu de les ajouter, et la partition de
-variables est remplacée au lieu de grossir.
-"""
+# **********************************************************************
+# * Nom     : __main__.py                                              *
+# * Type    : Point d'entrée                                           *
+# * Sujet   : Production d'une ou plusieurs journées de variables, de  *
+# *   la base au stockage objet                                        *
+# * Service : etl                                                      *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -72,20 +42,15 @@ from predict_common.paths import (
 )
 from predict_common.schemas import TIMESTAMP_COLUMN, features_arrow_schema
 
-# Journées produites quand la ligne de commande n'en demande pas
-# davantage. Une seule : `--date 2026-09-02` reste ce qu'il était, et
-# demander une fenêtre est un geste explicite.
+# Nombre de journées produites quand rien n'est demandé.
 DEFAULT_DAYS = 1
 
+# Code de sortie d'un run abouti.
 EXIT_OK = 0
+# Code de sortie d'un run interrompu.
 EXIT_FAILED = 1
 
-# Ce que Postgres répond tant qu'il n'accepte pas encore de connexion : il
-# rejoue son WAL, ou il s'arrête. Au redémarrage du poste, les conteneurs
-# repartent tous ensemble et gagnent la course sur la base de quelques
-# secondes — `depends_on: service_healthy` n'ordonne que `compose up`, pas la
-# relance du démon Docker. Le cycle suivant passera ; laisser la trace du
-# driver ici ferait chercher un bug là où il n'y a qu'un ordre de démarrage.
+# Messages par lesquels PostgreSQL dit qu'il démarre encore.
 DB_WARMUP_MARKERS = (
     "the database system is starting up",
     "the database system is shutting down",
@@ -97,7 +62,10 @@ logger = logging.getLogger(__name__)
 
 
 def feature_spec(config: Config, version: str | None = None) -> FeatureSpec:
-    """Construit la définition des variables demandée par la configuration."""
+    """Méthode : feature_spec
+    Description : Construit la définition des variables demandée par la
+      configuration.
+    """
     return FeatureSpec(
         version=version or config.get_str("etl.feature_version"),
         resample_rule=config.get_str("etl.resample_rule"),
@@ -111,10 +79,9 @@ def transform(
     spec: FeatureSpec,
     day: date,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Enchaîne les étages et retourne les mesures enrichies et les variables.
-
-    Les deux sont retournés parce qu'ils ne vont pas au même endroit : les
-    mesures repartent dans `mesure`, les variables en partition.
+    """Méthode : transform
+    Description : Enchaîne les étages et retourne les mesures enrichies et les
+      variables.
     """
     measures = impute_frame(deduplicate(to_measures(check_measures(raw))))
     features = build(keep_usable(measures), spec, day)
@@ -127,21 +94,9 @@ def publish(
     spec: FeatureSpec,
     day: date,
 ) -> str | None:
-    """Écrit la partition de variables, sauf si cela revenait à en effacer une.
-
-    Une partition vide se publie : une journée sans heure exploitable existe,
-    et le dire vaut mieux que laisser un trou qu'on ne saurait distinguer
-    d'une journée jamais traitée.
-
-    Mais l'écriture REMPLACE la partition cible. Un run qui ne produit rien
-    par accident de fenêtre — la collecte trop jeune pour que `lag_168h`
-    désigne quelque chose, la source muette pendant un cycle — effacerait
-    alors des variables qu'aucun autre traitement ne régénère à cette date,
-    et la chaîne aval n'aurait plus rien à lire sans qu'une seule erreur ait
-    été levée. Entre les deux, on garde ce qui existe.
-
-    Rend `None` quand rien n'a été écrit, pour que l'appelant ne journalise
-    pas une publication qui n'a pas eu lieu.
+    """Méthode : publish
+    Description : Écrit la partition de variables, sauf si cela revenait à en
+      effacer une.
     """
     partition = features_partition(root, spec.version, day)
     if features.empty and io.exists(partition):
@@ -167,7 +122,10 @@ def publish(
 
 
 def run(config: Config, engine: Engine, day: date, version: str | None) -> int:
-    """Produit la journée demandée et retourne le nombre d'heures publiées."""
+    """Méthode : run
+    Description : Produit la journée demandée et retourne le nombre d'heures
+      publiées.
+    """
     spec = feature_spec(config, version)
     root = config.get_str("storage.root")
     batch_size = config.get_int("database.batch_size")
@@ -193,11 +151,9 @@ def run(config: Config, engine: Engine, day: date, version: str | None) -> int:
 
 
 def of_day(measures: pd.DataFrame, day: date) -> pd.DataFrame:
-    """Ne garde que les mesures du jour produit.
-
-    Le reste de la fenêtre n'a servi qu'à donner un passé aux décalages : le
-    reposer en base à chaque run ferait réécrire huit journées pour en produire
-    une, sans rien changer à ce qu'elles contiennent.
+    """Méthode : of_day
+    Description : Ne garde que les mesures du jour produit, le reste n'ayant
+      servi qu'aux décalages.
     """
     if measures.empty:
         return measures
@@ -205,7 +161,9 @@ def of_day(measures: pd.DataFrame, day: date) -> pd.DataFrame:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Analyse la ligne de commande de l'ETL."""
+    """Méthode : parse_args
+    Description : Analyse la ligne de commande de l'ETL.
+    """
     parser = argparse.ArgumentParser(
         prog="etl",
         description="Transformation des mesures TimescaleDB en variables.",
@@ -236,13 +194,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _configure_logging() -> None:
-    """Arme le journal, et met la sortie standard à l'abri de l'encodage local.
-
-    MLflow imprime des emoji quand il rend la main ; une console Windows en
-    cp1252 lève alors une UnicodeEncodeError au beau milieu d'un run qui, lui,
-    s'est bien passé. On ne peut pas demander à MLflow de se taire, mais on
-    peut faire en sorte qu'un caractère non représentable dégrade l'affichage
-    au lieu d'interrompre le traitement.
+    """Méthode : _configure_logging
+    Description : Arme le journal et met la sortie à l'abri de l'encodage
+      local.
     """
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -255,24 +209,27 @@ def _configure_logging() -> None:
 
 
 def is_db_warming_up(error: BaseException) -> bool:
-    """Dit si la base refuse la connexion parce qu'elle démarre encore."""
+    """Méthode : is_db_warming_up
+    Description : Dit si l'erreur signale une base qui démarre plutôt qu'une
+      panne.
+    """
     message = str(error).lower()
     return any(marker in message for marker in DB_WARMUP_MARKERS)
 
 
 def db_error_line(error: BaseException) -> str:
-    """Réduit une erreur de driver à sa raison, en une ligne.
-
-    SQLAlchemy ajoute à `str()` un lien vers sa documentation et psycopg
-    déroule l'adresse et le port : quatre lignes pour une boucle horaire qui
-    n'a besoin que de savoir pourquoi elle n'a pas pu écrire.
+    """Méthode : db_error_line
+    Description : Réduit une erreur SQLAlchemy à sa première ligne utile.
     """
     lines = str(getattr(error, "orig", None) or error).strip().splitlines()
     return lines[0].strip() if lines else type(error).__name__
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Point d'entrée du conteneur ETL."""
+    """Méthode : main
+    Description : Point d'entrée : lit la configuration, produit les journées
+      demandées, rend un code de sortie.
+    """
     _configure_logging()
     args = parse_args(argv)
     engine: Engine | None = None
@@ -280,14 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config()
         end = parse_date(args.date) if args.date else datetime.now(UTC).date()
         engine = open_engine(config.get_optional_str("database.url"))
-        # Avant tout calcul : une base en retard de migration ferait
-        # échouer le chargement APRÈS avoir produit la journée entière,
-        # sous la forme brute que remonte le driver.
         verify_schema(engine, (mesure, mesure_exclu))
-        # Le rejeu d'une journée déjà produite est sans effet de bord : la
-        # partition est remplacée et l'écriture en base repose les colonnes
-        # déduites. Une fenêtre n'a donc pas à savoir où la précédente s'est
-        # arrêtée.
         for day in lookback_range(end, args.days):
             run(config, engine, day, args.feature_version)
     except (ConfigError, DatabaseError, PathError, CleanError) as exc:
@@ -297,8 +247,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("run interrompu : %s", exc)
         return EXIT_FAILED
     except OperationalError as exc:
-        # La base est joignable ou pas, mais la faute n'est jamais dans le
-        # SQL de la chaîne : une requête fautive lèverait ProgrammingError.
         if is_db_warming_up(exc):
             logger.info("base en attente : elle démarre encore.")
         else:

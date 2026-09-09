@@ -1,30 +1,10 @@
-"""Construction des variables explicatives : agrégats, décalages, calendrier.
-
-La source produit à la minute, le modèle prédit à l'heure. C'est ici que la
-série change de pas, et ce changement n'est pas un détail de mise en forme :
-il corrige une faute que la chaîne portait tant que les décalages étaient
-calculés en nombre de lignes. Un décalage compté en lignes suppose une série
-sans trou ; une coupure de capteur d'un quart d'heure décalait alors
-silencieusement tout l'historique, et `lag_24h` désignait autre chose que la
-veille sans que rien ne le dise.
-
-Ici, la série est rééchantillonnée puis réindexée sur une grille horaire
-complète, trous compris. Un décalage devient une position sur cette grille :
-`lag_24h` est la veille à la même heure, ou rien du tout. Les lignes dont un
-décalage manque sont retirées — elles n'ont pas d'historique suffisant, et les
-garder reviendrait à imputer une valeur que le modèle prendrait pour une
-observation.
-
-La moyenne glissante est décalée d'un pas avant d'être calculée. Sans ce
-décalage, elle contiendrait la cible de l'heure courante : le modèle lirait la
-réponse dans la question, ses métriques seraient excellentes à
-l'apprentissage et fausses en production.
-
-Chaque heure porte enfin ce qu'elle doit à l'ETL. `imputed_ratio` dit quelle
-part de l'heure a été reconstruite et `data_quality` retient la plus sévère
-des qualifications des minutes qui la composent — jamais leur moyenne, qui ne
-voudrait rien dire. Les deux informent l'entraînement sans décider à sa place.
-"""
+# **********************************************************************
+# * Nom     : features.py                                              *
+# * Type    : Module                                                   *
+# * Sujet   : Construction des variables explicatives : grille         *
+# *   horaire, décalages, calendrier                                   *
+# * Service : etl                                                      *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -48,28 +28,29 @@ from predict_common.schemas import (
     rolling_column,
 )
 
+# Part de l'heure qui a été reconstruite.
 IMPUTED_RATIO_COLUMN = "imputed_ratio"
+# Premier jour du week-end, lundi valant zéro.
 WEEKEND_FIRST_DAY = 5
+# Sert à vérifier que le pas de grille divise l'heure.
 SECONDS_PER_HOUR = 3600
 
 logger = logging.getLogger(__name__)
 
 
 class FeatureError(ValueError):
-    """Les variables demandées ne peuvent pas être calculées telles quelles."""
+    """Classe : FeatureError
+    Description : Les variables demandées ne peuvent pas être calculées telles
+      quelles.
+    """
 
 
 @dataclass(frozen=True)
 class FeatureSpec:
-    """Définition d'une version de variables, telle que `conf/` la porte.
-
-    Changer l'un de ces champs change les colonnes produites : c'est pour cela
-    qu'un tel changement s'accompagne d'une nouvelle `feature_version`, et non
-    d'une réécriture des partitions existantes. Deux versions coexistent alors
-    sous deux préfixes, et un modèle entraîné sur la première reste
-    reproductible après la sortie de la seconde.
+    """Classe : FeatureSpec
+    Description : Définition d'une version de variables : pas, décalages,
+      fenêtre glissante.
     """
-
     version: str
     resample_rule: str
     lag_hours: tuple[int, ...]
@@ -77,24 +58,16 @@ class FeatureSpec:
 
     @property
     def columns(self) -> tuple[str, ...]:
-        """Colonnes calculées écrites dans la partition, dans l'ordre du schéma.
-
-        Sur-ensemble des variables du modèle : l'ETL publie aussi ce que le
-        modèle ne consomme pas, la température au premier chef. Ce que le
-        modèle lit est décidé par `feature_columns`, pas ici — la couche des
-        variables décrit ce qu'elle sait, elle n'arbitre pas à la place de
-        l'entraînement.
+        """Méthode : columns
+        Description : Énumère les colonnes publiées par cette version.
         """
         return published_columns(self.lag_hours, self.rolling_window_h)
 
     @property
     def periods_per_hour(self) -> int:
-        """Nombre de pas de la grille dans une heure.
-
-        Les décalages sont exprimés en heures dans `conf/`, parce que c'est
-        ainsi qu'on raisonne sur une saisonnalité. La grille, elle, a le pas
-        du rééchantillonnage : la conversion doit être exacte, sinon `lag_24h`
-        ne tomberait pas sur la veille à la même heure.
+        """Méthode : periods_per_hour
+        Description : Nombre de pas de grille dans une heure, refusé s'il n'est
+          pas entier.
         """
         step = pd.Timedelta(self.resample_rule)
         seconds = step.total_seconds()
@@ -107,24 +80,18 @@ class FeatureSpec:
 
     @property
     def lookback_days(self) -> int:
-        """Profondeur d'historique nécessaire pour remplir une journée.
-
-        Le décalage le plus long décide : produire le 2 septembre avec un
-        `lag_168h` demande de lire jusqu'au 26 août. La journée elle-même
-        compte pour un, et un jour de marge absorbe le décalage de fuseau
-        d'une source qui ne serait pas exactement en UTC.
+        """Méthode : lookback_days
+        Description : Profondeur à lire pour que le plus long décalage ait de
+          quoi désigner.
         """
         deepest_h = max((*self.lag_hours, self.rolling_window_h))
         return 2 + -(-deepest_h // 24)
 
 
 def resample(frame: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
-    """Ramène les mesures d'un lot au pas de la grille, site par site.
-
-    La cible agrégée est `consumption_kw_imputed` et non `consumption_kw` :
-    c'est elle qui porte la meilleure valeur exploitable de chaque minute, la
-    brute quand elle existe et la reconstruite sinon. Agréger la brute
-    trouerait les heures que l'imputation venait précisément de combler.
+    """Méthode : resample
+    Description : Ramène les mesures d'une fenêtre sur la grille horaire, site
+      par site.
     """
     if frame.empty:
         return _empty_hourly()
@@ -139,12 +106,9 @@ def resample(frame: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
 
 
 def build(frame: pd.DataFrame, spec: FeatureSpec, day: date) -> pd.DataFrame:
-    """Produit les variables du jour demandé à partir d'une fenêtre de mesures.
-
-    La fenêtre reçue déborde volontairement sur les jours précédents : sans
-    eux, `lag_168h` n'aurait rien à désigner. Seul le jour demandé est
-    retourné, et c'est ce qui rend la production d'une journée indépendante
-    des journées voisines — donc rejouable.
+    """Méthode : build
+    Description : Produit les variables du jour demandé à partir d'une fenêtre
+      de mesures.
     """
     hourly = resample(frame, spec)
     if hourly.empty:
@@ -167,13 +131,8 @@ def _report_incomplete(
     complete: pd.DataFrame,
     spec: FeatureSpec,
 ) -> None:
-    """Dit quelles colonnes ont fait retirer des heures, et combien.
-
-    Sans ce compte, une journée sort vide sans rien dire de plus, et la cause
-    la plus courante — un décalage qui n'a pas encore d'historique à désigner,
-    parce que la collecte a démarré il y a moins de `lag_168h` — se cherche
-    pendant des jours. La journée reste produite vide : c'est une information
-    d'exploitation, pas une erreur. Elle mérite seulement d'être motivée.
+    """Méthode : _report_incomplete
+    Description : Dit quelles colonnes ont fait retirer des heures, et combien.
     """
     removed = len(selected) - len(complete)
     if not removed:
@@ -196,11 +155,9 @@ def _resample_site(
     group: pd.DataFrame,
     spec: FeatureSpec,
 ) -> pd.DataFrame:
-    """Agrège les mesures d'un site sur la grille, une colonne à la fois.
-
-    Chaque colonne a sa règle, et aucune n'est la moyenne par défaut :
-    `data_quality` retient la plus sévère, `imputed_ratio` est la part des
-    minutes reconstruites. Une agrégation uniforme perdrait les deux.
+    """Méthode : _resample_site
+    Description : Agrège les mesures d'un site sur la grille, une colonne à la
+      fois.
     """
     indexed = group.set_index(pd.DatetimeIndex(group[TIMESTAMP_COLUMN])).sort_index()
     buckets = indexed.resample(spec.resample_rule)
@@ -219,10 +176,8 @@ def _resample_site(
 
 
 def _derive_site(group: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
-    """Ajoute calendrier, décalages et moyenne glissante à un site.
-
-    Le site est d'abord réindexé sur une grille complète : c'est cette grille,
-    et non la suite des lignes présentes, qui donne son sens à un décalage.
+    """Méthode : _derive_site
+    Description : Ajoute calendrier, décalages et moyenne glissante à un site.
     """
     frame = _on_complete_grid(group, spec)
     stamps = frame[TIMESTAMP_COLUMN]
@@ -232,8 +187,6 @@ def _derive_site(group: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
     target = frame[TARGET_COLUMN]
     for hours in spec.lag_hours:
         frame[lag_column(hours)] = target.shift(hours * spec.periods_per_hour)
-    # Décalée d'un pas avant d'être moyennée : sans cela, la fenêtre
-    # contiendrait la cible de l'instant courant.
     window = spec.rolling_window_h * spec.periods_per_hour
     frame[rolling_column(spec.rolling_window_h)] = (
         target.shift(1).rolling(window=window, min_periods=window).mean()
@@ -242,7 +195,10 @@ def _derive_site(group: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
 
 
 def _on_complete_grid(group: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
-    """Réindexe un site sur une grille sans trou, du premier au dernier pas."""
+    """Méthode : _on_complete_grid
+    Description : Réindexe un site sur une grille sans trou, pour que les
+      décalages tombent juste.
+    """
     ordered = group.sort_values(TIMESTAMP_COLUMN)
     grid = pd.date_range(
         start=ordered[TIMESTAMP_COLUMN].min(),
@@ -262,7 +218,9 @@ def _on_complete_grid(group: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
 
 
 def _imputed_ratio(methods: pd.Series) -> float:
-    """Part des mesures du pas dont la valeur a été reconstruite."""
+    """Méthode : _imputed_ratio
+    Description : Part des minutes reconstruites dans une heure.
+    """
     known = methods.dropna()
     if known.empty:
         return 0.0
@@ -270,7 +228,10 @@ def _imputed_ratio(methods: pd.Series) -> float:
 
 
 def _worst_quality(qualities: pd.Series) -> str:
-    """Qualification du pas : la plus sévère de celles qu'il contient."""
+    """Méthode : _worst_quality
+    Description : Retient la qualification la plus sévère des minutes d'une
+      heure.
+    """
     known = qualities.dropna()
     if known.empty:
         return QUALITY_CRITICAL
@@ -278,12 +239,8 @@ def _worst_quality(qualities: pd.Series) -> str:
 
 
 def _required_columns(spec: FeatureSpec) -> Sequence[str]:
-    """Colonnes dont l'absence retire la ligne du jeu d'apprentissage.
-
-    La température n'en fait pas partie, et c'est délibéré : un site sans
-    capteur thermique produit une série de consommation parfaitement
-    exploitable, et XGBoost gère nativement l'absence d'une variable. L'exiger
-    ici viderait la partition de ce site sans rien dire.
+    """Méthode : _required_columns
+    Description : Colonnes sans lesquelles une heure n'est pas publiable.
     """
     return (
         TARGET_COLUMN,
@@ -293,7 +250,9 @@ def _required_columns(spec: FeatureSpec) -> Sequence[str]:
 
 
 def _output_columns(spec: FeatureSpec) -> Sequence[str]:
-    """Colonnes de la partition produite, dans l'ordre du schéma."""
+    """Méthode : _output_columns
+    Description : Colonnes écrites dans la partition, dans l'ordre.
+    """
     return (
         TIMESTAMP_COLUMN,
         SITE_COLUMN,
@@ -305,7 +264,9 @@ def _output_columns(spec: FeatureSpec) -> Sequence[str]:
 
 
 def _empty_hourly() -> pd.DataFrame:
-    """Tableau horaire vide, aux colonnes attendues par la suite."""
+    """Méthode : _empty_hourly
+    Description : Tableau horaire vide, mais aux bonnes colonnes.
+    """
     return pd.DataFrame(
         columns=[
             TIMESTAMP_COLUMN,
@@ -319,5 +280,7 @@ def _empty_hourly() -> pd.DataFrame:
 
 
 def _empty_features(spec: FeatureSpec) -> pd.DataFrame:
-    """Tableau de variables vide, aux colonnes de la version demandée."""
+    """Méthode : _empty_features
+    Description : Partition de variables vide, mais aux bonnes colonnes.
+    """
     return pd.DataFrame(columns=list(_output_columns(spec)))
