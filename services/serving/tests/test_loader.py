@@ -51,7 +51,7 @@ def loaded(model: FakeModel) -> LoadedModel:
     inputs = model.metadata.signature.inputs
     return LoadedModel(
         model=model,
-        uri="models:/enervision_xgboost@champion",
+        uri="models:/enervision_consommation@champion",
         version="3",
         columns=tuple(inputs.input_names()),
         dtypes=dict(zip(inputs.input_names(), inputs.numpy_types(), strict=True)),
@@ -80,7 +80,9 @@ def registry_serving(
     monkeypatch.setattr(loader.mlflow.pyfunc, "load_model", load_model)
     monkeypatch.setattr(loader.mlflow, "set_tracking_uri", lambda uri: None)
     monkeypatch.setattr(loader, "_registry_entry", lambda uri: entry)
-    return ModelRegistry("http://mlflow.invalid", "models:/enervision_xgboost@champion")
+    return ModelRegistry(
+        "http://mlflow.invalid", "models:/enervision_consommation@champion"
+    )
 
 
 def test_a_resolvable_alias_makes_the_service_ready(monkeypatch) -> None:
@@ -138,8 +140,8 @@ class TestConform:
 
 class TestAliasParsing:
     def test_an_alias_uri_is_decomposed(self) -> None:
-        assert loader._parse_alias("models:/enervision_xgboost@champion") == (
-            "enervision_xgboost",
+        assert loader._parse_alias("models:/enervision_consommation@champion") == (
+            "enervision_consommation",
             "champion",
         )
 
@@ -147,7 +149,7 @@ class TestAliasParsing:
         assert loader._parse_alias("runs:/abc/model") == ("", "")
 
     def test_a_registry_without_an_alias_has_none(self) -> None:
-        assert loader._parse_alias("models:/enervision_xgboost/3") == ("", "")
+        assert loader._parse_alias("models:/enervision_consommation/3") == ("", "")
 
     def test_the_internal_identifier_takes_over_without_a_registry(self) -> None:
         assert loader._version_of(None, FakeModel(), "runs:/abc/model") == "uuid-1"

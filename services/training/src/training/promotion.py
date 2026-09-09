@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from training.arbitration import BenchResult
@@ -15,6 +16,22 @@ from training.model import DECISION_METRIC
 
 # Marge exigée sur le champion en place, en part d'erreur.
 DEFAULT_MARGIN = 0.0
+
+# Bruit de calcul, non tolérance de qualité — celle-là est la marge.
+# La forêt agrège ses arbres en parallèle : deux runs identiques diffèrent au
+# dernier bit, et 5e-15 kW se lisaient « dégradation ».
+FLOAT_TOLERANCE = 1e-9
+
+
+def degrades(measured: float, tolerated: float) -> bool:
+    """Méthode : degrades
+    Description : Dit si une mesure dépasse le toléré au-delà du bruit de
+      calcul. Deux valeurs égales à FLOAT_TOLERANCE près décrivent le même
+      modèle.
+    """
+    return measured > tolerated and not math.isclose(
+        measured, tolerated, rel_tol=FLOAT_TOLERANCE
+    )
 
 
 @dataclass(frozen=True)
@@ -81,7 +98,7 @@ def decide(
             ),
         )
     tolerated = served * (1.0 + margin)
-    if measured > tolerated:
+    if degrades(measured, tolerated):
         return Verdict(
             accepted=False,
             reason=(
