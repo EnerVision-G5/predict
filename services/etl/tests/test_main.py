@@ -1,14 +1,3 @@
-"""Enchaînement d'un run : lecture de la fenêtre, transformation, publication.
-
-Ce fichier teste ce que les étages ne peuvent pas tester seuls — la fenêtre
-lue, ce qui repart en base, et l'idempotence de la partition publiée.
-
-La base est remplacée par un moteur qui rend un lot préparé à la lecture et
-mémorise les instructions à l'écriture. Ce qui compte n'est pas que PostgreSQL
-accepte les instructions — c'est son métier, et le schéma figé le garantit —
-mais que l'ETL lise la bonne fenêtre et n'en repose que la bonne journée.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
@@ -44,13 +33,6 @@ SPEC_LAGS = [1, 24]
 
 
 class ReadingEngine(FakeEngine):
-    """Moteur factice qui rend un lot fixe à la lecture.
-
-    `pd.read_sql_query` passe par `connect()` ; l'écriture passe par `begin()`.
-    Séparer les deux permet de vérifier ce qui est relu autant que ce qui est
-    réécrit, sans jamais joindre une base.
-    """
-
     def __init__(self, frame: pd.DataFrame) -> None:
         super().__init__()
         self.frame = frame
@@ -67,7 +49,6 @@ class ReadingEngine(FakeEngine):
 
 
 def config_for(root: Path) -> Config:
-    """Configuration minimale d'un run, pointée sur un stockage jetable."""
     return Config(
         values={
             "storage": {"root": str(root)},
@@ -86,7 +67,6 @@ def config_for(root: Path) -> Config:
 
 
 def measures(make_raw, make_reading, days: int = 5, **overrides) -> pd.DataFrame:
-    """Lot tel qu'une lecture de `mesure` le rendrait, sur `days` journées."""
     readings = [
         make_reading(
             f"{(DAY - timedelta(days=offset)).isoformat()}T{hour:02d}:00:00Z",
@@ -100,8 +80,6 @@ def measures(make_raw, make_reading, days: int = 5, **overrides) -> pd.DataFrame
 
 @pytest.fixture
 def patched_read(monkeypatch):
-    """Remplace la lecture SQL par le lot que porte le moteur factice."""
-
     def install(engine: ReadingEngine) -> None:
         def read_sql_query(query, connection, params=None, **kwargs):
             connection.queried.append(dict(params or {}))
@@ -123,11 +101,7 @@ def test_the_command_line_overrides_the_configured_version(tmp_path: Path) -> No
 
 
 class TestWindow:
-    """La fenêtre lue déborde sur les journées que les décalages réclament."""
-
     def test_it_ends_at_midnight_after_the_produced_day(self) -> None:
-        # Borne haute exclue : une mesure de minuit pile appartient au
-        # lendemain et à lui seul, sinon deux runs voisins la liraient.
         _, end = window(DAY, 3)
         assert end == datetime(2026, 9, 11, tzinfo=UTC)
 
@@ -155,8 +129,6 @@ def test_run_publishes_the_features_partition(
 def test_run_reads_the_window_the_lags_need(
     tmp_path: Path, make_raw, make_reading, patched_read
 ) -> None:
-    # Sans les journées précédentes, lag_24h n'aurait rien à désigner et la
-    # journée sortirait presque entièrement écartée.
     engine = ReadingEngine(measures(make_raw, make_reading))
     patched_read(engine)
     run(config_for(tmp_path), engine, DAY, version=None)
@@ -168,8 +140,6 @@ def test_run_reads_the_window_the_lags_need(
 def test_run_reposes_only_the_produced_day(
     tmp_path: Path, make_raw, make_reading, patched_read
 ) -> None:
-    # La fenêtre lue ne sert qu'aux décalages : la reposer entière ferait
-    # réécrire cinq journées pour en produire une.
     engine = ReadingEngine(measures(make_raw, make_reading))
     patched_read(engine)
     run(config_for(tmp_path), engine, DAY, version=None)
@@ -183,7 +153,6 @@ def test_run_reposes_only_the_produced_day(
 def test_a_replay_reproduces_the_partition(
     tmp_path: Path, make_raw, make_reading, patched_read
 ) -> None:
-    # Le rejeu après incident est le mode d'exploitation normal.
     engine = ReadingEngine(measures(make_raw, make_reading))
     patched_read(engine)
     config = config_for(tmp_path)
@@ -196,8 +165,6 @@ def test_a_replay_reproduces_the_partition(
 def test_two_versions_do_not_overwrite_each_other(
     tmp_path: Path, make_raw, make_reading, patched_read
 ) -> None:
-    # C'est ce qui permet à un modèle entraîné sur v1 de rester reproductible
-    # après la sortie de v2.
     engine = ReadingEngine(measures(make_raw, make_reading))
     patched_read(engine)
     config = config_for(tmp_path)
@@ -227,8 +194,6 @@ def test_transform_returns_the_whole_window_of_measures(
     spec = feature_spec(config_for(tmp_path))
     enriched, _ = transform(measures(make_raw, make_reading), spec, DAY)
     assert "consumption_kw_imputed" in enriched.columns
-    # Toute la fenêtre : c'est elle que les variables consomment. C'est
-    # `of_day` qui restreint ensuite ce qui repart en base.
     assert len(enriched) == 24 * 5
 
 
@@ -243,8 +208,6 @@ def test_of_day_keeps_only_the_produced_day(
 def test_a_day_of_outages_publishes_an_empty_partition(
     tmp_path: Path, make_raw, make_reading, patched_read
 ) -> None:
-    # Une journée sans mesure exploitable existe et elle est vide : c'est une
-    # information, pas une absence de partition.
     engine = ReadingEngine(
         measures(
             make_raw,
@@ -259,6 +222,37 @@ def test_a_day_of_outages_publishes_an_empty_partition(
     assert io.exists(features_partition(str(tmp_path), "v1", DAY))
 
 
+def test_an_empty_run_keeps_the_partition_it_would_have_erased(
+    tmp_path: Path, make_raw, make_reading, patched_read
+) -> None:
+    engine = ReadingEngine(measures(make_raw, make_reading))
+    patched_read(engine)
+    assert run(config_for(tmp_path), engine, DAY, version=None) == 24
+    partition = features_partition(str(tmp_path), "v1", DAY)
+
+    vide = ReadingEngine(
+        measures(
+            make_raw,
+            make_reading,
+            consumption_kw=None,
+            null_reasons=["sensor_failure"],
+        )
+    )
+    patched_read(vide)
+    assert run(config_for(tmp_path), vide, DAY, version=None) == 0
+    assert len(io.read_frames([partition])) == 24
+
+
+def test_publish_reports_that_nothing_was_written(
+    tmp_path: Path, make_raw, make_reading, patched_read
+) -> None:
+    engine = ReadingEngine(measures(make_raw, make_reading))
+    patched_read(engine)
+    run(config_for(tmp_path), engine, DAY, version=None)
+    spec = feature_spec(config_for(tmp_path))
+    assert publish(pd.DataFrame(), str(tmp_path), spec, DAY) is None
+
+
 def test_the_features_carry_no_excluded_measure(
     tmp_path: Path, make_raw, make_reading, patched_read
 ) -> None:
@@ -271,12 +265,7 @@ def test_the_features_carry_no_excluded_measure(
 
 
 class TestParseArgs:
-    """La ligne de commande dit ce que le run produit."""
-
     def test_the_date_defaults_to_today(self) -> None:
-        # La boucle du conteneur appelle `python -m etl` sans argument : une
-        # date obligatoire la faisait sortir en erreur à chaque cycle, donc
-        # ne publiait jamais rien.
         assert parse_args([]).date is None
 
     def test_a_single_day_is_produced_by_default(self) -> None:
@@ -290,24 +279,12 @@ class TestParseArgs:
         assert args.feature_version == "v2"
 
     def test_the_side_output_flag_is_gone(self) -> None:
-        # La base n'est plus une sortie annexe : elle est la couche brute, et
-        # l'écriture de retour n'est plus optionnelle.
         with pytest.raises(SystemExit):
             parse_args(["--date", "2026-09-10", "--load-db"])
 
 
 class TestADatabaseStillStartingUp:
-    """Le conteneur repart avant que TimescaleDB ait rejoué son WAL.
-
-    Au redémarrage du poste, le démon Docker relance tous les conteneurs
-    ensemble sans lire les `depends_on` du compose — ceux-ci n'ordonnent que
-    `compose up`. Le cycle suivant passera ; la trace du driver à cet endroit
-    faisait chercher un bug là où il n'y a qu'un ordre de démarrage.
-    """
-
     def failing_open(self, monkeypatch, tmp_path: Path, error: Exception) -> None:
-        """Fait échouer l'ouverture du moteur sur l'erreur donnée."""
-
         def refuse(*args, **kwargs):
             raise error
 
@@ -335,10 +312,6 @@ class TestADatabaseStillStartingUp:
     def test_an_unreachable_database_stays_an_error_on_one_line(
         self, monkeypatch, tmp_path: Path, caplog
     ) -> None:
-        # Injoignable n'est pas « en train de démarrer » : une base absente
-        # pendant des heures doit se voir, sinon la boucle tourne à vide en
-        # silence. Une ligne suffit, le lien de SQLAlchemy n'en fait pas
-        # partie.
         origin = Exception("connection refused\nseconde ligne du driver")
         self.failing_open(monkeypatch, tmp_path, OperationalError("", {}, origin))
 
@@ -353,8 +326,6 @@ class TestADatabaseStillStartingUp:
 
 
 class TestDatabaseErrorReading:
-    """Les deux prédicats qui décident du ton du journal."""
-
     def test_the_startup_states_of_postgres_are_recognised(self) -> None:
         assert is_db_warming_up(Exception("FATAL: the database system is starting up"))
         assert is_db_warming_up(Exception("The Database System Is Shutting Down"))

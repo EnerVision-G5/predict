@@ -1,19 +1,3 @@
-"""Collecte des deux routes que `mesure` ne remplace pas.
-
-`GET /api/v1/alerts` dit ce que la source a jugé anormal, avec sa valeur et
-son seuil — rien de tout cela n'est dans une mesure, et l'alerte disparaît de
-la réponse dès qu'elle se résout. `GET /api/v1/sensors/status` dit quel
-capteur est tombé et jusqu'à quand, là où `null_reasons` ne dit que ce qui
-manquait sur une ligne.
-
-Les deux appellent des traitements opposés, et c'est le seul point qui compte
-vraiment ici : les alertes sont un journal qu'on n'écrase jamais, l'état des
-capteurs est un présent qu'on repose à chaque tick.
-
-Aucun test ne joint PostgreSQL : le SQL produit est compilé pour le dialecte
-et lu tel quel.
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -63,7 +47,6 @@ CAPTEURS = {
 
 
 def compiled(statement) -> str:
-    """Rend le SQL tel que le dialecte PostgreSQL l'émettra."""
     return str(statement.compile(dialect=postgresql.dialect()))
 
 
@@ -75,28 +58,18 @@ class TestAlertes:
         row = rows[0]
         assert row["alert_id"] == "ALR-SITE002-1718458320"
         assert row["site_id"] == "SITE002"
-        # Daté, et non nu : `alerte.ts` est un `timestamptz`, et un horodatage
-        # sans fuseau y serait interprété selon le réglage de la session qui
-        # l'insère. Sans fuseau prêté, la source est lue en UTC.
         assert row["ts"] == datetime(2026, 9, 4, 14, 12, tzinfo=UTC)
         assert row["severity"] == "critical"
-        # `type` est trop générique pour une colonne : la traduction est portée
-        # une fois, ici, plutôt que dans chaque requête.
         assert row["type_alerte"] == "outage"
         assert row["valeur"] == 812.5
         assert row["seuil"] == 720.0
 
     def test_l_horodatage_suit_le_fuseau_prete_a_la_source(self) -> None:
-        # La source date ses alertes comme elle date ses mesures : sans
-        # fuseau, sur l'heure locale de sa machine. Une alerte de 14:12
-        # locales est un incident de 12:12 UTC.
         rows = to_alerts([ALERTE], "Europe/Paris")
 
         assert rows[0]["ts"] == datetime(2026, 9, 4, 12, 12, tzinfo=UTC)
 
     def test_une_alerte_incomplete_est_ecartee_seule(self) -> None:
-        # Le lot entier serait rejeté par la base si elle partait avec : une
-        # alerte mal décrite ne doit pas emporter les autres.
         incomplete = dict(ALERTE, alert_id="ALR-X", severity=None)
         rows = to_alerts([ALERTE, incomplete])
 
@@ -108,11 +81,6 @@ class TestAlertes:
         assert rows == []
 
     def test_le_journal_n_ecrase_jamais(self) -> None:
-        """Le poller repasse chaque minute sur une alerte encore active.
-
-        `alert_id` est stable côté source : sans DO NOTHING, une alerte d'une
-        heure serait enregistrée soixante fois.
-        """
         sql = compiled(build_alerte_insert(to_alerts([ALERTE])))
 
         assert "ON CONFLICT" in sql
@@ -128,7 +96,6 @@ class TestAlertes:
         assert len(engine.executed) == 1
 
     def test_un_lot_vide_ne_soumet_rien(self) -> None:
-        # Une réponse vide est une réponse valable : aucune alerte en cours.
         engine = FakeEngine()
 
         assert write_alerts(engine, [], batch_size=10) == 0
@@ -148,14 +115,9 @@ class TestEtatDesCapteurs:
             "network",
         }
         assert all(row["site_id"] == "SITE001" for row in rows)
-        # `overall` est recopié sur chaque ligne : la table est plate, et
-        # demander « quels capteurs sont tombés » ne doit pas obliger à
-        # déplier un JSON en SQL.
         assert all(row["overall"] == "degraded" for row in rows)
 
     def test_la_date_de_retablissement_annoncee_est_conservee(self) -> None:
-        # C'est la seule information que ni `mesure` ni `null_reasons` ne
-        # portent : la source annonce jusqu'à quand elle sera muette.
         rows = {row["capteur"]: row for row in to_sensor_states(CAPTEURS)}
 
         assert rows["temperature"]["statut"] == "failing"
@@ -167,8 +129,6 @@ class TestEtatDesCapteurs:
     def test_la_date_de_retablissement_suit_le_fuseau_prete_a_la_source(
         self,
     ) -> None:
-        # `/sensors/status` ne date pas mieux ses réponses que `/current` :
-        # un capteur annoncé rétabli à 14:33 locales le serait à 12:33 UTC.
         rows = {
             row["capteur"]: row
             for row in to_sensor_states(CAPTEURS, "Europe/Paris")
@@ -189,11 +149,6 @@ class TestEtatDesCapteurs:
         assert to_sensor_states(payload) == []
 
     def test_le_present_est_repose_et_non_empile(self) -> None:
-        """Cette table dit l'état ; les épisodes vivent dans `capteur_panne`.
-
-        Empiler ici ferait une ligne par capteur et par minute pour décrire
-        une panne que deux lignes suffisent à borner.
-        """
         sql = compiled(build_capteur_etat_upsert(to_sensor_states(CAPTEURS)))
 
         assert "ON CONFLICT" in sql
@@ -216,8 +171,6 @@ class TestEtatDesCapteurs:
 
 
 def test_un_horodatage_deja_typé_traverse_intact() -> None:
-    # httpx rend des chaînes, mais un appelant peut passer un datetime : le
-    # reconvertir en chaîne pour le reparser serait une perte de fuseau.
     stamp = datetime(2026, 9, 4, 14, 12, tzinfo=UTC)
     rows = to_alerts([dict(ALERTE, timestamp=stamp)])
 
@@ -228,14 +181,6 @@ NOW = datetime(2026, 9, 4, 14, 40, tzinfo=UTC)
 
 
 class TestJournalDesPannes:
-    """Les transitions, là où la source ne sert qu'un présent.
-
-    `capteur_etat` dit l'état, ce journal dit les épisodes. Et ni l'un ni
-    l'autre ne double `mesure.null_reasons`, qui ne connaît que les pannes
-    visibles SUR une mesure : un capteur tombé puis rétabli entre deux relevés
-    n'y laisse rien.
-    """
-
     def test_sain_puis_en_panne_ouvre_un_episode(self) -> None:
         states = to_sensor_states(CAPTEURS)
         previous = {("SITE001", "temperature"): "ok"}
@@ -251,8 +196,6 @@ class TestJournalDesPannes:
         assert closed == []
 
     def test_une_panne_qui_dure_n_ouvre_rien_de_plus(self) -> None:
-        # Sans cette comparaison, un capteur en panne depuis trois jours
-        # ouvrirait un épisode par tick, soit plus de quatre mille.
         states = to_sensor_states(CAPTEURS)
         previous = {("SITE001", "temperature"): "failing"}
 
@@ -278,18 +221,12 @@ class TestJournalDesPannes:
         assert closed == [{"site_id": "SITE001", "capteur": "temperature"}]
 
     def test_un_capteur_jamais_vu_compte_comme_sain(self) -> None:
-        # Premier tick sur ce site : sa panne est bien un début.
         opened, closed = to_sensor_episodes({}, to_sensor_states(CAPTEURS), NOW)
 
         assert [row["capteur"] for row in opened] == ["temperature"]
         assert closed == []
 
     def test_l_ouverture_ignore_un_episode_deja_ouvert(self) -> None:
-        """Deux processus concurrents ne doivent pas en créer deux.
-
-        `DO NOTHING` sans cible : la clé naturelle n'est pas la seule
-        contrainte à protéger, l'unicité de l'épisode ouvert compte autant.
-        """
         engine = FakeEngine()
         write_sensor_episodes(engine, {}, to_sensor_states(CAPTEURS), NOW, 10)
 

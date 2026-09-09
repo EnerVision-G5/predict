@@ -1,23 +1,10 @@
-"""Schémas des couches d'artefacts : le contrat entre deux services.
-
-Chaque frontière de la chaîne est un chemin plus un schéma. Le chemin est
-construit par `paths`, le schéma est déclaré ici, et c'est leur couple qui
-remplace l'appel de fonction que la découpe a supprimé.
-
-Deux formes coexistent, et elles ne servent pas à la même chose.
-
-Le schéma pandera valide le contenu : les types, les bornes, les valeurs
-admises, ce qui peut être nul. Il est vérifié à l'écriture par le producteur
-et à la lecture par le consommateur. Cette double vérification n'est pas une
-redite : validée à l'écriture seule, une rupture de contrat serait imputée au
-consommateur trois étapes plus loin ; validée à la lecture seule, une
-partition fausse serait déjà publiée.
-
-Le schéma pyarrow fixe les types du fichier. Sans lui, une colonne entièrement
-nulle sur une journée s'écrirait en type `null`, et la lecture de deux
-partitions dont l'une a des valeurs et l'autre non échouerait à la
-concaténation — panne fréquente, tardive, et dont la cause est invisible.
-"""
+# **********************************************************************
+# * Nom     : schemas.py                                               *
+# * Type    : Module                                                   *
+# * Sujet   : Contrats des couches : noms de colonnes, valeurs admises *
+# *   et schémas de validation                                         *
+# * Service : predict_common (bibliothèque partagée)                   *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -27,8 +14,7 @@ import numpy
 import pandera.pandas as pa
 import pyarrow
 
-# Colonnes de mesure servies par la source. L'ordre est celui du schéma figé
-# v1.0 de la table `mesure`, qui reste la référence commune aux équipes.
+# Colonnes numériques de la couche brute.
 NUMERIC_COLUMNS = (
     "consumption_kw",
     "consumption_kwh",
@@ -39,22 +25,25 @@ NUMERIC_COLUMNS = (
     "humidity_percent",
 )
 
-# Colonne cible des prévisions.
+# Colonne que le modèle apprend à prédire.
 TARGET_COLUMN = "consumption_kw"
 
-# Nom de l'horodatage tel que la source le sert. La table `mesure` l'appelle
-# `ts` : le collecteur traduit à l'entrée, une fois, et c'est la seule
-# frontière de renommage de la chaîne.
+# Nom de l'horodatage tel que la source le rend.
 SOURCE_TIMESTAMP_COLUMN = "timestamp"
+# Nom de l'horodatage dans toute la chaîne.
 TIMESTAMP_COLUMN = "ts"
+# Nom de l'identifiant de site dans toute la chaîne.
 SITE_COLUMN = "site_id"
 
-# Valeurs admises par la contrainte CHECK de `data_quality`, de la moins
-# sévère à la plus sévère : cet ordre est celui de la comparaison.
+# Qualification d'une heure sans défaut constaté.
 QUALITY_GOOD = "good"
+# Qualification d'une heure incomplète mais exploitable.
 QUALITY_PARTIAL = "partial"
+# Qualification d'une heure dont la valeur est douteuse.
 QUALITY_DEGRADED = "degraded"
+# Qualification d'une heure inexploitable.
 QUALITY_CRITICAL = "critical"
+# Qualifications admises, de la meilleure à la pire.
 DATA_QUALITY_VALUES = (
     QUALITY_GOOD,
     QUALITY_PARTIAL,
@@ -62,76 +51,57 @@ DATA_QUALITY_VALUES = (
     QUALITY_CRITICAL,
 )
 
-# Qui a posé `data_quality` et `null_reasons`, migration
-# 07_mesure_quality_source.sql.
-#
-# `data_quality` est NOT NULL DEFAULT 'good' : le schéma figé ne sait pas dire
-# « pas encore qualifiée ». Le collecteur retombe donc sur le défaut quand la
-# source se tait, et l'ETL repose la qualification à son passage. Sans cette
-# colonne, les deux 'good' sont indiscernables, et une fenêtre non encore
-# traitée par l'ETL passe pour une fenêtre saine — ce que l'indicateur de
-# mesures dégradées publié par l'API métier lirait comme 0 % de dégradation.
+# Colonne disant QUI a posé la qualification.
 QUALITY_SOURCE_COLUMN = "quality_source"
+# Qualification posée par le collecteur, faute de mieux.
 QUALITY_SOURCE_SOURCE = "source"
+# Qualification déduite des données par l'ETL.
 QUALITY_SOURCE_ETL = "etl"
+# Auteurs admis d'une qualification.
 QUALITY_SOURCE_VALUES = (QUALITY_SOURCE_SOURCE, QUALITY_SOURCE_ETL)
 
-# Valeurs admises par la contrainte CHECK de `imputation_method`.
+# Valeur brute, ou rien à reconstruire.
 METHOD_NONE = "none"
+# Valeur reconstruite par report de la dernière connue.
 METHOD_LOCF = "locf"
+# Valeur reconstruite entre deux valeurs connues.
 METHOD_INTERPOLATION = "interpolation"
+# Méthodes de reconstruction admises.
 IMPUTATION_METHODS = (METHOD_NONE, METHOD_LOCF, METHOD_INTERPOLATION)
 
+# Type pandas exigé de tout horodatage de la chaîne.
 UTC_DTYPE = "datetime64[ns, UTC]"
 
-# Longueur maximale d'un identifiant de site, reprise du VARCHAR(20) de la
-# table `mesure` : une valeur plus longue serait tronquée par la base.
+# Longueur maximale d'un identifiant de site en base.
 SITE_ID_MAX_LENGTH = 20
 
-# Bornes des CHECK que porte `mesure`. Les rejouer ici n'est pas une redite :
-# une violation détectée avant l'insertion nomme la colonne et la ligne, là où
-# PostgreSQL fait échouer le lot entier sans dire laquelle des mille est
-# fautive.
+# Bornes physiques du facteur de puissance.
 POWER_FACTOR_RANGE = (0.0, 1.0)
+# Bornes physiques de l'humidité relative, en pourcent.
 HUMIDITY_RANGE = (0.0, 100.0)
 
+# Nom de la couche des variables dans les chemins.
 FEATURES_LAYER = "features"
 
 
 def is_sequence(value: object) -> bool:
-    """Dit si une valeur est un tableau de motifs, quelle que soit sa forme.
-
-    `null_reasons` est écrit en `list<string>` et relu par pyarrow sous forme
-    de tableau numpy, pas de liste Python. Les deux sont le même contrat :
-    n'accepter que la liste ferait échouer la validation sur une partition que
-    le producteur venait pourtant d'écrire valide, ce qui est le pire des
-    faux positifs — celui qui décrédibilise le contrôle.
+    """Méthode : is_sequence
+    Description : Dit si une valeur est une liste, un tuple ou un tableau.
     """
     return isinstance(value, (list, tuple, numpy.ndarray))
 
 
 def _numeric_columns(nullable: bool) -> dict[str, pa.Column]:
-    """Déclare les sept colonnes de mesure, toutes décimales."""
+    """Méthode : _numeric_columns
+    Description : Décrit les colonnes numériques de la couche brute.
+    """
     return {
         name: pa.Column(float, nullable=nullable, required=True)
         for name in NUMERIC_COLUMNS
     }
 
 
-# --- Couche brute : la table `mesure`, écrite par le collecteur, lue par l'ETL
-#
-# La couche brute n'est pas un fichier : c'est TimescaleDB. Le schéma ci-dessous
-# ne remplace pas les contraintes de la base — elles font foi et vivent dans le
-# repo enervision-db — il les rejoue en amont, là où l'erreur est encore
-# imputable au bon service. Une violation détectée ici nomme la colonne ; la
-# même violation laissée à PostgreSQL fait échouer l'insertion du lot entier
-# sans dire laquelle des mille lignes est fautive.
-#
-# Tout y est nullable sauf l'horodatage et le site. Une valeur nulle n'est pas
-# une valeur qui manque, c'est un capteur qui dit qu'il est tombé : la refuser
-# ici perdrait la panne, qui est l'information à conserver. Le tri des nulls
-# est le métier de l'ETL, pas celui du collecteur.
-
+# Contrat de la couche brute, vérifié à la lecture.
 MEASURE_SCHEMA = pa.DataFrameSchema(
     {
         TIMESTAMP_COLUMN: pa.Column(UTC_DTYPE, nullable=False),
@@ -141,9 +111,6 @@ MEASURE_SCHEMA = pa.DataFrameSchema(
             checks=pa.Check.str_length(1, SITE_ID_MAX_LENGTH),
         ),
         **_numeric_columns(nullable=True),
-        # Deux colonnes portent un CHECK en base. Une valeur hors bornes est
-        # une donnée de source aberrante, pas une panne capteur : la laisser
-        # passer ferait échouer l'insertion du lot entier.
         "power_factor": pa.Column(
             float,
             nullable=True,
@@ -152,9 +119,6 @@ MEASURE_SCHEMA = pa.DataFrameSchema(
         "humidity_percent": pa.Column(
             float, nullable=True, checks=pa.Check.in_range(*HUMIDITY_RANGE)
         ),
-        # Liste de chaînes : pandera n'a pas de type de colonne pour un
-        # tableau, la contrainte porte donc sur la valeur. `TEXT[] NOT NULL`
-        # en base, donc jamais nulle — le vide se dit par une liste vide.
         "null_reasons": pa.Column(
             object,
             nullable=False,
@@ -163,17 +127,10 @@ MEASURE_SCHEMA = pa.DataFrameSchema(
                 error="null_reasons doit être une liste, jamais une valeur seule.",
             ),
         ),
-        # `NOT NULL DEFAULT 'good'` en base : le schéma figé ne sait pas dire
-        # « non qualifiée ». Le collecteur retombe donc sur le défaut quand la
-        # source se tait, et l'ETL repose la qualification à son passage — voir
-        # UNQUALIFIED dans collector.sink.
         "data_quality": pa.Column(
             str, nullable=False, checks=pa.Check.isin(DATA_QUALITY_VALUES)
         ),
     },
-    # Une colonne inconnue de la source n'est pas une rupture de contrat : le
-    # collecteur projette ce que la table accepte. Une colonne manquante, elle,
-    # en est une.
     strict=False,
     coerce=True,
     unique=[SITE_COLUMN, TIMESTAMP_COLUMN],
@@ -181,29 +138,7 @@ MEASURE_SCHEMA = pa.DataFrameSchema(
 )
 
 
-# --- Couche des variables : ce que l'ETL écrit, ce que l'entraînement lit ---
-#
-# La cible y est obligatoire et non nulle. C'est ce qui distingue cette couche
-# de la précédente : une heure sans consommation exploitable n'est pas une
-# ligne d'apprentissage dégradée, c'est une ligne qui n'a pas sa place. Elle a
-# été écartée par `etl.exclude`, en amont, avec sa cause.
-
-# Deux jeux de colonnes, et non un seul, parce que « ce que l'ETL publie » et
-# « ce que le modèle consomme » ne sont pas la même chose.
-#
-# La température est une mesure réelle, et la partition la garde : elle sert à
-# l'analyse, et elle servira au modèle le jour où une prévision météo
-# alimentera l'inférence. Mais le service d'inférence, lui, ne connaît pas la
-# température des heures à venir — il la présenterait vide à chaque prédiction.
-# Un modèle entraîné dessus apprendrait des séparations qu'il ne pourrait plus
-# emprunter en production : chaque arbre qui teste la température enverrait
-# toutes les lignes servies dans sa branche par défaut. Ce n'est pas une
-# information perdue proprement, c'est un biais fixe que rien ne signale.
-#
-# Les deux listes se recouvrent donc partiellement, et c'est voulu : les sortir
-# d'ici plutôt que de les écrire deux fois est ce qui empêche l'ETL et
-# l'entraînement de diverger sans que rien ne le dise.
-
+# Colonnes de calendrier et de météo publiées telles quelles.
 PUBLISHED_FIXED_COLUMNS = (
     "hour",
     "day_of_week",
@@ -211,39 +146,36 @@ PUBLISHED_FIXED_COLUMNS = (
     "temperature_celsius",
 )
 
+# Colonnes de calendrier que le modèle reçoit.
 MODEL_FIXED_COLUMNS = (
     "hour",
     "day_of_week",
     "is_weekend",
 )
 
-# Bornes calendaires, écrites une fois pour que la contrainte du schéma et le
-# calcul qui la remplit ne puissent pas diverger.
+# Bornes de l'heure du jour.
 HOUR_RANGE = (0, 23)
+# Bornes du jour de la semaine, lundi valant zéro.
 DAY_OF_WEEK_RANGE = (0, 6)
 
 
 def lag_column(hours: int) -> str:
-    """Nom de la colonne portant le décalage de `hours` heures."""
+    """Méthode : lag_column
+    Description : Nomme la colonne d'un décalage exprimé en heures.
+    """
     return f"lag_{hours}h"
 
 
 def rolling_column(hours: int) -> str:
-    """Nom de la colonne portant la moyenne glissante sur `hours` heures."""
+    """Méthode : rolling_column
+    Description : Nomme la colonne d'une moyenne glissante en heures.
+    """
     return f"roll_mean_{hours}h"
 
 
 def feature_columns(lag_hours: Sequence[int], rolling_window_h: int) -> tuple[str, ...]:
-    """Retourne les variables explicatives, dans l'ordre attendu du modèle.
-
-    L'ordre compte : c'est celui de la signature MLflow, donc celui dans lequel
-    le service d'inférence doit présenter ses colonnes. Le déduire d'un même
-    appel des deux côtés est ce qui empêche l'entraînement et le service de
-    diverger sans que rien ne le dise.
-
-    La température n'en fait pas partie : voir `MODEL_FIXED_COLUMNS`. La
-    surveillance de dérive lit cette même liste, si bien qu'elle mesure la
-    tâche que le service rend vraiment, et non une tâche plus facile.
+    """Méthode : feature_columns
+    Description : Énumère les colonnes que le modèle reçoit en entrée.
     """
     return (
         *MODEL_FIXED_COLUMNS,
@@ -256,12 +188,8 @@ def published_columns(
     lag_hours: Sequence[int],
     rolling_window_h: int,
 ) -> tuple[str, ...]:
-    """Retourne les colonnes calculées que l'ETL écrit dans la partition.
-
-    Sur-ensemble de `feature_columns` : la partition porte en plus ce que le
-    modèle ne consomme pas encore. Retirer une colonne d'ici change le contrat
-    de la couche, donc impose une nouvelle `feature_version` ; en retirer une
-    de `feature_columns` ne change que le modèle, que MLflow versionne déjà.
+    """Méthode : published_columns
+    Description : Énumère les colonnes écrites dans une partition de variables.
     """
     return (
         *PUBLISHED_FIXED_COLUMNS,
@@ -274,11 +202,9 @@ def features_schema(
     lag_hours: Sequence[int],
     rolling_window_h: int,
 ) -> pa.DataFrameSchema:
-    """Construit le schéma pandera de la couche des variables.
-
-    Le schéma dépend de la configuration parce que les décalages en dépendent :
-    changer `etl.lag_hours` change les colonnes produites, et c'est pour cela
-    que ce changement s'accompagne d'une nouvelle `feature_version`.
+    """Méthode : features_schema
+    Description : Construit le contrat d'une partition de variables pour des
+      décalages donnés.
     """
     derived = {
         name: pa.Column(float, nullable=False)
@@ -303,17 +229,11 @@ def features_schema(
                 int, nullable=False, checks=pa.Check.in_range(*DAY_OF_WEEK_RANGE)
             ),
             "is_weekend": pa.Column(int, nullable=False, checks=pa.Check.isin((0, 1))),
-            # La température reste nullable : un site sans capteur thermique
-            # produit quand même une série de consommation exploitable, et
-            # XGBoost gère nativement l'absence.
             "temperature_celsius": pa.Column(float, nullable=True),
             **derived,
             "data_quality": pa.Column(
                 str, nullable=False, checks=pa.Check.isin(DATA_QUALITY_VALUES)
             ),
-            # Part de l'heure reconstruite par l'ETL, entre 0 et 1. Elle dit à
-            # l'entraînement ce que la cible doit à l'imputation, sans le
-            # décider à sa place.
             "imputed_ratio": pa.Column(
                 float, nullable=False, checks=pa.Check.in_range(0.0, 1.0)
             ),
@@ -329,7 +249,9 @@ def features_arrow_schema(
     lag_hours: Sequence[int],
     rolling_window_h: int,
 ) -> pyarrow.Schema:
-    """Construit le schéma pyarrow correspondant, qui fixe les types écrits."""
+    """Méthode : features_arrow_schema
+    Description : Construit le schéma parquet correspondant, types figés.
+    """
     derived = [
         (name, pyarrow.float64())
         for name in (

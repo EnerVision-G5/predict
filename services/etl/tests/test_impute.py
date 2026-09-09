@@ -1,9 +1,3 @@
-"""Imputation de la puissance dans une colonne séparée de la valeur brute.
-
-La garantie testée est double : la valeur brute ressort intacte de l'étage,
-et la valeur reconstruite dit toujours par quelle méthode elle a été obtenue.
-"""
-
 from __future__ import annotations
 
 import pandas as pd
@@ -23,7 +17,6 @@ from predict_common.schemas import (
 
 
 def series(make_raw, make_reading, values, site_id="SITE001"):
-    """Construit un lot horaire d'un site à partir de ses puissances."""
     readings = [
         make_reading(
             f"2026-09-02T{hour:02d}:00:00Z",
@@ -54,8 +47,6 @@ def test_impute_frame_interpolates_a_framed_gap(make_raw, make_reading) -> None:
 
 
 def test_impute_frame_weighs_the_interpolation_on_time(make_raw, make_reading) -> None:
-    # Trou de deux heures : la valeur reconstruite doit tomber au tiers et aux
-    # deux tiers, pas à la moitié comme si les mesures étaient contiguës.
     imputed = impute_frame(series(make_raw, make_reading, [10.0, None, None, 40.0]))
     assert imputed.loc[1, IMPUTED_COLUMN] == 20.0
     assert imputed.loc[2, IMPUTED_COLUMN] == 30.0
@@ -84,7 +75,6 @@ def test_impute_frame_marks_an_untouched_measure_as_none(
 
 
 def test_impute_frame_never_borrows_from_another_site(make_raw, make_reading) -> None:
-    # Deux sites ne mesurent pas la même installation.
     frame = pd.concat(
         [
             series(make_raw, make_reading, [10.0, 20.0], site_id="SITE001"),
@@ -107,8 +97,6 @@ def test_impute_frame_adds_its_columns_to_an_empty_batch(make_raw) -> None:
 def test_impute_frame_ignores_a_row_without_a_usable_timestamp(
     make_raw, make_reading
 ) -> None:
-    # Sans horodatage, une mesure n'a ni passé ni futur : lui donner une
-    # valeur reviendrait à la placer au hasard dans la série.
     frame = to_measures(
         make_raw(
             [

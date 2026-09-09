@@ -1,42 +1,10 @@
-"""Chargement de l'historique de référence dans la couche brute.
-
-Pourquoi ce module existe. `GET /api/v1/readings` ne sert pas d'historique :
-la source ne remonte qu'à 48 heures, et au-delà elle répond des mesures NULLES
-plutôt qu'une erreur. Un modèle a besoin de saisons, pas de deux journées. Les
-jeux de données de référence — deux années horaires par site, fournis avec la
-source — sont donc la SEULE origine possible de l'historique d'apprentissage,
-et ce module est le chemin par lequel il entre en base.
-
-Ce n'est pas un second collecteur. Les lignes du CSV sont converties en
-lectures au format de la source, puis remises à `collector.sink`, qui les
-normalise, les cale sur la grille et les écrit. Tout ce qui décide de la forme
-d'une mesure reste donc écrit à un seul endroit : un chemin d'import parallèle
-finirait par qualifier autrement ce que la chaîne lit ensuite pareil.
-
-L'écriture n'écrase rien. `sink.write` insère en `ON CONFLICT DO NOTHING` : sur
-un serveur qui collecte déjà, l'import comble ce qui manque et ne touche à
-aucune mesure déjà présente. C'est ce qui rend la commande rejouable, et ce qui
-permet de la lancer en production sans reconstruire la base.
-
-Le pas est HORAIRE, et il le reste. Une ligne par heure, à HH:00, et non
-soixante copies de la même valeur : `mesure` est une grille à la minute, mais
-rien n'oblige à la remplir. L'ETL agrège à l'heure et calcule son taux
-d'imputation sur les lignes PRÉSENTES (voir `etl.features._imputed_ratio`) :
-une heure portant une seule ligne non imputée vaut donc `imputed_ratio = 0`.
-Fabriquer les cinquante-neuf minutes absentes inventerait des mesures qui
-n'ont pas eu lieu, sans rien apporter en aval.
-
-Ce que le jeu de données ne porte pas reste NULL : ni tension, ni intensité, ni
-facteur de puissance. Les déduire d'une consommation horaire serait inventer
-trois grandeurs électriques à partir d'une seule.
-
-Où vivent les fichiers. Sur le stockage objet, pas dans le dépôt ni dans
-l'image. Vingt-quatre mégaoctets de CSV figés faisaient grossir chaque clone
-et chaque couche d'image publiée, pour une donnée qu'un seul geste lit une
-seule fois. `storage.datasets_root` désigne donc un répertoire ou un seau —
-`datasets` sur un poste, `s3://enervision-datasets` en déploiement — et les
-deux traversent le même code, celui de `predict_common.io`.
-"""
+# **********************************************************************
+# * Nom     : datasets.py                                              *
+# * Type    : Module                                                   *
+# * Sujet   : Chargement de l'historique de référence, des CSV vers la *
+# *   couche brute                                                     *
+# * Service : collector                                                *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -69,10 +37,7 @@ from predict_common.schemas import (
 
 logger = logging.getLogger(__name__)
 
-# Colonnes exigées du CSV. Les autres qu'il porte — consumption_euros,
-# solar_irradiance_wm2, hour, day_of_week, is_weekend… — sont ignorées : les
-# unes n'ont pas de colonne dans `mesure`, les autres sont des variables que
-# l'ETL recalcule, et les figer ici en donnerait deux versions.
+# Colonnes qu'un CSV de référence doit porter.
 REQUIRED_COLUMNS = (
     "timestamp",
     "site_id",
@@ -81,46 +46,33 @@ REQUIRED_COLUMNS = (
     "humidity_percent",
 )
 
-# Motif des fichiers par site. `all_sites_combined.csv` porte exactement les
-# mêmes lignes et n'est volontairement pas lu : le charger en plus doublerait
-# le travail pour un résultat identique, le `ON CONFLICT DO NOTHING` absorbant
-# la seconde passe.
+# Motif des fichiers retenus dans la racine des jeux de données.
 FILE_PATTERN = "SITE*.csv"
 
-# Vocabulaire des causes, aligné sur celui que la source emploie dans
-# `null_reasons`. Le jeu de données n'en fournit pas : elles sont déduites de
-# ce qui manque, et doivent se lire comme celles du fil de l'eau, sans quoi une
-# analyse de fiabilité aurait deux vocabulaires à connaître.
+# Cause posée quand la consommation manque seule.
 REASON_CONSUMPTION = "consumption_sensor_failure"
+# Cause posée quand la température manque.
 REASON_TEMPERATURE = "temperature_sensor_failure"
+# Cause posée quand l'humidité manque.
 REASON_HUMIDITY = "humidity_sensor_failure"
+# Cause posée quand la ligne entière est vide.
 REASON_NETWORK = "network_loss"
 
-# Lots d'insertion. Repris de la configuration quand elle le dit, sinon cette
-# valeur : sept fichiers de 17 521 lignes font 122 647 mesures, qu'il ne faut
-# pas soumettre d'un bloc.
+# Taille de lot d'écriture si la configuration n'en donne pas.
 DEFAULT_BATCH_SIZE = 1000
 
 
 class DatasetError(RuntimeError):
-    """Le jeu de données est absent, illisible, ou incomplet."""
+    """Classe : DatasetError
+    Description : Les jeux de données sont introuvables, illisibles ou mal
+      formés.
+    """
 
 
 def find_files(root: str) -> list[str]:
-    """Retourne les URI des fichiers par site, triées, et refuse une racine
-    muette.
-
-    Une racine vide est une erreur et non un import de zéro ligne : la
-    commande aurait l'air d'avoir réussi, et le défaut ne se verrait qu'à
-    l'entraînement, faute de variables à apprendre.
-
-    Le filtrage est fait ici et non par le stockage : S3 ne connaît pas les
-    motifs de shell, il ne sait que lister un préfixe.
-
-    Les URI rendues sont RECONSTRUITES sur la racine reçue, et non reprises
-    de l'inventaire : `get_file_info` rend le chemin tel que le système de
-    fichiers le connaît, donc `enervision-datasets/SITE001.csv` sans son
-    schéma. Le relire ferait chercher un répertoire de ce nom sur le disque.
+    """Méthode : find_files
+    Description : Liste les CSV de référence d'une racine, disque ou stockage
+      objet.
     """
     try:
         filesystem, path = io.resolve(str(root))
@@ -141,10 +93,9 @@ def find_files(root: str) -> list[str]:
 
 
 def read_file(uri: str) -> pd.DataFrame:
-    """Lit un fichier par site et vérifie qu'il porte ce qu'on attend.
-
-    L'URI désigne un fichier du disque ou du stockage objet ; c'est
-    `predict_common.io` qui décide lequel, à partir du schéma.
+    """Méthode : read_file
+    Description : Lit un CSV de référence et refuse un fichier aux colonnes
+      manquantes.
     """
     name = base_name(uri)
     try:
@@ -160,17 +111,17 @@ def read_file(uri: str) -> pd.DataFrame:
 
 
 def base_name(uri: str) -> str:
-    """Dernier segment d'une URI, pour les journaux et les messages."""
+    """Méthode : base_name
+    Description : Extrait le nom de fichier d'une URI, séparateurs
+      indifférents.
+    """
     return str(uri).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
 
 
 def to_readings(frame: pd.DataFrame) -> Iterator[dict[str, Any]]:
-    """Convertit les lignes du jeu de données en lectures de la source.
-
-    `consumption_kw` reprend `consumption_kwh` sans conversion, et c'est exact
-    au pas horaire : l'énergie consommée pendant une heure, en kWh, est
-    numériquement la puissance moyenne de cette heure, en kW. C'est aussi la
-    convention de la source, dont les deux champs portent la même valeur.
+    """Méthode : to_readings
+    Description : Transforme les lignes d'un CSV en mesures, causes et qualité
+      comprises.
     """
     for row in frame.to_dict(orient="records"):
         consumption = _clean(row.get("consumption_kwh"))
@@ -182,7 +133,6 @@ def to_readings(frame: pd.DataFrame) -> Iterator[dict[str, Any]]:
             "site_id": row["site_id"],
             "consumption_kw": consumption,
             "consumption_kwh": consumption,
-            # Absentes du jeu de données. Laissées NULL plutôt que déduites.
             "voltage_v": None,
             "current_a": None,
             "power_factor": None,
@@ -194,12 +144,9 @@ def to_readings(frame: pd.DataFrame) -> Iterator[dict[str, Any]]:
 
 
 def load_file(engine: Engine, uri: str, batch_size: int) -> int:
-    """Charge un fichier et retourne le nombre de mesures soumises.
-
-    Soumises et non écrites : le `ON CONFLICT DO NOTHING` ne remonte pas ce
-    qu'il a ignoré. Un second import annonce donc les mêmes nombres que le
-    premier sans avoir rien inséré — c'est le comportement attendu, et le
-    seul honnête, puisque la base ne dit pas ce qu'elle a écarté.
+    """Méthode : load_file
+    Description : Charge un fichier dans la couche brute et rend le nombre de
+      mesures soumises.
     """
     frame = read_file(uri)
     measures = sink.to_measures(to_readings(frame))
@@ -214,7 +161,9 @@ def load_file(engine: Engine, uri: str, batch_size: int) -> int:
 
 
 def load(engine: Engine, root: str, batch_size: int) -> int:
-    """Charge tous les fichiers par site de la racine, dans l'ordre."""
+    """Méthode : load
+    Description : Charge tous les fichiers de la racine, un par un.
+    """
     total = 0
     for uri in find_files(root):
         total += load_file(engine, uri, batch_size)
@@ -226,11 +175,8 @@ def _reasons(
     temperature: float | None,
     humidity: float | None,
 ) -> list[str]:
-    """Déduit les causes de ce qui manque sur la ligne.
-
-    Tout absent vaut `network_loss` et non trois pannes simultanées : c'est
-    ainsi que la source qualifie une coupure, et trois capteurs qui tombent à
-    la même seconde décrivent le réseau, pas les capteurs.
+    """Méthode : _reasons
+    Description : Déduit les causes d'absence des colonnes vides d'une ligne.
     """
     if consumption is None and temperature is None and humidity is None:
         return [REASON_NETWORK]
@@ -245,11 +191,8 @@ def _reasons(
 
 
 def _quality(consumption: float | None, reasons: Sequence[str]) -> str:
-    """Qualifie la ligne, avec le vocabulaire de la source.
-
-    La consommation décide de la sévérité, parce que c'est elle que le modèle
-    apprend : une température manquante gêne, une consommation manquante rend
-    l'heure inapprenable.
+    """Méthode : _quality
+    Description : Déduit la qualification d'une ligne de ses causes d'absence.
     """
     if REASON_NETWORK in reasons:
         return QUALITY_CRITICAL
@@ -261,19 +204,17 @@ def _quality(consumption: float | None, reasons: Sequence[str]) -> str:
 
 
 def _clean(value: Any) -> float | None:
-    """Ramène un manquant pandas à None, et le reste à un flottant."""
+    """Méthode : _clean
+    Description : Ramène une valeur absente de pandas à None.
+    """
     if value is None or pd.isna(value):
         return None
     return float(value)
 
 
 def _iso(value: Any) -> str:
-    """Rend l'horodatage en ISO 8601 UTC, tel que `to_measures` l'attend.
-
-    Les horodatages du jeu de données sont naïfs. Ils sont lus en UTC, comme
-    ceux que la source sert : les interpréter dans le fuseau du serveur
-    décalerait tout l'historique de une à deux heures selon la saison, et
-    ferait apprendre au modèle des journées de travail commençant à 7 h.
+    """Méthode : _iso
+    Description : Écrit un horodatage en ISO 8601 UTC, fuseau prêté si absent.
     """
     stamp = pd.Timestamp(value)
     if stamp.tzinfo is None:
@@ -282,14 +223,23 @@ def _iso(value: Any) -> str:
 
 
 def _batch_size(config: Config) -> int:
+    """Méthode : _batch_size
+    Description : Lit la taille de lot d'écriture dans la configuration.
+    """
     return config.get_int("database.batch_size", DEFAULT_BATCH_SIZE)
 
 
 def _datasets_root(config: Config) -> str:
+    """Méthode : _datasets_root
+    Description : Lit la racine des jeux de données dans la configuration.
+    """
     return config.get_str("storage.datasets_root")
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Méthode : build_parser
+    Description : Analyse la ligne de commande du chargement de l'historique.
+    """
     parser = argparse.ArgumentParser(
         prog="collector.datasets",
         description=(
@@ -316,6 +266,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Méthode : main
+    Description : Point d'entrée : charge l'historique de référence et rend un
+      code de sortie.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -325,10 +279,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config()
         root = args.root or _datasets_root(config)
         engine = open_engine(config.get_optional_str("database.url"))
-        # Avant le premier fichier : cent vingt mille lignes lues et
-        # transformées pour échouer au chargement seraient du travail perdu,
-        # et l'erreur brute du driver ne dirait pas que le schéma est en
-        # retard sur les migrations de l'API.
         verify_schema(engine, (mesure,))
         batch_size = args.batch_size or _batch_size(config)
         logger.info("jeux de données lus depuis %s", root)

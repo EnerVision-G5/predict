@@ -1,12 +1,3 @@
-"""Prévision multi-pas : historique lu, récurrence, fuites évitées.
-
-Le service ne recalcule pas les variables depuis les mesures brutes — ce
-serait refaire le travail de l'ETL avec un second jeu de règles. Il lit la
-dernière partition publiée. Les tests fixent donc ce qu'il fait de cet
-historique : où il puise ses décalages, comment il enchaîne les heures, et à
-quel moment il refuse de continuer plutôt que d'inventer.
-"""
-
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -42,7 +33,6 @@ TODAY = date(2026, 9, 10)
 
 
 def spec_for(root: Path) -> ForecastSpec:
-    """Réglages du service, pointés sur un stockage jetable."""
     return ForecastSpec(
         root=str(root),
         feature_version="v1",
@@ -53,7 +43,6 @@ def spec_for(root: Path) -> ForecastSpec:
 
 
 def features(day: date, site_id: str = "SITE001") -> pd.DataFrame:
-    """Partition de variables d'une journée, telle que l'ETL la publie."""
     stamps = pd.date_range(
         f"{day.isoformat()}T00:00:00Z", periods=24, freq="h", tz="UTC"
     )
@@ -76,7 +65,6 @@ def features(day: date, site_id: str = "SITE001") -> pd.DataFrame:
 
 
 def seed(root: Path, days: int = 3, site_id: str = "SITE001") -> None:
-    """Publie les dernières partitions de variables."""
     for offset in range(days):
         day = TODAY - timedelta(days=offset)
         io.write_frame(
@@ -87,7 +75,6 @@ def seed(root: Path, days: int = 3, site_id: str = "SITE001") -> None:
 
 
 def series(hours: int = 48) -> pd.Series:
-    """Série horaire observée, indexée sur le temps."""
     index = pd.date_range("2026-09-08T00:00:00Z", periods=hours, freq="h", tz="UTC")
     return pd.Series([50.0 + index_ % 24 for index_ in range(hours)], index=index)
 
@@ -98,8 +85,6 @@ def test_read_history_gathers_the_recent_partitions(tmp_path: Path) -> None:
 
 
 def test_read_history_tolerates_a_missing_night(tmp_path: Path) -> None:
-    # L'ETL de la nuit peut ne pas avoir tourné : le service sert alors sur
-    # l'historique de la veille plutôt que de refuser.
     seed(tmp_path, days=1)
     assert len(read_history(spec_for(tmp_path), today=TODAY)) == 24
 
@@ -126,15 +111,11 @@ def test_site_history_refuses_an_unknown_site(tmp_path: Path) -> None:
 
 
 def test_site_history_refuses_an_empty_read(tmp_path: Path) -> None:
-    # Le tableau est alors vide et sans colonnes : le cas doit donner un refus
-    # explicite, pas une erreur de clé au milieu d'une requête.
     with pytest.raises(NoHistory):
         site_history(pd.DataFrame(), "SITE001", spec_for(tmp_path))
 
 
 def test_site_history_leaves_a_gap_as_a_gap(tmp_path: Path) -> None:
-    # L'imputation appartient à l'ETL : la refaire ici en donnerait deux
-    # versions, qui finiraient par diverger.
     seed(tmp_path)
     frame = read_history(spec_for(tmp_path), today=TODAY)
     without = frame[frame["ts"].dt.hour != 5]
@@ -149,11 +130,7 @@ def test_horizon_stamps_follow_the_last_observed_hour() -> None:
 
 
 class TestBuildRow:
-    """Une ligne de variables, ou rien — mais jamais une valeur inventée."""
-
     def test_the_calendar_columns_are_integers(self, tmp_path: Path) -> None:
-        # La signature du modèle les déclare `integer` : MLflow refuse une
-        # conversion float64 vers int32 qu'il ne peut pas garantir sans perte.
         row = build_row(series(), horizon_stamps(series(), 1)[0], spec_for(tmp_path))
         assert isinstance(row["hour"], int)
         assert isinstance(row["day_of_week"], int)
@@ -166,24 +143,16 @@ class TestBuildRow:
         assert row["lag_24h"] == history.loc[stamp - pd.Timedelta(hours=24)]
 
     def test_the_future_temperature_is_not_presented(self, tmp_path: Path) -> None:
-        # Le modèle ne l'attend plus : elle a quitté les variables
-        # explicatives. La présenter vide reviendrait à faire emprunter à
-        # chaque prédiction la branche par défaut des arbres qui la testent.
         row = build_row(series(), horizon_stamps(series(), 1)[0], spec_for(tmp_path))
         assert "temperature_celsius" not in row
 
     def test_a_missing_lag_gives_no_row(self, tmp_path: Path) -> None:
-        # Inventer sa valeur donnerait une prévision dont rien ne dirait
-        # qu'elle repose sur du vide.
         short = series(hours=2)
         assert build_row(short, horizon_stamps(short, 1)[0], spec_for(tmp_path)) is None
 
     def test_the_rolling_window_stops_before_the_predicted_hour(
         self, tmp_path: Path
     ) -> None:
-        # C'est la même règle qu'à l'entraînement, où la moyenne glissante est
-        # décalée d'un pas : la rompre présenterait au modèle une variable
-        # qu'il n'a jamais vue sous cette forme.
         history = series()
         stamp = horizon_stamps(history, 1)[0]
         row = build_row(history, stamp, spec_for(tmp_path))
@@ -192,8 +161,6 @@ class TestBuildRow:
 
 
 class TestPredictSeries:
-    """Chaque heure prédite nourrit la suivante."""
-
     def test_the_horizon_is_served_in_full(self, tmp_path: Path) -> None:
         points = predict_series(
             lambda frame: [42.0], series(), 6, spec_for(tmp_path), COLUMNS
@@ -208,8 +175,6 @@ class TestPredictSeries:
             return [99.0]
 
         predict_series(predict, series(), 3, spec_for(tmp_path), COLUMNS)
-        # La première heure lit l'historique observé, les suivantes lisent la
-        # prévision précédente.
         assert seen[1] == 99.0
         assert seen[2] == 99.0
 
@@ -226,8 +191,6 @@ class TestPredictSeries:
         assert seen[0] == list(COLUMNS)
 
     def test_the_horizon_stops_when_history_runs_out(self, tmp_path: Path) -> None:
-        # Un historique trop court ne donne aucun point plutôt que des points
-        # bâtis sur rien.
         points = predict_series(
             lambda frame: [42.0], series(hours=2), 6, spec_for(tmp_path), COLUMNS
         )
@@ -235,11 +198,7 @@ class TestPredictSeries:
 
 
 class TestConfidenceBand:
-    """La bande dit ce que vaut la prévision, ou ne dit rien."""
-
     def test_no_spread_gives_no_bounds(self) -> None:
-        # Le contrat les prévoit optionnelles : mieux vaut pas d'intervalle
-        # qu'un intervalle qui ne repose sur rien.
         assert confidence_band(50.0, 1, None) == (None, None)
 
     def test_the_band_is_centred_on_the_prediction(self) -> None:
@@ -251,34 +210,16 @@ class TestConfidenceBand:
         assert upper - 50.0 == pytest.approx(CONFIDENCE_Z * 2.0)
 
     def test_the_band_grows_as_the_square_root_of_the_step(self) -> None:
-        # Les erreurs de deux pas successifs s'additionnent en variance, pas
-        # en écart-type : une croissance linéaire donnerait à l'horizon 48 une
-        # bande quatre fois trop large, que personne ne lirait.
         first = confidence_band(50.0, 1, 2.0)
         fourth = confidence_band(50.0, 4, 2.0)
         assert (fourth[1] - fourth[0]) == pytest.approx(2 * (first[1] - first[0]))
 
     def test_the_lower_bound_is_not_clipped_at_zero(self) -> None:
-        # Le schéma de la couche brute n'interdit pas un soutirage négatif, et
-        # rogner la borne masquerait un modèle qui prédit une aberration.
         lower, _ = confidence_band(1.0, 1, 10.0)
         assert lower < 0.0
 
 
-# --- Cache de la fenêtre de variables ---------------------------------------
-#
-# Le service relisait le stockage à chaque prévision : `lookback_days`
-# partitions journalières téléchargées, décompressées, concaténées et triées
-# pour n'en extraire qu'un seul site. Le job de rafraîchissement boucle sur
-# les sept sites, donc sept lectures complètes de la même fenêtre par cycle.
-
-
 def test_la_fenetre_n_est_lue_qu_une_fois_dans_le_ttl(monkeypatch) -> None:
-    """Deux prévisions rapprochées ne relisent pas le stockage.
-
-    L'ETL ne publie qu'une fois par cycle : relire plus souvent ne peut rien
-    apprendre de neuf.
-    """
     forecast.reset_history_cache()
     reads = []
 
@@ -301,7 +242,6 @@ def test_la_fenetre_n_est_lue_qu_une_fois_dans_le_ttl(monkeypatch) -> None:
 
 
 def test_un_ttl_nul_relit_a_chaque_fois(monkeypatch) -> None:
-    """Le cache se désactive par configuration, sans changer le reste."""
     forecast.reset_history_cache()
     reads = []
 
@@ -322,12 +262,6 @@ def test_un_ttl_nul_relit_a_chaque_fois(monkeypatch) -> None:
 
 
 def test_un_changement_de_journee_invalide_le_cache(monkeypatch) -> None:
-    """La clé porte la journée : minuit passé, la fenêtre a bougé.
-
-    Sans elle, un service démarré la veille servirait indéfiniment les
-    partitions de la veille, et `feature_lag_hours` grandirait sans que rien
-    ne relise.
-    """
     forecast.reset_history_cache()
     reads = []
 
@@ -348,17 +282,7 @@ def test_un_changement_de_journee_invalide_le_cache(monkeypatch) -> None:
     forecast.reset_history_cache()
 
 
-# --- Repli sur l'historique de référence -----------------------------------
-#
-# La source ne remonte qu'à 48 heures : au démarrage de la chaîne, aucun site
-# n'a les heures continues que réclame le décalage le plus profond, et le
-# service refusait alors toute prévision. Ces tests fixent à quelles
-# conditions il rejoue l'historique de référence, et surtout à quelles
-# conditions il ne le fait pas.
-
-
 def spec_with_fallback(root: Path, years: int = 2) -> ForecastSpec:
-    """Mêmes réglages, avec le repli activé."""
     return ForecastSpec(
         root=str(root),
         feature_version="v1",
@@ -370,7 +294,6 @@ def spec_with_fallback(root: Path, years: int = 2) -> ForecastSpec:
 
 
 def seed_reference(root: Path, years: int, days: int = 3) -> date:
-    """Publie des partitions décalées de `years` années de 52 semaines."""
     origin = date.today() - timedelta(
         days=forecast.REFERENCE_SHIFT_DAYS * years
     )
@@ -385,9 +308,6 @@ def seed_reference(root: Path, years: int, days: int = 3) -> date:
 
 
 def test_le_repli_decale_de_semaines_entieres(tmp_path) -> None:
-    # 364 jours, ni 365 ni 366 : le modèle lit day_of_week, is_weekend et un
-    # décalage de 168 h. Une année civile ferait glisser les jours de la
-    # semaine, et un lundi de bureau nourrirait la prévision d'un samedi.
     assert forecast.REFERENCE_SHIFT_DAYS % 7 == 0
     origin = seed_reference(tmp_path, years=1)
     history, returned = forecast.reference_history(
@@ -395,15 +315,10 @@ def test_le_repli_decale_de_semaines_entieres(tmp_path) -> None:
     )
     assert returned == origin
     assert not history.empty
-    # Les heures rendues sont ramenées au présent, pas laissées dans le passé.
     assert history.index.max().date() >= date.today() - timedelta(days=1)
 
 
 def test_le_repli_ne_deborde_pas_dans_le_futur(tmp_path) -> None:
-    # La journée de référence est rejouée entière : ses heures du soir
-    # atterriraient après maintenant, la prévision démarrerait après elles, et
-    # feature_lag_hours deviendrait négatif — un âge de variables négatif ne
-    # veut rien dire.
     seed_reference(tmp_path, years=1)
     history, _ = forecast.reference_history(
         spec_with_fallback(tmp_path), "SITE001"
@@ -413,8 +328,6 @@ def test_le_repli_ne_deborde_pas_dans_le_futur(tmp_path) -> None:
 
 
 def test_le_repli_essaie_les_annees_dans_l_ordre(tmp_path) -> None:
-    # La deuxième année n'est tentée que si la première ne porte rien : plus
-    # on remonte, moins la série ressemble au site d'aujourd'hui.
     origin = seed_reference(tmp_path, years=2)
     _, returned = forecast.reference_history(
         spec_with_fallback(tmp_path, years=2), "SITE001"
@@ -423,8 +336,6 @@ def test_le_repli_essaie_les_annees_dans_l_ordre(tmp_path) -> None:
 
 
 def test_le_repli_desactive_refuse(tmp_path) -> None:
-    # reference_years = 0 : le service se tait comme avant. Le repli est un
-    # choix d'exploitation, pas un comportement imposé.
     seed_reference(tmp_path, years=1)
     with pytest.raises(NoHistory):
         forecast.reference_history(spec_with_fallback(tmp_path, years=0), "SITE001")

@@ -1,42 +1,9 @@
-"""Collecte continue de la mesure courante, second point d'entrée du service.
-
-    python -m collector.poller
-    python -m collector.poller --interval 30 --site SITE001
-
-Là où `python -m collector` rattrape une journée passée par pagination, le
-poller interroge `/current` sur chaque site à cadence fixe et l'écrit au fil de
-l'eau. Les deux alimentent la même table, avec le même schéma et la même
-insertion idempotente : c'est l'ETL qui les réunit, sans savoir lequel des deux
-a produit quoi.
-
-Trois choix structurent le fichier, et ils sont les mêmes qu'avant la découpe
-parce que ce sont les bons.
-
-Le processus ne s'arrête pas sur un échec réseau. Un site injoignable est
-journalisé et le tick continue avec les autres ; la vraie relance, c'est le
-tick suivant, une minute plus tard. Seul un incident au démarrage fait sortir
-le processus, et c'est alors la politique de redémarrage du conteneur qui
-reprend la main.
-
-La cadence est ancrée sur des instants absolus, pas sur une attente de la
-durée de l'intervalle. Un tick lent décalerait sinon tous les suivants, et le
-retard deviendrait invisible en se fondant dans la cadence.
-
-Le retard est journalisé sous ses deux formes, parce qu'elles ne désignent pas
-la même panne : le retard de données mesure l'âge de ce que sert la source, le
-retard d'ordonnancement mesure ce que le poller lui-même a pris de retard.
-
-Chaque tick repose en plus son état dans `ingestion_etat`, une ligne par site.
-Le journal ne suffisait pas : personne ne le lit depuis un dashboard, et
-surtout un site en échec n'écrit rien dans `mesure`, si bien que rien en base
-ne le distinguait d'un site dont la source n'avait rien de neuf. Cette
-écriture-là ne peut jamais interrompre la boucle — voir `record_tick`.
-
-Ni le poller ni le rattrapage n'écrasent quoi que ce soit : les deux insèrent
-en `ON CONFLICT DO NOTHING`. Une minute déjà relevée au fil de l'eau n'est donc
-pas réécrite par le rattrapage du lendemain, et surtout, aucun des deux ne
-recouvre les colonnes que l'ETL a déduites entre-temps.
-"""
+# **********************************************************************
+# * Nom     : poller.py                                                *
+# * Type    : Point d'entrée                                           *
+# * Sujet   : Collecte continue des mesures courantes, à cadence fixe  *
+# * Service : collector                                                *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -89,17 +56,17 @@ from predict_common.schemas import TIMESTAMP_COLUMN
 from predict_common.source import SourceClient, SourceError, SourceSettings
 from predict_common.timestamps import DEFAULT_SOURCE_TIMEZONE
 
-# Le démarrage n'a pas le luxe d'attendre le tick suivant : sans référentiel
-# des sites, il n'y a rien à interroger. On insiste donc plus longuement
-# qu'en régime établi, où l'échec d'un site est absorbé par la cadence.
+# Tentatives de lecture du référentiel au démarrage.
 STARTUP_ATTEMPTS = 3
+# Attente entre deux tentatives de démarrage.
 STARTUP_BACKOFF_S = 5.0
 
-# Au-delà de cet écart entre l'instant prévu d'un tick et son démarrage réel,
-# le poller ne tient plus la cadence : c'est un symptôme, pas un détail.
+# Écart à l'heure prévue au-delà duquel on avertit.
 SCHEDULE_SKEW_WARNING_S = 5.0
 
+# Code de sortie d'un arrêt demandé.
 EXIT_OK = 0
+# Code de sortie d'un démarrage impossible.
 EXIT_STARTUP_FAILED = 1
 
 logger = logging.getLogger(__name__)
@@ -107,20 +74,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PollSettings:
-    """Ce qui règle la boucle, extrait de la configuration une seule fois."""
-
+    """Classe : PollSettings
+    Description : Cadence, seuil de retard et taille de lot de la collecte
+      continue.
+    """
     interval_s: float
     lag_warning_s: float
     batch_size: int
-    # Fuseau prêté aux horodatages que la source envoie sans le leur. Il est
-    # lu du bloc `source`, qui le décrit, mais il est porté ici : la boucle en
-    # a besoin à chaque tick, et l'aller chercher dans le client ferait
-    # dépendre l'écriture de la façon dont la lecture est branchée.
     source_timezone: str = DEFAULT_SOURCE_TIMEZONE
 
     @classmethod
     def from_config(cls, config: Config) -> PollSettings:
-        """Lit les seules clés dont la boucle a besoin."""
+        """Méthode : from_config
+        Description : Construit les réglages depuis le bloc collector de la
+          configuration.
+        """
         return cls(
             interval_s=config.get_float("collector.poll_interval_s"),
             lag_warning_s=config.get_float("collector.lag_warning_s"),
@@ -133,8 +101,10 @@ class PollSettings:
 
 @dataclass(frozen=True)
 class PollContext:
-    """Ressources partagées par tous les ticks d'un même processus."""
-
+    """Classe : PollContext
+    Description : Ce dont un tick a besoin : réglages, client, base, et le
+      signal d'arrêt.
+    """
     settings: PollSettings
     client: SourceClient
     engine: Engine
@@ -143,8 +113,10 @@ class PollContext:
 
 @dataclass(frozen=True)
 class SiteTick:
-    """Résultat de l'interrogation d'un site sur un tick."""
-
+    """Classe : SiteTick
+    Description : Résultat de la collecte d'un site : lignes écrites et retard
+      constaté.
+    """
     site_id: str
     rows: int
     lag_s: float | None
@@ -152,25 +124,28 @@ class SiteTick:
 
 @dataclass(frozen=True)
 class TickReport:
-    """Bilan consolidé d'un tick, tel qu'il part au journal et en base."""
-
+    """Classe : TickReport
+    Description : Bilan d'un tick sur tous les sites, états d'ingestion
+      compris.
+    """
     rows: int
     lags_s: tuple[float, ...]
-    # Un état par site interrogé, succès comme échec. Le journal en tire son
-    # résumé, `ingestion_etat` en tire ses lignes : les deux disent la même
-    # chose du même tick, ce qui n'est vrai que parce qu'ils partent d'ici.
     states: tuple[IngestionState, ...]
 
     @property
     def failed_sites(self) -> tuple[str, ...]:
-        """Sites dont le tick a échoué, dans l'ordre d'interrogation."""
+        """Méthode : failed_sites
+        Description : Sites dont le tick n'a rien pu écrire.
+        """
         return tuple(
             state.site_id for state in self.states if not state.succeeded
         )
 
     @property
     def max_lag_s(self) -> float | None:
-        """Retard de données du site le plus en retard, sites muets exclus."""
+        """Méthode : max_lag_s
+        Description : Retard le plus élevé constaté sur le tick.
+        """
         if not self.lags_s:
             return None
         return max(self.lags_s)
@@ -178,18 +153,16 @@ class TickReport:
 
 @dataclass
 class Schedule:
-    """Suite des instants de tick, ancrée sur un instant de départ."""
-
+    """Classe : Schedule
+    Description : Échéancier du tick suivant, et compte des ticks sautés.
+    """
     interval_s: float
     due_at: datetime
     missed: int = field(default=0, init=False)
 
     def advance(self, now: datetime) -> None:
-        """Place l'échéance suivante, en écartant les ticks déjà dépassés.
-
-        Rejouer les ticks manqués n'aurait aucun sens ici : `/current` ne sert
-        que la mesure du moment, une rafale de rattrapage relirait plusieurs
-        fois la même valeur.
+        """Méthode : advance
+        Description : Avance l'échéance d'un pas et compte ce qui a été manqué.
         """
         self.due_at += timedelta(seconds=self.interval_s)
         late_s = (now - self.due_at).total_seconds()
@@ -201,10 +174,8 @@ class Schedule:
 
 
 def ingestion_lag_s(frame: pd.DataFrame, now: datetime) -> float | None:
-    """Retourne l'âge de la mesure la plus ancienne du lot, en secondes.
-
-    Un retard négatif n'est pas corrigé : il signale une horloge de source en
-    avance sur la nôtre, information que masquer serait une faute.
+    """Méthode : ingestion_lag_s
+    Description : Retard entre la mesure la plus ancienne du lot et maintenant.
     """
     if frame.empty:
         return None
@@ -213,7 +184,9 @@ def ingestion_lag_s(frame: pd.DataFrame, now: datetime) -> float | None:
 
 
 def quality_summary(frame: pd.DataFrame) -> str:
-    """Résume la répartition des `data_quality` du lot pour le journal."""
+    """Méthode : quality_summary
+    Description : Résume les qualifications d'un lot en une ligne de journal.
+    """
     if frame.empty:
         return "aucune"
     counts = frame["data_quality"].value_counts(dropna=False).to_dict()
@@ -222,10 +195,9 @@ def quality_summary(frame: pd.DataFrame) -> str:
 
 
 def poll_site(context: PollContext, site_id: str, now: datetime) -> SiteTick:
-    """Lit la mesure courante d'un site et l'écrit dans `mesure`.
-
-    Les échecs ne sont pas rattrapés ici : ils remontent au tick, seul niveau
-    qui sache qu'un site en panne ne doit pas empêcher les autres.
+    """Méthode : poll_site
+    Description : Interroge un site, écrit sa mesure courante et rend son
+      bilan.
     """
     settings = context.settings
     records = context.client.fetch_current(site_id)
@@ -247,12 +219,9 @@ def run_tick(
     sites: Sequence[str],
     now: datetime,
 ) -> TickReport:
-    """Interroge tous les sites une fois et retourne le bilan du tick.
-
-    Un état est produit pour chaque site, y compris en échec — et c'est le
-    point : un site qui n'a rien écrit ne laisse aucune trace dans `mesure`,
-    et sans cet état il serait indiscernable d'un site que la source n'avait
-    simplement rien à dire.
+    """Méthode : run_tick
+    Description : Interroge tous les sites une fois et retourne le bilan du
+      tick.
     """
     rows = 0
     lags: list[float] = []
@@ -285,13 +254,9 @@ def run_tick(
 
 
 def record_tick(context: PollContext, report: TickReport) -> None:
-    """Repose l'état de collecte du tick, sans jamais interrompre la boucle.
-
-    L'écriture est rattrapée ici et nulle part ailleurs. Un tick dont la base
-    vient de refuser les mesures ne pourra pas non plus y écrire son échec :
-    laisser remonter l'exception ferait mourir le processus au moment précis
-    où il a le plus de raisons de continuer à essayer. Le journal garde alors
-    la trace, et le tick suivant retentera.
+    """Méthode : record_tick
+    Description : Repose l'état de collecte du tick, sans jamais interrompre la
+      boucle.
     """
     try:
         write_state(
@@ -309,11 +274,8 @@ def poll_forever(
     sites: Sequence[str],
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> int:
-    """Boucle de collecte jusqu'à ce que l'arrêt du processus soit demandé.
-
-    L'attente passe par l'événement d'arrêt et non par une temporisation
-    aveugle : un conteneur qu'on stoppe rend la main tout de suite au lieu
-    d'user la minute en cours.
+    """Méthode : poll_forever
+    Description : Boucle jusqu'au signal d'arrêt, un tick par échéance.
     """
     schedule = Schedule(interval_s=context.settings.interval_s, due_at=clock())
     completed = 0
@@ -335,17 +297,8 @@ def poll_forever(
 
 
 def collect_side_channels(context: PollContext) -> None:
-    """Journalise les alertes et repose l'état des capteurs.
-
-    Deux routes que `mesure` ne remplace pas. Les alertes disent ce que la
-    source a jugé anormal, avec son seuil — information qu'aucune mesure ne
-    porte, et qui disparaît de la réponse dès que l'alerte se résout. L'état
-    des capteurs dit lequel est tombé et jusqu'à quand, là où `null_reasons`
-    ne dit que ce qui manquait sur une ligne.
-
-    Aucun échec ne remonte : ce sont des annexes du tick, pas le tick. Une
-    route d'alertes en panne ne doit pas arrêter la collecte des mesures, qui
-    est la seule chose dont la chaîne aval dépend.
+    """Méthode : collect_side_channels
+    Description : Collecte alertes et état des capteurs, en marge des mesures.
     """
     batch_size = context.settings.batch_size
     try:
@@ -364,10 +317,8 @@ def collect_side_channels(context: PollContext) -> None:
 
 
 def _collect_sensors(context: PollContext, batch_size: int) -> None:
-    """Repose l'état des capteurs, et journalise les transitions au passage.
-
-    L'état précédent est lu AVANT d'être écrasé : c'est lui qui date les
-    débuts et les fins de panne, la source ne servant qu'un présent.
+    """Méthode : _collect_sensors
+    Description : Repose l'état des capteurs et ouvre ou ferme leurs pannes.
     """
     payload = context.client.fetch_sensors_status()
     timezone = context.settings.source_timezone
@@ -385,24 +336,9 @@ def catch_up(
     config: Config,
     depth_days: int | None,
 ) -> None:
-    """Comble ce qui manque en base avant d'entrer dans la boucle.
-
-    Sans lui, un poller qui redémarre reprend AU PRÉSENT : tout ce que la
-    coupure a laissé passer reste un trou, et rien ne le signale — `mesure`
-    n'a pas de ligne à montrer pour une minute qui n'a jamais été collectée.
-    Le trou ne se voyait qu'au moment où l'ETL produisait une journée creuse,
-    ou pas du tout.
-
-    Le rattrapage passe par `/api/v1/readings`, la seule route qui serve du
-    passé — `/current` ne connaît que l'instant présent. Sa profondeur est
-    déduite de la dernière mesure de chaque site, donc de la durée réelle de
-    la coupure : cinq minutes d'arrêt coûtent une journée relue, une semaine
-    en coûte sept. Voir `collector.__main__.catch_up_days`.
-
-    Son échec n'empêche pas la boucle de démarrer, et c'est délibéré : la
-    collecte du présent a plus de valeur que celle du passé, et un rattrapage
-    qui échoue peut être relancé à la main (`python -m collector --catch-up`)
-    sans arrêter le service.
+    """Méthode : catch_up
+    Description : Rejoue les journées incomplètes trouvées en base au
+      démarrage.
     """
     depth = depth_days or config.get_int(
         "collector.catch_up_days", DEFAULT_CATCH_UP_DAYS
@@ -427,12 +363,9 @@ def catch_up(
 
 
 def install_signal_handlers(stop: threading.Event) -> None:
-    """Arme l'arrêt propre sur SIGTERM et SIGINT.
-
-    Sans cela, `docker stop` couperait le processus au milieu d'une écriture
-    et laisserait une transaction ouverte côté base.
+    """Méthode : install_signal_handlers
+    Description : Fait de SIGTERM et SIGINT une demande d'arrêt après le tick.
     """
-
     def request_stop(signum: int, frame: FrameType | None) -> None:
         logger.info("signal %s reçu, arrêt après le tick en cours", signum)
         stop.set()
@@ -445,17 +378,13 @@ def resolve_targets(
     context: PollContext,
     requested: Sequence[str] | None,
 ) -> list[str]:
-    """Synchronise le référentiel et retourne les sites à interroger.
-
-    Le référentiel est réclamé avec plus d'insistance qu'une mesure : sans
-    lui, la boucle n'a rien à faire et le processus doit sortir pour que le
-    conteneur le relance.
+    """Méthode : resolve_targets
+    Description : Choisit les sites à interroger et synchronise leur
+      référentiel.
     """
     referential = _fetch_referential(context, required=not requested)
     if referential is None:
         return list(requested or ())
-    # Entretient `site`, que `mesure.site_id` référence : un site absent ferait
-    # rejeter ses mesures sans que rien n'explique pourquoi.
     sync_sites(context.engine, referential, context.settings.batch_size)
     if requested:
         return list(requested)
@@ -466,12 +395,9 @@ def _fetch_referential(
     context: PollContext,
     required: bool,
 ) -> list[dict] | None:
-    """Réclame le référentiel, plus longuement qu'une mesure ordinaire.
-
-    Sans lui et sans `--site`, la boucle n'a rien à interroger : le processus
-    doit sortir pour que le conteneur le relance. Avec `--site`, l'exploitant a
-    nommé ses sites et une source qui ne sert pas son référentiel ne doit pas
-    empêcher la boucle de tourner.
+    """Méthode : _fetch_referential
+    Description : Lit le référentiel des sites, avec quelques tentatives au
+      démarrage.
     """
     last_error: Exception | None = None
     for attempt in range(1, STARTUP_ATTEMPTS + 1):
@@ -493,7 +419,9 @@ def _fetch_referential(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Analyse la ligne de commande du conteneur de collecte continue."""
+    """Méthode : parse_args
+    Description : Analyse la ligne de commande de la collecte continue.
+    """
     parser = argparse.ArgumentParser(
         prog="collector.poller",
         description="Collecte continue des mesures courantes EnerVision.",
@@ -532,13 +460,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _configure_logging() -> None:
-    """Arme le journal, et met la sortie standard à l'abri de l'encodage local.
-
-    MLflow imprime des emoji quand il rend la main ; une console Windows en
-    cp1252 lève alors une UnicodeEncodeError au beau milieu d'un run qui, lui,
-    s'est bien passé. On ne peut pas demander à MLflow de se taire, mais on
-    peut faire en sorte qu'un caractère non représentable dégrade l'affichage
-    au lieu d'interrompre le traitement.
+    """Méthode : _configure_logging
+    Description : Arme le journal et met la sortie à l'abri de l'encodage
+      local.
     """
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -551,22 +475,19 @@ def _configure_logging() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Point d'entrée du conteneur de collecte continue."""
+    """Méthode : main
+    Description : Point d'entrée : monte le contexte, boucle, et rend un code
+      de sortie.
+    """
     _configure_logging()
     args = parse_args(argv)
     try:
         config = load_config()
         settings = PollSettings.from_config(config)
         source_settings = SourceSettings.from_config(config)
-        # pool_pre_ping : le poller vit des jours, et une connexion coupée par
-        # la base entre deux ticks échouerait sur la première écriture au lieu
-        # d'être renouvelée.
         engine = open_engine(
             config.get_optional_str("database.url"), pool_pre_ping=True
         )
-        # Le poller est un processus long : une base en retard de migration
-        # doit l'empêcher de démarrer, pas le laisser journaliser le même
-        # échec toutes les minutes pendant des jours.
         verify_schema(
             engine,
             (mesure, site, ingestion_etat, alerte, capteur_etat, capteur_panne),
@@ -604,12 +525,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _with_interval(settings: PollSettings, interval_s: float) -> PollSettings:
-    """Retourne les réglages avec la cadence imposée en ligne de commande."""
+    """Méthode : _with_interval
+    Description : Rend les mêmes réglages avec une autre cadence, refusée si
+      nulle.
+    """
     if interval_s <= 0:
         raise ValueError("--interval doit être strictement positif.")
-    # `replace` et non une reconstruction champ par champ : celle-ci laissait
-    # silencieusement tomber tout réglage ajouté depuis, et `--interval` aurait
-    # suffi à faire relire la source dans un autre fuseau que celui configuré.
     return replace(settings, interval_s=interval_s)
 
 
@@ -618,14 +539,18 @@ def _wait_until(
     due_at: datetime,
     clock: Callable[[], datetime],
 ) -> None:
-    """Attend l'échéance, interruptible par une demande d'arrêt."""
+    """Méthode : _wait_until
+    Description : Attend l'échéance, interruptible par le signal d'arrêt.
+    """
     delay_s = (due_at - clock()).total_seconds()
     if delay_s > 0:
         stop.wait(delay_s)
 
 
 def _log_skew(started_at: datetime, schedule: Schedule) -> None:
-    """Journalise l'écart entre l'instant prévu du tick et son démarrage."""
+    """Méthode : _log_skew
+    Description : Signale les ticks sautés et l'écart à l'heure prévue.
+    """
     if schedule.missed:
         logger.warning(
             "%d tick(s) sauté(s) : le tick précédent a dépassé la cadence",
@@ -639,7 +564,9 @@ def _log_skew(started_at: datetime, schedule: Schedule) -> None:
 
 
 def _log_tick(report: TickReport, requested: int, duration_s: float) -> None:
-    """Journalise le bilan d'un tick, retard de données compris."""
+    """Méthode : _log_tick
+    Description : Journalise le bilan d'un tick en une ligne.
+    """
     lag = "n/a" if report.max_lag_s is None else f"{report.max_lag_s:.1f} s"
     logger.info(
         "tick : %d/%d site(s), %d mesure(s), retard données max %s, durée %.2f s",
@@ -664,7 +591,10 @@ def _log_site(
     quality: str,
     warning_s: float,
 ) -> None:
-    """Journalise le résultat d'un site, en alertant sur un retard excessif."""
+    """Méthode : _log_site
+    Description : Journalise le résultat d'un site, en avertissant sur un
+      retard excessif.
+    """
     if lag_s is None:
         logger.warning("site %s : aucune mesure courante servie", site_id)
         return

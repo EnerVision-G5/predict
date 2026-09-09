@@ -1,34 +1,10 @@
-"""La règle qui accepte ou refuse une mise en service.
-
-`--promote` promouvait aveuglément : il posait l'alias `champion` sur ce qui
-venait d'être appris, sans jamais regarder ce que la version en place savait
-faire. Le vocabulaire du challenge était là — `challenger`, `champion` — mais
-rien ne les opposait, et rien n'empêchait une semaine d'apprentissage dégradée
-de remplacer un modèle meilleur qu'elle. Le seul garde-fou était l'attention
-de qui tapait la commande.
-
-Trois conditions, dans cet ordre, et l'ordre porte la décision.
-
-**Battre la baseline naïve.** ADR-010 en fait un livrable permanent : un
-modèle qui ne bat pas la recopie de la veille ne paie ni son entraînement, ni
-son registre, ni sa surveillance. C'est la première question parce qu'elle
-disqualifie sans qu'on ait besoin de regarder le champion — un candidat qui
-échoue ici ne mérite pas d'être servi, même s'il est meilleur que ce qui l'est
-déjà.
-
-**Être comparable.** Deux mesures faites sur des bancs différents ne se
-comparent pas. Le refus est alors franc plutôt que masqué par un classement
-que personne ne pourrait défendre — et il se lève en figeant le banc dans
-`conf/`.
-
-**Ne pas dégrader.** La marge dit ce qu'on tolère : à zéro, le candidat doit
-au moins égaler le champion.
-
-Rien ici ne décide seul. `--force` passe outre, parce qu'un exploitant peut
-avoir une raison que la règle n'a pas — un champion entraîné sur une période
-aberrante, un banc qu'on sait faussé. Le passage en force est journalisé pour
-ce qu'il est.
-"""
+# **********************************************************************
+# * Nom     : promotion.py                                             *
+# * Type    : Module                                                   *
+# * Sujet   : Règle qui décide si un candidat mérite d'être mis en     *
+# *   service                                                          *
+# * Service : training                                                 *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -37,22 +13,15 @@ from dataclasses import dataclass
 from training.arbitration import BenchResult
 from training.model import DECISION_METRIC
 
-# Ce que le candidat doit dépasser, en proportion de l'erreur du champion. 0
-# tolère l'égalité et refuse toute dégradation. Une marge positive assume du
-# bruit de mesure ; une marge négative exigerait un gain minimal pour
-# justifier le changement.
+# Marge exigée sur le champion en place, en part d'erreur.
 DEFAULT_MARGIN = 0.0
 
 
 @dataclass(frozen=True)
 class Verdict:
-    """La décision, et la phrase qui la justifie.
-
-    La raison n'est pas un journal mais une valeur : elle part dans le tag du
-    run et dans le code de sortie de la commande. Une décision qu'on ne peut
-    pas relire six mois plus tard n'est pas une décision, c'est un souvenir.
+    """Classe : Verdict
+    Description : Décision de promotion et la raison qui l'a fondée.
     """
-
     accepted: bool
     reason: str
 
@@ -63,11 +32,8 @@ def decide(
     naive: BenchResult,
     margin: float = DEFAULT_MARGIN,
 ) -> Verdict:
-    """Dit si le candidat peut prendre la place du champion, et pourquoi.
-
-    Le champion absent n'est pas un cas dégradé : c'est la première promotion,
-    et il n'y a alors rien à ne pas dégrader. La baseline, elle, est exigée
-    dans tous les cas — c'est ce qui distingue « premier » de « bon ».
+    """Méthode : decide
+    Description : Oppose le candidat au champion et à la baseline, et tranche.
     """
     measured = candidate.error
     reference = naive.error

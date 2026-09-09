@@ -1,12 +1,3 @@
-"""Chargement de la configuration : couches, environnement, typage.
-
-La garantie testée est qu'aucune valeur ne peut entrer dans la chaîne sans
-avoir été demandée. Une clé absente, une variable d'environnement obligatoire
-manquante ou un nombre illisible font échouer le chargement — un run qui
-partirait sur un défaut que personne n'a écrit produirait des artefacts au
-mauvais endroit, et rien ne le dirait.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -47,7 +38,6 @@ training:
 
 @pytest.fixture
 def conf_dir(tmp_path: Path) -> Path:
-    """Écrit une arborescence conf/ minimale mais réaliste."""
     (tmp_path / "base.yaml").write_text(BASE, encoding="utf-8")
     (tmp_path / "local.yaml").write_text(LOCAL, encoding="utf-8")
     return tmp_path
@@ -65,7 +55,6 @@ def test_load_config_applies_the_local_layer_by_default(conf_dir: Path) -> None:
 
 
 def test_load_config_merges_blocks_key_by_key(conf_dir: Path) -> None:
-    # local.yaml ne surcharge que n_estimators : max_depth doit survivre.
     config = load_config(env={}, directory=conf_dir)
     assert config.get_int("training.params.n_estimators") == 120
     assert config.get_int("training.params.max_depth") == 6
@@ -123,8 +112,6 @@ def test_get_str_refuses_an_empty_value() -> None:
 
 
 def test_get_optional_str_accepts_an_assumed_absence(conf_dir: Path) -> None:
-    # La sortie annexe TimescaleDB est désactivée par une URL vide, ce qui est
-    # une décision et non un oubli.
     config = load_config(env={}, directory=conf_dir)
     assert config.get_optional_str("etl.database_url") == ""
 
@@ -136,8 +123,6 @@ def test_get_int_refuses_an_unreadable_number() -> None:
 
 
 def test_get_int_refuses_a_boolean() -> None:
-    # YAML lit `yes` comme un booléen : le laisser passer donnerait 1 sans que
-    # personne n'ait demandé 1.
     config = Config(values={"a": True})
     with pytest.raises(ConfigError):
         config.get_int("a")
@@ -152,6 +137,16 @@ def test_get_int_list_refuses_a_lone_value() -> None:
     config = Config(values={"a": 24})
     with pytest.raises(ConfigError, match="liste"):
         config.get_int_list("a")
+
+
+def test_get_int_list_splits_a_value_from_the_environment() -> None:
+    assert Config(values={"a": "1, 24, 168"}).get_int_list("a") == [1, 24, 168]
+    assert Config(values={"a": "24"}).get_int_list("a") == [24]
+
+
+def test_get_int_list_refuses_an_empty_environment_value() -> None:
+    with pytest.raises(ConfigError, match="vide"):
+        Config(values={"a": " , "}).get_int_list("a")
 
 
 def test_section_returns_a_block(conf_dir: Path) -> None:
@@ -169,14 +164,6 @@ def test_config_directory_honours_the_override(tmp_path: Path) -> None:
     assert config_directory({"PREDICT_CONF_DIR": str(tmp_path)}) == tmp_path
 
 
-# --- Booléens venus de l'environnement --------------------------------------
-#
-# `_expand_text` rend TOUJOURS une chaîne : `${SERVING_AUTH_ENABLED:-true}`
-# produit `"true"`, jamais `True`. Un `if config.get(...)` serait donc vrai
-# pour `"false"` comme pour `"true"` — l'inversion silencieuse qui ouvre un
-# contrôle d'accès en croyant le fermer.
-
-
 @pytest.mark.parametrize("word", ["true", "TRUE", "1", "yes", "on"])
 def test_get_bool_lit_les_ecritures_vraies(word: str) -> None:
     assert Config(values={"a": {"b": word}}).get_bool("a.b") is True
@@ -184,17 +171,14 @@ def test_get_bool_lit_les_ecritures_vraies(word: str) -> None:
 
 @pytest.mark.parametrize("word", ["false", "False", "0", "no", "off"])
 def test_get_bool_lit_les_ecritures_fausses(word: str) -> None:
-    """La chaîne "false" doit valoir False, pas "non vide donc vrai"."""
     assert Config(values={"a": {"b": word}}).get_bool("a.b") is False
 
 
 def test_get_bool_accepte_un_booleen_deja_type() -> None:
-    """Une valeur écrite en dur dans le YAML arrive déjà en booléen."""
     assert Config(values={"a": {"b": False}}).get_bool("a.b") is False
 
 
 def test_get_bool_refuse_ce_qu_il_ne_sait_pas_lire() -> None:
-    """`SERVING_AUTH_ENABLED=oui` doit se voir, pas se deviner."""
     with pytest.raises(ConfigError, match="booléen"):
         Config(values={"a": {"b": "oui"}}).get_bool("a.b")
 

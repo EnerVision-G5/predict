@@ -1,14 +1,10 @@
-"""Exporte la spécification OpenAPI du service d'inférence.
-
-Usage :
-    python scripts/export_openapi.py                 # écrit sur stdout
-    python scripts/export_openapi.py chemin.json     # écrit dans le fichier
-
-Le paquet `serving` doit être installé (uv sync à la racine du workspace).
-
-Le JSON est produit avec les clés triées : c'est ce qui rend la comparaison
-avec le contrat gelé déterministe, donc utilisable par le job CI de dérive.
-"""
+# **********************************************************************
+# * Nom     : export_openapi.py                                        *
+# * Type    : Script                                                   *
+# * Sujet   : Export de la spécification OpenAPI du service            *
+# *   d'inférence                                                      *
+# * Service : outillage                                                *
+# **********************************************************************
 
 from __future__ import annotations
 
@@ -20,16 +16,20 @@ from serving.api import CONTRACT_VERSION, app
 
 
 def build_spec() -> dict:
-    """Retourne la spécification OpenAPI avec la version de contrat forcée."""
+    """Méthode : build_spec
+    Description : Construit la spécification telle que le service la sert.
+    """
     spec = app.openapi()
     spec["info"]["version"] = CONTRACT_VERSION
     return spec
 
 
 def main(argv: list[str]) -> int:
+    """Méthode : main
+    Description : Point d'entrée : écrit la spécification sur la sortie
+      standard.
+    """
     payload = json.dumps(build_spec(), indent=2, sort_keys=True, ensure_ascii=False)
-    # Fins de ligne LF forcées : le contrat gelé est comparé par la CI Linux,
-    # une génération Windows en CRLF ferait échouer le diff sans dérive réelle.
     encoded = (payload + "\n").encode("utf-8")
     if len(argv) > 1:
         destination = Path(argv[1])

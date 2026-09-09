@@ -1,12 +1,3 @@
-"""Collecte continue : cadence, tolérance aux pannes, journal du retard.
-
-Le poller est un processus long. Ce qui compte n'est donc pas seulement qu'il
-collecte, mais qu'il survive — à un site injoignable, à un tick qui déborde de
-la cadence, à un arrêt demandé au milieu d'une attente. Chaque test ci-dessous
-porte sur l'une de ces trois situations, et aucun n'attend réellement : la
-cadence et l'horloge sont injectées.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -40,14 +31,11 @@ NOW = datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
 
 @pytest.fixture
 def poll_settings() -> PollSettings:
-    """Réglages d'une boucle dont la cadence est injectée, jamais attendue."""
     return PollSettings(interval_s=60.0, lag_warning_s=180.0, batch_size=10)
 
 
 @pytest.fixture
 def make_context(poll_settings, make_client):
-    """Fabrique un contexte de boucle branché sur une source simulée."""
-
     def build(handler, engine: FakeEngine | None = None) -> PollContext:
         return PollContext(
             settings=poll_settings,
@@ -60,14 +48,11 @@ def make_context(poll_settings, make_client):
 
 
 def current(make_reading, **overrides):
-    """Gestionnaire qui sert une mesure courante."""
     reading = make_reading("2026-09-02T07:59:50Z", **overrides)
     return lambda _: httpx.Response(200, json=reading)
 
 
 class TestSchedule:
-    """La cadence est ancrée sur des instants absolus."""
-
     def test_a_tick_on_time_advances_by_one_interval(self) -> None:
         schedule = Schedule(interval_s=60.0, due_at=NOW)
         schedule.advance(NOW + timedelta(seconds=1))
@@ -75,32 +60,23 @@ class TestSchedule:
         assert schedule.missed == 0
 
     def test_a_slow_tick_does_not_shift_the_following_ones(self) -> None:
-        # Une attente de la durée de l'intervalle décalerait toute la suite, et
-        # le retard disparaîtrait en se fondant dans la cadence.
         schedule = Schedule(interval_s=60.0, due_at=NOW)
         schedule.advance(NOW + timedelta(seconds=30))
         assert schedule.due_at == NOW + timedelta(seconds=60)
 
     def test_overrunning_the_cadence_skips_the_missed_ticks(self) -> None:
-        # /current ne sert que la mesure du moment : rattraper relirait
-        # plusieurs fois la même valeur.
         schedule = Schedule(interval_s=60.0, due_at=NOW)
         schedule.advance(NOW + timedelta(seconds=200))
-        # Les ticks de 60, 120 et 180 s sont passés pendant le tick lent.
         assert schedule.missed == 3
         assert schedule.due_at == NOW + timedelta(seconds=240)
 
 
 class TestLag:
-    """Le retard de données mesure l'âge de ce que sert la source."""
-
     def test_the_lag_is_the_age_of_the_oldest_measure(self, make_reading) -> None:
         frame = to_measures([make_reading("2026-09-02T07:59:50Z")])
         assert ingestion_lag_s(frame, NOW) == pytest.approx(10.0)
 
     def test_a_source_clock_ahead_of_ours_is_not_hidden(self, make_reading) -> None:
-        # Un retard négatif signale une horloge en avance : le masquer serait
-        # une faute, c'est une panne d'infrastructure.
         frame = to_measures([make_reading("2026-09-02T08:00:10Z")])
         assert ingestion_lag_s(frame, NOW) < 0
 
@@ -142,8 +118,6 @@ def test_two_ticks_write_two_measures(make_context, make_reading) -> None:
 def test_the_poller_never_overwrites_what_the_etl_deduced(
     make_context, make_reading
 ) -> None:
-    # Le tick suivant repasse sur des minutes déjà transformées : un
-    # DO UPDATE y effacerait la qualification et l'imputation.
     from sqlalchemy.dialects import postgresql
 
     engine = FakeEngine()
@@ -157,7 +131,6 @@ def test_the_poller_never_overwrites_what_the_etl_deduced(
 def test_a_failing_site_does_not_stop_the_others(
     make_context, make_reading, monkeypatch
 ) -> None:
-    # La vraie relance d'un site en panne, c'est le tick suivant.
     def poll(context, site_id, now):
         if site_id == "SITE002":
             raise SourceError("site muet")
@@ -197,8 +170,6 @@ def test_a_late_tick_is_logged_as_a_warning(
 ) -> None:
     context = make_context(current(make_reading))
     late = SCHEDULE_SKEW_WARNING_S + 5.0
-    # Ancrage, attente, démarrage réel du tick, fin du tick. L'arrêt n'est
-    # demandé qu'après le dernier, pour que la boucle exécute un tour entier.
     instants = [NOW, NOW, NOW + timedelta(seconds=late), NOW + timedelta(seconds=late)]
     calls: list[int] = []
 
@@ -216,18 +187,12 @@ def test_a_late_tick_is_logged_as_a_warning(
 def test_the_loop_stops_as_soon_as_the_stop_is_requested(
     make_context, make_reading
 ) -> None:
-    # Un conteneur qu'on stoppe rend la main tout de suite, il n'use pas la
-    # minute en cours.
     context = make_context(current(make_reading))
     context.stop.set()
     assert poll_forever(context, ["SITE001"], clock=lambda: NOW) == 0
 
 
 def test_resolve_targets_keeps_the_requested_sites(make_context) -> None:
-    # L'exploitant a nommé ses sites : une source qui ne sert pas son
-    # référentiel ne doit pas empêcher la boucle de tourner. Le seed a déjà
-    # posé les sites courants, et la clé étrangère tranchera s'il manquait
-    # vraiment quelque chose.
     context = make_context(lambda _: httpx.Response(500))
     assert resolve_targets(context, ["SITE009"]) == ["SITE009"]
 
@@ -244,7 +209,6 @@ def test_resolve_targets_synchronises_the_referential(make_context) -> None:
     engine = FakeEngine()
     context = make_context(lambda _: httpx.Response(200, json=payload), engine=engine)
     resolve_targets(context, None)
-    # `site` est entretenue avant toute mesure : la clé étrangère l'exige.
     assert len(engine.executed) == 1
 
 
@@ -255,8 +219,6 @@ def test_resolve_targets_reads_the_reference_list(make_context) -> None:
 
 
 def test_a_startup_without_the_reference_list_fails(make_context) -> None:
-    # Sans référentiel, la boucle n'a rien à interroger : le processus sort et
-    # c'est la politique de redémarrage du conteneur qui reprend la main.
     context = make_context(lambda _: httpx.Response(500))
     with pytest.raises(SourceError):
         resolve_targets(context, None)
@@ -265,8 +227,6 @@ def test_a_startup_without_the_reference_list_fails(make_context) -> None:
 def test_a_tick_across_midnight_writes_its_own_instant(
     make_context, make_reading
 ) -> None:
-    # Le poller ne range rien par journée : c'est l'horodatage de la mesure qui
-    # la place, et la clé primaire qui arbitre.
     engine = FakeEngine()
     context = make_context(
         lambda _: httpx.Response(200, json=make_reading("2026-09-03T00:00:05Z")),
@@ -288,8 +248,6 @@ def test_settings_read_the_configuration_block() -> None:
     settings = PollSettings.from_config(config)
     assert settings.interval_s == 60.0
     assert settings.batch_size == 1000
-    # Le bloc `source` est absent de cette configuration : le fuseau retombe
-    # sur un défaut neutre plutôt que de faire échouer le démarrage.
     assert settings.source_timezone == "UTC"
 
 
@@ -313,16 +271,8 @@ def test_a_batch_the_source_cannot_place_is_not_written(
 
 
 class TestIngestionState:
-    """Ce que le tick repose en base, et que `mesure` ne peut pas dire.
-
-    Un site en échec n'écrit aucune mesure. Sans cette table, il serait
-    indiscernable d'un site dont la source n'avait rien de neuf — et c'est
-    justement la panne qu'on cherche à voir.
-    """
-
     @staticmethod
     def _state_statements(engine: FakeEngine) -> list[str]:
-        """Rend les instructions visant `ingestion_etat`, compilées."""
         from sqlalchemy.dialects import postgresql
 
         compiled = [
@@ -341,7 +291,6 @@ class TestIngestionState:
 
         statements = self._state_statements(engine)
         assert len(statements) == 1
-        # Le présent, pas un historique : la ligne du site est reposée.
         assert "DO UPDATE" in statements[0]
         assert "last_success_at" in statements[0]
 
@@ -354,9 +303,6 @@ class TestIngestionState:
         assert report.states[0].succeeded is False
         statements = self._state_statements(engine)
         assert len(statements) == 1
-        # Ni la date du dernier succès, ni le nombre de lignes, ni le retard
-        # ne sont touchés : un échec n'a rien à en dire, et les écraser
-        # effacerait la seule chose vraie qu'on sache encore du site.
         assert "last_success_at" not in statements[0]
         assert "consecutive_failures" in statements[0]
 
@@ -373,16 +319,11 @@ class TestIngestionState:
         context = make_context(current(make_reading), engine=engine)
         record_tick(context, run_tick(context, ["SITE001", "SITE002"], NOW))
 
-        # Deux instructions et non une : succès et échecs ne posent pas les
-        # mêmes colonnes, un lot mixte devrait choisir une forme pour les deux.
         assert len(self._state_statements(engine)) == 2
 
     def test_a_database_failure_on_the_state_write_does_not_kill_the_loop(
         self, make_context, make_reading, caplog
     ) -> None:
-        # Le tick dont la base vient de refuser les mesures ne pourra pas non
-        # plus y écrire son échec. Mourir là serait mourir au moment précis où
-        # le processus a le plus de raisons de continuer à essayer.
         class BrokenEngine(FakeEngine):
             def begin(self):
                 raise SQLAlchemyError("base injoignable")
