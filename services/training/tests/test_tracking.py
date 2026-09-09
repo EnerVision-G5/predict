@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -86,3 +88,56 @@ def test_tags_travel_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tracking.mlflow, "set_tags", posted.update)
     tracking.set_tags({"challenge": True, "famille": "naive"})
     assert posted == {"challenge": "True", "famille": "naive"}
+
+
+class TestLogCandidateModel:
+    """Le modèle d'un candidat, et ce qui arrive quand il ne part pas."""
+
+    @staticmethod
+    def features() -> Any:
+        import pandas as pd
+
+        return pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+
+    def test_the_safe_format_is_used_with_its_declared_types(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        def fake_log_model(model: Any, **kwargs: Any) -> None:
+            seen.update(kwargs)
+
+        monkeypatch.setattr(tracking.mlflow.sklearn, "log_model", fake_log_model)
+        monkeypatch.setattr(tracking, "infer_signature", lambda *_: None)
+        tracking.log_candidate_model(
+            object(), self.features(), [1.0, 2.0], name="v1-challenge-ridge"
+        )
+        assert seen["serialization_format"] == "skops"
+        assert "xgboost.sklearn.XGBRegressor" in seen["skops_trusted_types"]
+        assert seen["name"] == "v1-challenge-ridge"
+
+    def test_an_attached_model_reports_its_logged_identifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            tracking.mlflow.sklearn,
+            "log_model",
+            lambda *a, **k: SimpleNamespace(model_id="m-42"),
+        )
+        monkeypatch.setattr(tracking, "infer_signature", lambda *_: None)
+        assert tracking.log_candidate_model(
+            object(), self.features(), []
+        ) == "m-42"
+
+    def test_a_model_that_does_not_leave_is_reported_and_not_raised(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def refuse(*_: Any, **__: Any) -> None:
+            raise RuntimeError("untrusted types")
+
+        monkeypatch.setattr(tracking.mlflow.sklearn, "log_model", refuse)
+        monkeypatch.setattr(tracking, "infer_signature", lambda *_: None)
+        with caplog.at_level(logging.WARNING, logger="training.tracking"):
+            logged = tracking.log_candidate_model(object(), self.features(), [])
+        assert logged == ""
+        assert "non attaché" in caplog.text

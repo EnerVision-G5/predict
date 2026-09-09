@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from training.arbitration import BenchResult
-from training.promotion import decide
+from training.promotion import decide, degrades
 
 WINDOW = "2026-08-01/2026-08-14"
 OTHER_WINDOW = "2026-08-08/2026-08-21"
@@ -73,3 +73,33 @@ def test_a_candidate_without_bench_measure_is_refused() -> None:
     verdict = decide(candidate, champion=None, naive=NAIVE)
     assert not verdict.accepted
     assert "pari" in verdict.reason
+
+
+class TestFloatNoise:
+    """Deux mesures egales au bruit de calcul pres decrivent le meme modele."""
+
+    def test_a_last_bit_of_difference_is_not_a_degradation(self) -> None:
+        assert degrades(50.804266172884915, 50.80426617288491) is False
+
+    def test_a_real_degradation_is_still_one(self) -> None:
+        assert degrades(51.25, 50.80) is True
+
+    def test_an_improvement_is_never_a_degradation(self) -> None:
+        assert degrades(50.80, 51.25) is False
+
+    def test_the_champion_can_be_re_elected_on_an_identical_measure(self) -> None:
+        verdict = decide(
+            result(50.804266172884915, name="foret-aleatoire"),
+            champion=result(50.80426617288491, name="champion v5"),
+            naive=result(60.45, name="persistance-1h"),
+        )
+        assert verdict.accepted
+
+    def test_a_degradation_beyond_the_noise_is_still_refused(self) -> None:
+        verdict = decide(
+            result(50.81, name="foret-aleatoire"),
+            champion=result(50.80, name="champion v5"),
+            naive=result(60.45, name="persistance-1h"),
+        )
+        assert not verdict.accepted
+        assert "dégradation" in verdict.reason
